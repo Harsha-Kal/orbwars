@@ -12,22 +12,22 @@ from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
 
 # <<LEARNED_PARAMS_START>>
 LEARNED_PARAMS = {
-    "prod_weight": 15.0,
-    "ship_cost_weight": 1.0,
-    "dist_weight": 0.15,
-    "early_end_turn": 99,
-    "late_start_turn": 349,
-    "defend_threshold": 11,
-    "min_hold_base": 1,
-    "min_hold_threat": 5,
-    "attack_buffer_ratio": 0.25,
-    "min_attack_avail": 4,
-    "min_expand_avail": 2,
-    "consolidate_avail": 117,
-    "consolidate_frac": 0.5,
-    "aggressive_ship_ratio": 4.37,
-    "defensive_ship_ratio": 1.0,
-    "prod_target_early": 1.5,
+    "prod_weight": 8.195,
+    "ship_cost_weight": 1.045,
+    "dist_weight": 0.375,
+    "early_end_turn": 89,
+    "late_start_turn": 319,
+    "defend_threshold": 17,
+    "min_hold_base": 0,
+    "min_hold_threat": 7,
+    "attack_buffer_ratio": 0.468,
+    "min_attack_avail": 3,
+    "min_expand_avail": 6,
+    "consolidate_avail": 102,
+    "consolidate_frac": 0.666,
+    "aggressive_ship_ratio": 3.222,
+    "defensive_ship_ratio": 0.604,
+    "prod_target_early": 1.292,
 }
 # <<LEARNED_PARAMS_END>>
 
