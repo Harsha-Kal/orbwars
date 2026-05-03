@@ -91,6 +91,9 @@ SUN_X, SUN_Y = 50.0, 50.0
 SUN_R        = 10.0
 MAX_SPEED    = 6.0
 
+# Tracks ship counts from the previous turn to detect sudden garrison drops
+_prev_ships: dict = {}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  GEOMETRY
@@ -390,7 +393,8 @@ def agent(obs):
     moves     = []
 
     def avail(p):
-        return max(0, p.ships - committed.get(p.id, 0) - min_hold)
+        hold = max(min_hold, int(p.ships * 0.30))
+        return max(0, p.ships - committed.get(p.id, 0) - hold)
 
     def send(src, ang, n):
         n = int(n)
@@ -410,6 +414,25 @@ def agent(obs):
             fi, _ = fleet_net(p, [fl], me)
             if fi > 0:
                 targeted.add(p.id)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  PHASE 0 – Emergency: garrison dropped >60% since last turn
+    # ══════════════════════════════════════════════════════════════════════════
+    for p in my_p:
+        prev = _prev_ships.get(p.id)
+        if prev is None or prev == 0:
+            continue
+        if (prev - p.ships) / prev <= 0.60:
+            continue
+        # Planet lost >60% of ships — rush all available ships from nearest donors
+        donors = sorted(
+            [q for q in my_p if q.id != p.id],
+            key=lambda q: dp(q, p)
+        )
+        for donor in donors:
+            av = avail(donor)
+            if av > 0:
+                send_to(donor, p, av)
 
     # ══════════════════════════════════════════════════════════════════════════
     #  PHASE 1 – Reinforce threatened planets
@@ -483,21 +506,42 @@ def agent(obs):
     attack_mult = {"AGGRESSIVE": 1.0, "BALANCED": 1.0, "DEFENSIVE": 1.5}[mode]
     buf_ratio   = LEARNED_PARAMS["attack_buffer_ratio"]
 
-    free_enemies = [e for e in enemy_p if e.id not in targeted]
+    if enemy_p:
+        if len(my_p) >= 3:
+            # Coordinated attack: all planets hit the same target each step.
+            # Rotate through enemies sorted by distance from our centroid so we
+            # systematically capture the nearest cluster first.
+            cx = sum(p.x for p in my_p) / len(my_p)
+            cy = sum(p.y for p in my_p) / len(my_p)
+            sorted_enemies = sorted(
+                enemy_p, key=lambda e: math.hypot(e.x - cx, e.y - cy)
+            )
+            coord_tgt = sorted_enemies[obs_step % len(sorted_enemies)]
 
-    for src in sorted(my_p, key=lambda p: -avail(p)):
-        av = avail(src)
-        if av < LEARNED_PARAMS["min_attack_avail"] or not free_enemies:
-            continue
+            for src in sorted(my_p, key=lambda p: -avail(p)):
+                av = avail(src)
+                if av < LEARNED_PARAMS["min_attack_avail"]:
+                    continue
+                need = coord_tgt.ships + 1
+                buf  = max(3, int(need * buf_ratio * attack_mult))
+                to_send = min(av, need + buf)
+                if to_send > 0:
+                    send_to(src, coord_tgt, to_send)
+        else:
+            # 1-2 planets: each attacks its nearest untargeted enemy
+            free_enemies = [e for e in enemy_p if e.id not in targeted]
 
-        tgt  = min(free_enemies, key=lambda e: enemy_priority(e, src, fleets, me))
-        need = tgt.ships + 1
-        buf  = max(3, int(need * buf_ratio * attack_mult))
-
-        if av >= need:
-            send_to(src, tgt, min(av, need + buf))
-            targeted.add(tgt.id)
-            free_enemies = [e for e in free_enemies if e.id != tgt.id]
+            for src in sorted(my_p, key=lambda p: -avail(p)):
+                av = avail(src)
+                if av < LEARNED_PARAMS["min_attack_avail"] or not free_enemies:
+                    continue
+                tgt  = min(free_enemies, key=lambda e: dp(src, e))
+                need = tgt.ships + 1
+                buf  = max(3, int(need * buf_ratio * attack_mult))
+                if av >= need:
+                    send_to(src, tgt, min(av, need + buf))
+                    targeted.add(tgt.id)
+                    free_enemies = [e for e in free_enemies if e.id != tgt.id]
 
     # ══════════════════════════════════════════════════════════════════════════
     #  PHASE 4 – Consolidate surplus toward front-line
@@ -518,12 +562,30 @@ def agent(obs):
         if mode == AGGRESSIVE:
             consol_thresh = max(8, consol_thresh // 2)
 
+        front_dist = min(dp(front, e) for e in enemy_p)
+
         for src in my_p:
             if src.id == front.id:
+                continue
+            # Skip if src already has inbound friendly ships (avoids ping-pong)
+            fi, _ = fleet_net(src, fleets, me)
+            if fi > 0:
+                continue
+            # Only consolidate from planets clearly further back than the front
+            src_dist = min(dp(src, e) for e in enemy_p)
+            if src_dist <= front_dist * 1.2:
                 continue
             av = avail(src)
             if av >= consol_thresh and threat[src.id] >= defend_thresh:
                 send_to(src, front, int(av * consol_frac))
+
+    # Update ship-count history for next turn's emergency check
+    owned_ids = {p.id for p in my_p}
+    for p in my_p:
+        _prev_ships[p.id] = p.ships
+    for pid in list(_prev_ships.keys()):
+        if pid not in owned_ids:
+            del _prev_ships[pid]
 
     return moves
 
