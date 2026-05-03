@@ -47,22 +47,22 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 # <<LEARNED_PARAMS_START>>
 LEARNED_PARAMS = {
-    "prod_weight": 10.0,
-    "ship_cost_weight": 1.0,
-    "dist_weight": 0.15,
-    "early_end_turn": 100,
-    "late_start_turn": 350,
-    "defend_threshold": 3,
-    "min_hold_base": 1,
-    "min_hold_threat": 4,
-    "attack_buffer_ratio": 0.2,
-    "min_attack_avail": 4,
-    "min_expand_avail": 2,
-    "consolidate_avail": 15,
-    "consolidate_frac": 0.5,
-    "aggressive_ship_ratio": 1.5,
-    "defensive_ship_ratio": 0.75,
-    "prod_target_early": 1.2,
+    "prod_weight": 12.551,
+    "ship_cost_weight": 1.496,
+    "dist_weight": 0.078,
+    "early_end_turn": 121,
+    "late_start_turn": 281,
+    "defend_threshold": 13,
+    "min_hold_base": 3,
+    "min_hold_threat": 5,
+    "attack_buffer_ratio": 0.221,
+    "min_attack_avail": 8,
+    "min_expand_avail": 4,
+    "consolidate_avail": 90,
+    "consolidate_frac": 0.774,
+    "aggressive_ship_ratio": 1.133,
+    "defensive_ship_ratio": 1.368,
+    "prod_target_early": 1.302,
 }
 # <<LEARNED_PARAMS_END>>
 

@@ -276,7 +276,7 @@ class SurrogateOptimizer:
 
 def update_main_py(params: Dict):
     if not MAIN_PY.exists(): return
-    src = MAIN_PY.read_text()
+    src = MAIN_PY.read_text(encoding="utf-8")
     start_m, end_m = "# <<LEARNED_PARAMS_START>>", "# <<LEARNED_PARAMS_END>>"
     if start_m not in src or end_m not in src: return
     lines = ["LEARNED_PARAMS = {"]
@@ -284,7 +284,7 @@ def update_main_py(params: Dict):
     lines.append("}")
     new_block = f"{start_m}\n" + "\n".join(lines) + f"\n{end_m}"
     pattern = re.compile(re.escape(start_m) + r".*?" + re.escape(end_m), re.DOTALL)
-    MAIN_PY.write_text(pattern.sub(new_block, src))
+    MAIN_PY.write_text(pattern.sub(new_block, src), encoding="utf-8")
     print(f"  [Updater] main.py updated.")
 
 def main():
