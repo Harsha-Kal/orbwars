@@ -50,10 +50,20 @@ EXPAND_MIN_SEND = 3      # cheap neutral finishers are worth sending early
 EXPAND_MAX_PER_PLANET = 3 # fan out instead of one launch then idling
 ROTATING_SAVE_RESERVE = 1 # rotating planets save until they can finish an idle
 EVAC_RESERVE = 0          # threatened planets should move everything useful
+POWER_IDLE_COUNT = 2      # once we own this many idle planets...
+POWER_ROT_COUNT = 2       # ...and this many rotating planets, widen attacks
+POWER_RESERVE = 1
+POWER_MAX_PER_PLANET = 4
 ROTATING_NEAR_FACTOR = 0.75 # take rotating first if idle target is much farther
 ROTATING_NEAR_MARGIN = 8.0
 FAST_ROTATING_TURNS = 18.0  # rotating opener is worth it if capture is this quick
 SAME_TIME_MARGIN = 4.0      # "same time" capture window for idle vs rotating
+IDLE_LOWEST_NEAR_MARGIN = 6.0 # lowest idle can count as nearest within this gap
+LOCKED_TARGET_RADIUS = 35.0 # finish nearby invested targets before starting new ones
+LOCKED_MAX_NEED_RATIO = 1.25 # abandon if target now needs far more than available
+FRONTIER_BONUS = 35.0      # prefer bridge idle planets toward opponent idle bases
+ROTATING_RAID_BONUS = 45.0 # rotating fronts near opponent planets are valuable
+DEN_RADIUS = 28.0          # rotating planets inside this range can defend home
 
 
 # ── geometry ──────────────────────────────────────────────────────────────────
@@ -202,6 +212,77 @@ def enemy_need(src, tgt, ships, incoming):
     t = travel_turns(dp(src, tgt), max(1, ships))
     return tgt.ships + int(tgt.production * t) + 1 - incoming.get(tgt.id, 0)
 
+def frontier_idle_bonus(src, tgt, enemy_p):
+    enemy_idle = [e for e in enemy_p if is_idle(e)]
+    if not enemy_idle:
+        return 0.0
+    nearest_enemy = min(enemy_idle, key=lambda e: dp(tgt, e))
+    src_to_enemy = dp(src, nearest_enemy)
+    tgt_to_enemy = dp(tgt, nearest_enemy)
+    if tgt_to_enemy >= src_to_enemy:
+        return 0.0
+    progress = src_to_enemy - tgt_to_enemy
+    bridge = max(0.0, 1.0 - abs(dp(src, tgt) - tgt_to_enemy) / max(1.0, src_to_enemy))
+    return FRONTIER_BONUS * progress / max(1.0, src_to_enemy) + 12.0 * bridge
+
+def rotating_raid_bonus(src, tgt, enemy_p):
+    if not enemy_p:
+        return 0.0
+    nearest_enemy = min(enemy_p, key=lambda e: dp(tgt, e))
+    src_to_enemy = dp(src, nearest_enemy)
+    tgt_to_enemy = dp(tgt, nearest_enemy)
+    progress = max(0.0, src_to_enemy - tgt_to_enemy)
+    close_pressure = max(0.0, 1.0 - tgt_to_enemy / max(1.0, src_to_enemy))
+    return ROTATING_RAID_BONUS * progress / max(1.0, src_to_enemy) + 18.0 * close_pressure
+
+def den_defense_target(src, my_p, my_fleets, enemy_fleets, ang_vel):
+    idle_owned = [p for p in my_p if is_idle(p)]
+    if not idle_owned:
+        return None
+    den = min(idle_owned, key=lambda p: dp(src, p))
+    if dp(src, den) > DEN_RADIUS:
+        return None
+    threatened = []
+    for p in idle_owned:
+        fi, ei = incoming_counts(p, my_fleets, enemy_fleets, ang_vel)
+        net = p.ships + fi - ei
+        if ei > fi and net < DEFEND_NET:
+            threatened.append((net, dp(src, p), p))
+    if not threatened:
+        return None
+    _, _, target = min(threatened)
+    return target
+
+def support_rotating_value(src, rot, idle, ang_vel):
+    arc = arc_travel(rot, ang_vel, src.x, src.y)
+    if arc > OPENING_MAX_ARC:
+        return 1e9
+    idle_to_src_x, idle_to_src_y = src.x - idle.x, src.y - idle.y
+    idle_to_rot_x, idle_to_rot_y = rot.x - idle.x, rot.y - idle.y
+    denom = max(1e-6, math.hypot(idle_to_src_x, idle_to_src_y) * math.hypot(idle_to_rot_x, idle_to_rot_y))
+    cos_from_idle = (idle_to_src_x * idle_to_rot_x + idle_to_src_y * idle_to_rot_y) / denom
+    opposite_bonus = 10.0 if cos_from_idle < -0.25 else 0.0
+    return rot.ships * 3.0 + dp(src, rot) + 0.7 * dp(rot, idle) + 1.5 * arc - opposite_bonus
+
+def locked_target(src, targets, incoming, av):
+    candidates = []
+    for tgt in targets:
+        if incoming.get(tgt.id, 0) <= 0:
+            continue
+        if tgt.owner == -1:
+            need = target_need(tgt, incoming)
+        else:
+            need = enemy_need(src, tgt, max(1, av), incoming)
+        if need <= 0:
+            continue
+        d = dp(src, tgt)
+        if d <= LOCKED_TARGET_RADIUS and need <= max(1, int(av * LOCKED_MAX_NEED_RATIO)):
+            candidates.append((d, tgt.ships, tgt.id, tgt, need))
+    if not candidates:
+        return None, 0
+    _, _, _, tgt, need = min(candidates)
+    return tgt, need
+
 
 # ── main agent ────────────────────────────────────────────────────────────────
 
@@ -260,6 +341,13 @@ def agent(obs):
         if ei > fi and net <= 0:
             av = avail(p) - EVAC_RESERVE
             if av > 0:
+                escape_targets = [
+                    q for q in my_p
+                    if q.id != p.id and p.ships + fi + av < ei
+                ]
+                if escape_targets:
+                    fire(p, min(escape_targets, key=lambda q: dp(p, q)), av)
+                    continue
                 if not is_idle(p):
                     rotating_neutrals = [
                         n for n in neutral_p
@@ -337,27 +425,39 @@ def agent(obs):
                     if send_n >= EXPAND_MIN_SEND or send_n >= need:
                         fire(src, chosen, send_n)
             else:
-                rot_need = target_need(nearest_rot, incoming) if nearest_rot is not None else 0
-                idle_need = target_need(nearest_idle, incoming) if nearest_idle is not None else 0
-                rot_eta = capture_eta(src, nearest_rot, rot_need) if nearest_rot is not None and rot_need <= av else 1e9
-                idle_eta = capture_eta(src, nearest_idle, idle_need) if nearest_idle is not None and idle_need <= av else 1e9
+                lowest_idle = min(idle_targets, key=lambda n: (n.ships, dp(src, n)), default=None)
+                idle_choice = lowest_idle or nearest_idle
+                idle_is_lowest_and_near = False
+                if idle_choice is not None and nearest_idle is not None:
+                    idle_is_lowest_and_near = (
+                        idle_choice.id == nearest_idle.id
+                        or dp(src, idle_choice) <= dp(src, nearest_idle) + IDLE_LOWEST_NEAR_MARGIN
+                    )
 
-                if nearest_rot is not None and rot_eta <= FAST_ROTATING_TURNS:
-                    if nearest_idle is not None and idle_eta <= rot_eta + SAME_TIME_MARGIN:
-                        fire(src, nearest_idle, min(av, idle_need))
-                        av = avail(src) - OPENING_RESERVE
-                        if av > 0:
-                            need = target_need(nearest_rot, incoming)
-                            send_n = min(av, need)
-                            if send_n >= OPENING_MIN_SEND or send_n >= need:
-                                fire(src, nearest_rot, send_n)
-                    else:
-                        fire(src, nearest_rot, min(av, rot_need))
-                elif nearest_idle is not None:
-                    need = target_need(nearest_idle, incoming)
+                if idle_choice is not None and idle_is_lowest_and_near:
+                    need = target_need(idle_choice, incoming)
                     send_n = min(av, need)
                     if send_n >= OPENING_MIN_SEND or send_n >= need:
-                        fire(src, nearest_idle, send_n)
+                        fire(src, idle_choice, send_n)
+                else:
+                    support_rots = rotating_targets
+                    if idle_choice is not None:
+                        support_rots = sorted(
+                            rotating_targets,
+                            key=lambda n: support_rotating_value(src, n, idle_choice, ang_vel)
+                        )
+                    support_rot = support_rots[0] if support_rots else None
+
+                    if support_rot is not None:
+                        need = target_need(support_rot, incoming)
+                        send_n = min(av, need)
+                        if send_n >= OPENING_MIN_SEND or send_n >= need:
+                            fire(src, support_rot, send_n)
+                    elif idle_choice is not None:
+                        need = target_need(idle_choice, incoming)
+                        send_n = min(av, need)
+                        if send_n >= OPENING_MIN_SEND or send_n >= need:
+                            fire(src, idle_choice, send_n)
 
     # ── Early economy roles ───────────────────────────────────────────────────
     # Rotating planets are unreliable launch bases early: save until they can
@@ -372,6 +472,14 @@ def agent(obs):
                     if av < EXPAND_MIN_SEND:
                         break
 
+                    locked, locked_need = locked_target(src, neutral_p + enemy_p, incoming, av)
+                    if locked is not None:
+                        send_n = min(av, locked_need)
+                        if send_n >= EXPAND_MIN_SEND or send_n >= locked_need:
+                            fire(src, locked, send_n)
+                            launched += 1
+                            continue
+
                     idle_targets = []
                     rotating_targets = []
                     enemy_targets = []
@@ -380,11 +488,12 @@ def agent(obs):
                         if need <= 0:
                             continue
                         if is_idle(tgt):
-                            idle_targets.append((dp(src, tgt), -idle_capture_value(src, tgt), tgt.id, tgt, need))
+                            value = idle_capture_value(src, tgt) + frontier_idle_bonus(src, tgt, enemy_p)
+                            idle_targets.append((dp(src, tgt), -value, tgt.id, tgt, need))
                         else:
-                            score = rotating_capture_value(src, tgt, ang_vel)
+                            score = rotating_capture_value(src, tgt, ang_vel) + rotating_raid_bonus(src, tgt, enemy_p)
                             if score > -1e8:
-                                front_score = rotating_front_score(src, tgt, ang_vel)
+                                front_score = rotating_front_score(src, tgt, ang_vel) + rotating_raid_bonus(src, tgt, enemy_p)
                                 rotating_targets.append((-score, -front_score, dp(src, tgt), tgt.id, tgt, need))
                     for tgt in enemy_p:
                         need = enemy_need(src, tgt, av, incoming)
@@ -427,6 +536,12 @@ def agent(obs):
                     if av < OPENING_MIN_SEND:
                         break
 
+                    den_target = den_defense_target(src, my_p, my_fleets, enemy_fleets, ang_vel)
+                    if den_target is not None:
+                        fire(src, den_target, max(0, avail(src)))
+                        launched += 1
+                        continue
+
                     claimed_idle = []
                     high_idle = []
                     high_rotating = []
@@ -436,12 +551,13 @@ def agent(obs):
                         if need <= 0:
                             continue
                         if is_idle(tgt):
-                            item = (dp(src, tgt), -idle_capture_value(src, tgt), tgt.id, tgt, need)
+                            value = idle_capture_value(src, tgt) + frontier_idle_bonus(src, tgt, enemy_p)
+                            item = (dp(src, tgt), -value, tgt.id, tgt, need)
                             if incoming.get(tgt.id, 0) > 0:
                                 claimed_idle.append(item)
-                            high_idle.append((-idle_capture_value(src, tgt), dp(src, tgt), tgt.id, tgt, need))
+                            high_idle.append((-value, dp(src, tgt), tgt.id, tgt, need))
                         else:
-                            score = rotating_front_score(src, tgt, ang_vel)
+                            score = rotating_front_score(src, tgt, ang_vel) + rotating_raid_bonus(src, tgt, enemy_p)
                             if score > -1e8:
                                 high_rotating.append((-score, dp(src, tgt), tgt.id, tgt, need))
                     for tgt in enemy_p:
@@ -449,7 +565,8 @@ def agent(obs):
                         if need <= 0:
                             continue
                         d = dp(src, tgt)
-                        score = tgt.production * 70.0 / (need + 8.0) / (1.0 + 0.025 * d)
+                        raid = rotating_raid_bonus(src, tgt, enemy_p) if not is_idle(src) else 0.0
+                        score = (tgt.production * 70.0 + raid) / (need + 8.0) / (1.0 + 0.025 * d)
                         high_enemy.append((-score, d, tgt.id, tgt, need))
 
                     chosen = None
@@ -473,6 +590,84 @@ def agent(obs):
                     fire(src, chosen, send_n)
                     launched += 1
 
+    # ── Power state: enough bases, widen into new idles and opponents ─────────
+    my_idle_count = sum(1 for p in my_p if is_idle(p))
+    my_rot_count = len(my_p) - my_idle_count
+    if my_idle_count >= POWER_IDLE_COUNT and my_rot_count >= POWER_ROT_COUNT:
+        power_planets = sorted(my_p, key=lambda p: (p.production, avail(p)), reverse=True)
+        expand_slots = max(1, len(power_planets) // 2)
+        expand_ids = {p.id for p in power_planets[:expand_slots]}
+
+        for src in power_planets:
+            role = "expand" if src.id in expand_ids else "attack"
+            launched = 0
+            while launched < POWER_MAX_PER_PLANET:
+                av = avail(src) - POWER_RESERVE
+                if av < EXPAND_MIN_SEND:
+                    break
+
+                target = None
+                need = 0
+
+                if not is_idle(src):
+                    den_target = den_defense_target(src, my_p, my_fleets, enemy_fleets, ang_vel)
+                    if den_target is not None:
+                        fire(src, den_target, max(0, avail(src)))
+                        launched += 1
+                        continue
+
+                locked, locked_need = locked_target(src, neutral_p + enemy_p, incoming, av)
+                if locked is not None:
+                    target = locked
+                    need = locked_need
+
+                idle_candidates = []
+                rotating_candidates = []
+                if target is None:
+                    for tgt in neutral_p:
+                        n = target_need(tgt, incoming)
+                        if n <= 0:
+                            continue
+                        d = dp(src, tgt)
+                        if is_idle(tgt):
+                            score = (tgt.production * 90.0 + frontier_idle_bonus(src, tgt, enemy_p)) / (n + 4.0) / (1.0 + 0.025 * d)
+                            idle_candidates.append((-score, d, tgt.id, tgt, n))
+                        else:
+                            score = (tgt.production * 75.0 + rotating_raid_bonus(src, tgt, enemy_p)) / (n + 5.0) / (1.0 + 0.025 * d)
+                            rotating_candidates.append((-score, d, tgt.id, tgt, n))
+
+                enemy_candidates = []
+                if target is None:
+                    for tgt in enemy_p:
+                        n = enemy_need(src, tgt, av, incoming)
+                        if n <= 0:
+                            continue
+                        d = dp(src, tgt)
+                        score = tgt.production * 95.0 / (n + 8.0) / (1.0 + 0.02 * d)
+                        enemy_candidates.append((-score, d, tgt.id, tgt, n))
+
+                    if role == "expand" and idle_candidates:
+                        _, _, _, target, need = min(idle_candidates)
+                    elif role == "expand" and rotating_candidates:
+                        _, _, _, target, need = min(rotating_candidates)
+                    elif role == "attack" and enemy_candidates:
+                        _, _, _, target, need = min(enemy_candidates)
+                    elif role == "attack" and rotating_candidates:
+                        _, _, _, target, need = min(rotating_candidates)
+                    elif role == "expand" and enemy_candidates:
+                        _, _, _, target, need = min(enemy_candidates)
+                    elif role == "attack" and idle_candidates:
+                        _, _, _, target, need = min(idle_candidates)
+
+                if target is None:
+                    break
+
+                send_n = min(av, need)
+                if send_n < EXPAND_MIN_SEND and send_n < need:
+                    break
+                fire(src, target, send_n)
+                launched += 1
+
     # ── Phase 2: Per-planet offensive ─────────────────────────────────────────
     # Each planet independently fires at the best available target.
     # Because `incoming` is updated after each fire(), richer planets claim
@@ -493,6 +688,13 @@ def agent(obs):
             fleet_size = av  # spend all available if small but early
 
         chosen = None
+
+        locked, locked_need = locked_target(src, neutral_p + enemy_p, incoming, av)
+        if locked is not None:
+            send_n = min(av, locked_need)
+            if send_n > 0:
+                fire(src, locked, send_n)
+                continue
 
         # ── 2a: Nearest idle neutral that isn't fully covered ─────────────────
         for tgt in idle_neu:
