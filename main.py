@@ -15,19 +15,19 @@ LEARNED_PARAMS = {
     "prod_weight": 15.0,
     "ship_cost_weight": 1.0,
     "dist_weight": 0.15,
-    "early_end_turn": 50,
+    "early_end_turn": 99,
     "late_start_turn": 349,
-    "defend_threshold": 11,
+    "defend_threshold": 13,
     "min_hold_base": 1,
-    "min_hold_threat": 5,
+    "min_hold_threat": 6,
     "attack_buffer_ratio": 0.25,
     "min_attack_avail": 4,
     "min_expand_avail": 2,
-    "consolidate_avail": 188,
+    "consolidate_avail": 193,
     "consolidate_frac": 0.5,
-    "aggressive_ship_ratio": 4.73,
-    "defensive_ship_ratio": 0.86,
-    "prod_target_early": 1.76,
+    "aggressive_ship_ratio": 3.58,
+    "defensive_ship_ratio": 0.88,
+    "prod_target_early": 1.56,
 }
 # <<LEARNED_PARAMS_END>>
 
@@ -38,6 +38,7 @@ PARAM_DEFAULTS = {
     "reserve_fraction": 0.30,
     "active_attack_fraction": 0.70,
     "near_idle_dist_weight": 0.85,
+    "idle_first_max_distance": 100.0,
     "recapture_buffer": 2,
 }
 MANUAL_PARAMS = dict(PARAM_DEFAULTS)
@@ -176,6 +177,8 @@ def agent(obs):
         ang = aim_at(src, tgt, ang_vel, n)
         committed[src.id] = committed.get(src.id, 0) + n
         moves.append([src.id, ang, n])
+        if tgt.owner != me:
+            targeted[tgt.id] = targeted.get(tgt.id, 0) + n
 
     # Tracking targeted
     targeted = {}
@@ -221,7 +224,30 @@ def agent(obs):
                 if needed <= 0:
                     break
 
-    # 2. Expansion / Attack Scoring
+    # 2. Prefer nearby idle neutrals before the broader expansion/attack pass.
+    idle_neutrals = sorted(
+        [p for p in neutral_p if is_idle_planet(p)],
+        key=lambda p: min(dp(p, m) for m in my_p),
+    )
+    max_idle_dist = LEARNED_PARAMS.get("idle_first_max_distance", 100.0)
+    for tgt in idle_neutrals:
+        dist_to = min(dp(tgt, m) for m in my_p)
+        if dist_to > max_idle_dist:
+            continue
+
+        needed = max(1, tgt.ships + 1 - targeted.get(tgt.id, 0))
+        can_reach = sorted([d for d in my_p if avail(d) > 0], key=lambda d: dp(d, tgt))
+        if sum(avail(d) for d in can_reach) < needed:
+            continue
+
+        for d in can_reach:
+            to_send = min(avail(d), needed)
+            send_to(d, tgt, to_send)
+            needed -= to_send
+            if needed <= 0:
+                break
+
+    # 3. Expansion / Attack Scoring
     targets = []
     for p in neutral_p + enemy_p:
         dist_to = min(dp(p, m) for m in my_p) if my_p else 50
@@ -269,7 +295,7 @@ def agent(obs):
                 needed -= to_send
                 if needed <= 0: break
 
-    # 3. Consolidation
+    # 4. Consolidation
     if enemy_p and not is_early:
         front = min(my_p, key=lambda p: min(dp(p, e) for e in enemy_p))
         for p in my_p:
