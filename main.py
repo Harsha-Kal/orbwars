@@ -31,11 +31,12 @@ LEARNED_PARAMS = {
 }
 # <<LEARNED_PARAMS_END>>
 
+
 # Manual fallback values. Edit LEARNED_PARAMS above when you want to override the
 # local strategy without regenerating strategy_data.pkl.
 PARAM_DEFAULTS = {
     "reserve_fraction": 0.30,
-    "active_attack_fraction": 0.30,
+    "active_attack_fraction": 0.70,
     "near_idle_dist_weight": 0.85,
     "recapture_buffer": 2,
 }
