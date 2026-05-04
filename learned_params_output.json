@@ -1,0 +1,18 @@
+{
+  "aggressive_ship_ratio": 4.73,
+  "attack_buffer_ratio": 0.25,
+  "consolidate_avail": 188,
+  "consolidate_frac": 0.5,
+  "defend_threshold": 11,
+  "defensive_ship_ratio": 0.86,
+  "dist_weight": 0.15,
+  "early_end_turn": 50,
+  "late_start_turn": 349,
+  "min_attack_avail": 4,
+  "min_expand_avail": 2,
+  "min_hold_base": 1,
+  "min_hold_threat": 5,
+  "prod_target_early": 1.76,
+  "prod_weight": 15.0,
+  "ship_cost_weight": 1.0
+}
