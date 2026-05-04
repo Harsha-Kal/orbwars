@@ -45,22 +45,15 @@ MAIN_PY  = ROOT / "main.py"
 
 # ── Parameter Search Space ────────────────────────────────────────────────────
 PARAM_SPACE = {
-    "prod_weight":           (5.0, 30.0, float),
-    "ship_cost_weight":      (0.5, 2.5,  float),
-    "dist_weight":           (0.05, 0.5, float),
-    "early_end_turn":        (50, 150,   int),
-    "late_start_turn":       (250, 450,  int),
-    "defend_threshold":      (1, 20,     int),
-    "min_hold_base":         (0, 5,      int),
-    "min_hold_threat":       (1, 10,     int),
-    "attack_buffer_ratio":   (0.0, 0.5,  float),
-    "min_attack_avail":      (1, 10,     int),
-    "min_expand_avail":      (1, 10,     int),
-    "consolidate_avail":     (20, 150,   int),
-    "consolidate_frac":      (0.2, 0.8,  float),
-    "aggressive_ship_ratio": (1.0, 5.0,  float),
-    "defensive_ship_ratio":  (0.5, 1.5,  float),
-    "prod_target_early":     (1.0, 2.5,  float),
+    "min_hold":              (0, 10,   int),
+    "defend_threshold":      (0, 15,   int),
+    "reinforce_min_send":    (1, 20,   int),
+    "reinforce_target_net":  (5, 30,   int),
+    "neutral_prod_mult":     (1, 50,   int),
+    "attack_dist_weight":    (0.01, 1.0, float),
+    "attack_prod_weight":    (0.5, 10.0, float),
+    "attack_buffer":         (0, 30,   int),
+    "consolidate_threshold": (10, 100,  int),
 }
 
 FEATURE_COLS = [
