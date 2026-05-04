@@ -1,83 +1,87 @@
 """
-Orbit Wars - ML-Compatible Advanced Agent
-==========================================
-This agent is designed to work with learn_strategy.py.
-It uses markers to allow the ML script to automatically update parameters.
+Orbit Wars – ML-Adaptive Agent v3
+===================================
+Action:  [from_planet_id, angle_radians, num_ships]
+Planet:  Planet(id, owner, x, y, radius, ships, production)
+Fleet:   Fleet(id, owner, x, y, angle, from_planet_id, ships)
+
+Run  python learn_strategy.py  to update LEARNED_PARAMS automatically.
 """
 
 import math
+import os
 import pickle
+import numpy as np
 from pathlib import Path
-from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
 
+# Try to import from kaggle environment; fall back to mock classes if unavailable
+try:
+    from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
+except ImportError:
+    class Planet:
+        def __init__(self, id, owner, x, y, radius, ships, production):
+            self.id, self.owner, self.x, self.y = id, owner, x, y
+            self.radius, self.ships, self.production = radius, ships, production
+    class Fleet:
+        def __init__(self, id, owner, x, y, angle, from_planet_id, ships):
+            self.id, self.owner, self.x, self.y = id, owner, x, y
+            self.angle, self.from_planet_id, self.ships = angle, from_planet_id, ships
+
+# ─────────────────────────────────────────────────────────────────────────────
 # <<LEARNED_PARAMS_START>>
 LEARNED_PARAMS = {
-    "prod_weight": 15.0,
-    "ship_cost_weight": 1.0,
-    "dist_weight": 0.15,
-    "early_end_turn": 99,
-    "late_start_turn": 349,
-    "defend_threshold": 13,
-    "min_hold_base": 1,
-    "min_hold_threat": 6,
-    "attack_buffer_ratio": 0.25,
-    "min_attack_avail": 4,
-    "min_expand_avail": 2,
-    "consolidate_avail": 193,
-    "consolidate_frac": 0.5,
-    "aggressive_ship_ratio": 3.58,
-    "defensive_ship_ratio": 0.88,
-    "prod_target_early": 1.56,
+    "prod_weight": 11.512,
+    "ship_cost_weight": 0.92,
+    "dist_weight": 0.481,
+    "early_end_turn": 94,
+    "late_start_turn": 357,
+    "defend_threshold": 17,
+    "min_hold_base": 5,
+    "min_hold_threat": 10,
+    "attack_buffer_ratio": 0.042,
+    "min_attack_avail": 5,
+    "min_expand_avail": 4,
+    "consolidate_avail": 22,
+    "consolidate_frac": 0.699,
+    "aggressive_ship_ratio": 2.912,
+    "defensive_ship_ratio": 1.355,
+    "prod_target_early": 1.312,
 }
 # <<LEARNED_PARAMS_END>>
 
-
-# Manual fallback values. Edit LEARNED_PARAMS above when you want to override the
-# local strategy without regenerating strategy_data.pkl.
-PARAM_DEFAULTS = {
-    "reserve_fraction": 0.30,
-    "active_attack_fraction": 0.70,
-    "near_idle_dist_weight": 0.85,
-    "idle_first_max_distance": 100.0,
-    "recapture_buffer": 2,
-}
-MANUAL_PARAMS = dict(PARAM_DEFAULTS)
-MANUAL_PARAMS.update(LEARNED_PARAMS)
-USE_STRATEGY_DATA = True
-
-
-def load_strategy_params():
-    params = dict(MANUAL_PARAMS)
-    ml = {}
-    if not USE_STRATEGY_DATA:
-        return params, ml
-
-    pkl_path = Path(__file__).parent / "strategy_data.pkl" if "__file__" in globals() else Path("strategy_data.pkl")
+# ─────────────────────────────────────────────────────────────────────────────
+# Optional: load trained sklearn models
+# Try multiple paths for robustness on Kaggle
+_PKL_PATHS = [
+    Path(__file__).parent / "strategy_data.pkl",
+    Path("strategy_data.pkl"),
+    Path("/kaggle/working/strategy_data.pkl")
+]
+_ML  = {}
+for _p in _PKL_PATHS:
     try:
-        if pkl_path.exists():
-            with open(pkl_path, "rb") as fp:
-                bundle = pickle.load(fp)
-            ml = {
-                "win_rf": bundle.get("win_rf"),
-                "win_gbc": bundle.get("win_gbc"),
-                "scaler": bundle.get("scaler"),
-                "params": bundle.get("params", {}),
-            }
-            if ml["params"]:
-                params.update(ml["params"])
-    except Exception:
-        pass
-    return params, ml
+        if _p.exists():
+            with open(_p, "rb") as _fp:
+                # We use a try-except here because unpickling might trigger 
+                # ModuleNotFoundError if sklearn is not installed.
+                _bundle = pickle.load(_fp)
+                _ML = {
+                    "win_rf":  _bundle.get("win_rf"),
+                    "win_gbc": _bundle.get("win_gbc"),
+                    "scaler":  _bundle.get("scaler"),
+                    "params":  _bundle.get("params", {}),
+                }
+                if _ML.get("params"):
+                    LEARNED_PARAMS.update(_ML["params"])
+            break # Success
+    except (Exception, ImportError, ModuleNotFoundError):
+        continue # Try next path or fall back
 
-
-LEARNED_PARAMS, _ML = load_strategy_params()
-
+# ─────────────────────────────────────────────────────────────────────────────
 SUN_X, SUN_Y = 50.0, 50.0
 SUN_R        = 10.0
 MAX_SPEED    = 6.0
-
-
-# ── geometry ──────────────────────────────────────────────────────────────────
+_prev_ships: dict = {}
 
 def dist(ax, ay, bx, by): return math.hypot(bx - ax, by - ay)
 def dp(a, b): return math.hypot(b.x - a.x, b.y - a.y)
@@ -97,18 +101,16 @@ def hits_sun(x1, y1, x2, y2):
     disc = b*b - 4*a*c
     if disc < 0: return False
     sq = math.sqrt(disc)
-    t1 = (-b - sq) / (2*a)
-    t2 = (-b + sq) / (2*a)
+    t1, t2 = (-b - sq) / (2*a), (-b + sq) / (2*a)
     return (0 <= t1 <= 1) or (0 <= t2 <= 1) or (t1 < 0 < t2)
 
 def safe_angle(sx, sy, tx, ty):
     direct = math.atan2(ty - sy, tx - sx)
     if not hits_sun(sx, sy, tx, ty): return direct
-    dist_st = dist(sx, sy, tx, ty)
-    for off in [0.5, -0.5, 1.0, -1.0]:
+    d = dist(sx, sy, tx, ty)
+    for off in [0.5, -0.5, 1.0, -1.0, 1.5, -1.5]:
         ang = direct + off
-        ex = sx + dist_st * math.cos(ang)
-        ey = sy + dist_st * math.sin(ang)
+        ex, ey = sx + d * math.cos(ang), sy + d * math.sin(ang)
         if not hits_sun(sx, sy, ex, ey): return ang
     return direct
 
@@ -121,187 +123,145 @@ def predict_pos(p, ang_vel, turns):
 
 def aim_at(src, tgt, ang_vel, ships):
     tx, ty = tgt.x, tgt.y
-    for _ in range(8):
+    for _ in range(10):
         d_est = dist(src.x, src.y, tx, ty)
         t_est = travel_turns(d_est, ships)
         tx, ty = predict_pos(tgt, ang_vel, t_est)
     return safe_angle(src.x, src.y, tx, ty)
 
-def fleet_impact(planet, all_fleets, me):
+def fleet_net(planet, all_fleets, me):
     fi = ei = 0
     for fl in all_fleets:
-        ea = math.atan2(planet.y - fl.y, planet.x - fl.x)
-        if abs(math.atan2(math.sin(fl.angle - ea), math.cos(fl.angle - ea))) < 0.35:
+        ea   = math.atan2(planet.y - fl.y, planet.x - fl.x)
+        diff = abs(math.atan2(math.sin(fl.angle - ea), math.cos(fl.angle - ea)))
+        if diff < 0.30:
             if fl.owner == me: fi += fl.ships
             else: ei += fl.ships
     return fi, ei
 
-def is_idle_planet(p):
-    return dist(p.x, p.y, SUN_X, SUN_Y) + p.radius >= 50.0
+def compute_threat(my_planets, fleets, me):
+    threat = {}
+    for p in my_planets:
+        fi, ei = fleet_net(p, fleets, me)
+        threat[p.id] = p.ships + fi - ei
+    return threat
 
+EARLY, MID, LATE = "EARLY", "MID", "LATE"
+AGGRESSIVE, BALANCED, DEFENSIVE = "AGGRESSIVE", "BALANCED", "DEFENSIVE"
 
-# ── main agent ────────────────────────────────────────────────────────────────
+def game_phase(step):
+    if step < LEARNED_PARAMS["early_end_turn"]: return EARLY
+    if step >= LEARNED_PARAMS["late_start_turn"]: return LATE
+    return MID
+
+def strategic_mode(my_total, enemy_total):
+    ratio = my_total / max(1, enemy_total)
+    agg = LEARNED_PARAMS["aggressive_ship_ratio"]
+    dfn = LEARNED_PARAMS["defensive_ship_ratio"]
+    if ratio >= agg: return AGGRESSIVE
+    if ratio <= dfn: return DEFENSIVE
+    return BALANCED
+
+def comet_turns_remaining(comet_id, obs_comets, obs_step):
+    if not obs_comets: return 999
+    try:
+        for group in obs_comets:
+            ids = list(group.get("planet_ids", []) if isinstance(group, dict) else getattr(group, "planet_ids", []))
+            if comet_id not in ids: continue
+            paths = (group.get("paths") if isinstance(group, dict) else getattr(group, "paths", None))
+            idx   = (group.get("path_index", 0) if isinstance(group, dict) else getattr(group, "path_index", 0))
+            if paths: return max(0, len(paths[ids.index(comet_id)]) - int(idx))
+    except: pass
+    return 999
+
+def comet_is_capturable(comet, src, ships, ang_vel, comet_id, obs_comets, obs_step):
+    travel = travel_turns(dp(src, comet), ships)
+    remaining = comet_turns_remaining(comet_id, obs_comets, obs_step)
+    return remaining > travel + 10
+
+def should_expand(my_total, enemy_total, my_prod, enemy_prod, phase, mode, neutral_count):
+    prod_ratio = my_prod / max(1, enemy_prod)
+    if phase == EARLY: return neutral_count > 0
+    if mode == DEFENSIVE: return prod_ratio < LEARNED_PARAMS["prod_target_early"] and neutral_count > 0
+    return neutral_count > 0 and prod_ratio < 2.0
 
 def agent(obs):
+    global _prev_ships
     g = lambda key, default: (obs.get(key, default) if isinstance(obs, dict) else getattr(obs, key, default))
-    me, ang_vel = int(g("player", 0)), float(g("angular_velocity", 0.033))
-    step = int(g("step", 0))
-    planets = [Planet(*p) for p in g("planets", [])]
-    fleets = [Fleet(*f) for f in g("fleets", [])]
-    
-    my_p = [p for p in planets if p.owner == me]
-    neutral_p = [p for p in planets if p.owner == -1]
-    enemy_p = [p for p in planets if p.owner not in (-1, me)]
-    if not my_p:
-        return []
-
-    # Dynamic phase logic
-    is_early = step < LEARNED_PARAMS["early_end_turn"]
-    is_late  = step > LEARNED_PARAMS["late_start_turn"]
-
+    me = int(g("player", 0)); ang_vel = float(g("angular_velocity", 0.033))
+    comet_ids = set(g("comet_planet_ids", [])); obs_step = int(g("step", 0)); obs_comets = g("comets", [])
+    planets = [Planet(*p) for p in g("planets", [])]; fleets = [Fleet(*f) for f in g("fleets", [])]
+    my_p = [p for p in planets if p.owner == me]; neutral_p = [p for p in planets if p.owner == -1]; enemy_p = [p for p in planets if p.owner not in (-1, me)]
+    if not my_p: return []
+    my_fl = [fl for fl in fleets if fl.owner == me]; en_fl = [fl for fl in fleets if fl.owner != me]
+    my_total = sum(p.ships for p in my_p) + sum(fl.ships for fl in my_fl); en_total = sum(p.ships for p in enemy_p) + sum(fl.ships for fl in en_fl)
+    my_prod = sum(p.production for p in my_p); en_prod = sum(p.production for p in enemy_p)
+    phase = game_phase(obs_step); mode = strategic_mode(my_total, en_total)
+    threat = compute_threat(my_p, fleets, me)
+    def_thr = LEARNED_PARAMS["defend_threshold"]
+    any_threat = any(v < def_thr for v in threat.values())
+    min_hold = LEARNED_PARAMS["min_hold_threat"] if any_threat else LEARNED_PARAMS["min_hold_base"]
     committed, moves = {}, []
-    
-    def get_min_hold(p):
-        _, ei = fleet_impact(p, fleets, me)
-        reserve = int(math.ceil(p.ships * LEARNED_PARAMS.get("reserve_fraction", 0.30)))
-        if ei > 0:
-            return max(reserve, LEARNED_PARAMS["min_hold_threat"])
-        return max(reserve, LEARNED_PARAMS["min_hold_base"])
-
-    def avail(p): 
-        return max(0, p.ships - committed.get(p.id, 0) - get_min_hold(p))
-
+    def avail(p): return max(0, p.ships - committed.get(p.id, 0) - max(min_hold, int(p.ships * 0.30)))
     def send_to(src, tgt, n):
         n = int(n)
         if n <= 0: return
-        ang = aim_at(src, tgt, ang_vel, n)
         committed[src.id] = committed.get(src.id, 0) + n
-        moves.append([src.id, ang, n])
-        if tgt.owner != me:
-            targeted[tgt.id] = targeted.get(tgt.id, 0) + n
+        moves.append([src.id, aim_at(src, tgt, ang_vel, n), n])
 
-    # Tracking targeted
-    targeted = {}
-    for fl in fleets:
-        if fl.owner == me:
-            for p in planets:
-                if p.owner == me: continue
-                ea = math.atan2(p.y - fl.y, p.x - fl.x)
-                if abs(math.atan2(math.sin(fl.angle - ea), math.cos(fl.angle - ea))) < 0.35:
-                    targeted[p.id] = targeted.get(p.id, 0) + fl.ships
-
-    # 1. Defense
-    recapture_needed = {}
+    # Phase 0: Emergency
     for p in my_p:
-        fi, ei = fleet_impact(p, fleets, me)
-        net = p.ships + fi - ei
-        if net < LEARNED_PARAMS["defend_threshold"]:
-            needed = LEARNED_PARAMS["defend_threshold"] * 2 - net
-            for d in sorted(my_p, key=lambda d: dp(d, p)):
-                if d.id == p.id: continue
-                av = avail(d)
-                if av > 0:
-                    to_send = min(av, needed)
-                    send_to(d, p, to_send)
-                    needed -= to_send
-                    if needed <= 0: break
-        if net <= 0:
-            recapture_needed[p.id] = int(-net + p.production + LEARNED_PARAMS.get("recapture_buffer", 2))
-
-    # If an enemy attack looks strong enough to flip one of our planets, queue
-    # enough support from nearby planets so it can be held or immediately retaken.
-    for p in sorted(my_p, key=lambda p: recapture_needed.get(p.id, 0), reverse=True):
-        needed = recapture_needed.get(p.id, 0)
-        if needed <= 0:
-            continue
-        for d in sorted(my_p, key=lambda d: dp(d, p)):
-            if d.id == p.id:
-                continue
-            to_send = min(avail(d), needed)
-            if to_send > 0:
-                send_to(d, p, to_send)
-                needed -= to_send
-                if needed <= 0:
-                    break
-
-    # 2. Prefer nearby idle neutrals before the broader expansion/attack pass.
-    idle_neutrals = sorted(
-        [p for p in neutral_p if is_idle_planet(p)],
-        key=lambda p: min(dp(p, m) for m in my_p),
-    )
-    max_idle_dist = LEARNED_PARAMS.get("idle_first_max_distance", 100.0)
-    for tgt in idle_neutrals:
-        dist_to = min(dp(tgt, m) for m in my_p)
-        if dist_to > max_idle_dist:
-            continue
-
-        needed = max(1, tgt.ships + 1 - targeted.get(tgt.id, 0))
-        can_reach = sorted([d for d in my_p if avail(d) > 0], key=lambda d: dp(d, tgt))
-        if sum(avail(d) for d in can_reach) < needed:
-            continue
-
-        for d in can_reach:
-            to_send = min(avail(d), needed)
-            send_to(d, tgt, to_send)
-            needed -= to_send
-            if needed <= 0:
-                break
-
-    # 3. Expansion / Attack Scoring
-    targets = []
-    for p in neutral_p + enemy_p:
-        dist_to = min(dp(p, m) for m in my_p) if my_p else 50
-        # Score = (Production * Weight) - (Garrison * Weight) - (Distance * Weight)
-        score = (p.production * LEARNED_PARAMS["prod_weight"]) \
-                - (p.ships * LEARNED_PARAMS["ship_cost_weight"]) \
-                - (dist_to * LEARNED_PARAMS["dist_weight"])
-        
-        if p.owner == -1 and is_idle_planet(p):
-            score += max(0.0, 100.0 - dist_to) * LEARNED_PARAMS.get("near_idle_dist_weight", 0.85)
-        if is_early and p.owner == -1:
-            score *= LEARNED_PARAMS["prod_target_early"]
-        
-        targets.append((p, score))
-    
-    targets.sort(key=lambda x: (
-        x[0].owner == -1 and is_idle_planet(x[0]),
-        -min(dp(x[0], m) for m in my_p),
-        x[1],
-    ), reverse=True)
-
-    attack_source_limit = max(1, int(math.ceil(len(my_p) * LEARNED_PARAMS.get("active_attack_fraction", 0.30))))
-    active_sources = sorted([p for p in my_p if avail(p) > 0], key=lambda p: avail(p), reverse=True)[:attack_source_limit]
-    attack_source_ids = {p.id for p in active_sources}
-
-    for tgt, score in targets:
-        needed = tgt.ships + 1
-        if tgt.owner != -1:
-            # Enemy growth
-            t_est = travel_turns(min(dp(tgt, m) for m in my_p), 20)
-            needed += int(tgt.production * t_est)
-            # Apply aggressive/defensive ratios
-            ratio = LEARNED_PARAMS["aggressive_ship_ratio"] if is_late else LEARNED_PARAMS["defensive_ship_ratio"]
-            needed = int(needed * ratio)
-        
-        needed = max(1, needed - targeted.get(tgt.id, 0))
-        if needed <= 0: continue
-
-        # Coordinate attacks, but only from the active slice of planets this turn.
-        can_reach = sorted([d for d in my_p if d.id in attack_source_ids and avail(d) > 0], key=lambda d: dp(d, tgt))
-        if sum(avail(d) for d in can_reach) >= needed:
-            for d in can_reach:
-                to_send = min(avail(d), needed)
-                send_to(d, tgt, to_send)
-                needed -= to_send
-                if needed <= 0: break
-
-    # 4. Consolidation
-    if enemy_p and not is_early:
-        front = min(my_p, key=lambda p: min(dp(p, e) for e in enemy_p))
-        for p in my_p:
-            if p.id == front.id: continue
-            av = avail(p)
-            if av >= LEARNED_PARAMS["consolidate_avail"]:
-                send_to(p, front, int(av * LEARNED_PARAMS["consolidate_frac"]))
-
+        prev = _prev_ships.get(p.id)
+        if prev and (prev - p.ships) / prev > 0.60:
+            donors = sorted([q for q in my_p if q.id != p.id], key=lambda q: dp(q, p))
+            for donor in donors:
+                av = avail(donor)
+                if av > 0: send_to(donor, p, av)
+    # Phase 1: Reinforce
+    for p in sorted(my_p, key=lambda p: threat[p.id]):
+        if threat[p.id] < def_thr:
+            needed = def_thr - threat[p.id] + 2
+            donors = sorted([q for q in my_p if q.id != p.id and avail(q) >= needed and threat[q.id] >= def_thr], key=lambda q: dp(q, p))
+            if donors: send_to(donors[0], p, min(needed, avail(donors[0])))
+    # Phase 2: Expand
+    targeted = set()
+    for fl in my_fl:
+        for p in neutral_p + enemy_p:
+            if fleet_net(p, [fl], me)[0] > 0: targeted.add(p.id)
+    if should_expand(my_total, en_total, my_prod, en_prod, phase, mode, len(neutral_p)):
+        for src in sorted(my_p, key=lambda p: -avail(p)):
+            av = avail(src)
+            if av < LEARNED_PARAMS["min_expand_avail"]: continue
+            candidates = sorted([n for n in neutral_p if n.id not in targeted], key=lambda n: (1 if n.id not in comet_ids else 2, dp(src, n)))
+            for tgt in candidates:
+                if tgt.id in comet_ids and not comet_is_capturable(tgt, src, tgt.ships+1, ang_vel, tgt.id, obs_comets, obs_step): continue
+                cost = tgt.ships + 1 + fleet_net(tgt, fleets, me)[1]
+                if cost <= av:
+                    send_to(src, tgt, cost)
+                    targeted.add(tgt.id); break
+    # Phase 3: Attack
+    attack_mult = {"AGGRESSIVE": 1.0, "BALANCED": 1.0, "DEFENSIVE": 1.5}[mode]
+    if enemy_p:
+        cx, cy = sum(p.x for p in my_p)/len(my_p), sum(p.y for p in my_p)/len(my_p)
+        sorted_enemies = sorted(enemy_p, key=lambda e: dist(e.x, e.y, cx, cy))
+        coord_tgt = sorted_enemies[obs_step % len(sorted_enemies)]
+        for src in sorted(my_p, key=lambda p: -avail(p)):
+            av = avail(src)
+            if av >= LEARNED_PARAMS["min_attack_avail"]:
+                need = coord_tgt.ships + 1
+                to_send = min(av, need + max(3, int(need * LEARNED_PARAMS["attack_buffer_ratio"] * attack_mult)))
+                send_to(src, coord_tgt, to_send)
+    # Phase 4: Consolidate
+    if phase != EARLY and enemy_p and len(my_p) > 1:
+        front = min(my_p, key=lambda p: min(dp(p, e) for e in enemy_p) + min(dp(p, e) for e in enemy_p)*0.5)
+        c_thr = LEARNED_PARAMS["consolidate_avail"] // (2 if mode == AGGRESSIVE else 1)
+        f_dist = min(dp(front, e) for e in enemy_p)
+        for src in my_p:
+            if src.id != front.id and fleet_net(src, fleets, me)[0] == 0 and min(dp(src, e) for e in enemy_p) > f_dist * 1.2:
+                av = avail(src)
+                if av >= c_thr and threat[src.id] >= def_thr: send_to(src, front, int(av * LEARNED_PARAMS["consolidate_frac"]))
+    owned_ids = {p.id for p in my_p}
+    for p in my_p: _prev_ships[p.id] = p.ships
+    for pid in list(_prev_ships.keys()):
+        if pid not in owned_ids: del _prev_ships[pid]
     return moves
