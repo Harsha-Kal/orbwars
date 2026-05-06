@@ -438,6 +438,7 @@ def agent(obs):
     committed = {}
     incoming  = {}
     target_enemy_incoming = {}
+    tempo_move = {"offensive_ships": 0, "wave_attempted": False}
 
     def avail(p):
         return max(0, p.ships - committed.get(p.id, 0))
@@ -550,11 +551,16 @@ def agent(obs):
     best_enemy_prod = max(enemy_prod_by_owner.values(), default=0)
     behind = best_enemy_prod > my_prod * 1.30
     no_good_neutrals = not any(n.production >= 2 and target_need(n, incoming) <= 45 for n in neutral_p)
-    collapse_mode = (
+    ahead = bool(enemy_p) and (
+        my_prod > best_enemy_prod * 1.20
+        or len(my_p) >= len(enemy_p) + 3
+        or (leader_score > 0 and my_score > leader_score * 1.20)
+    )
+    collapse_mode = ahead and (
         (step > 220 and no_good_neutrals)
-        or behind
         or (my_ships > 350 and step - last_meaningful >= 8)
-        or (enemy_p and (my_prod > best_enemy_prod * 1.30 or len(my_p) >= len(enemy_p) + 3))
+        or my_prod > best_enemy_prod * 1.30
+        or len(my_p) >= len(enemy_p) + 3
     )
 
     def target_score_fn(tgt, src=None, leader_focus=False):
@@ -613,6 +619,7 @@ def agent(obs):
         moves.append([src.id, ang, n])
         if tgt.owner != me:
             incoming[tgt.id] = incoming.get(tgt.id, 0) + n
+            tempo_move["offensive_ships"] += n
         return True
 
     def source_list_for(tgt, max_src=6):
@@ -643,6 +650,8 @@ def agent(obs):
                 continue
             if fire(src, tgt, send_n, allow_partial=allow_partial):
                 sent += send_n
+        if sent > 0 and tgt.owner != me:
+            tempo_move["wave_attempted"] = True
         return sent
 
     def choose_opening_target(src):
@@ -744,6 +753,15 @@ def agent(obs):
         if not neutral_p or step >= OPENING_STEPS:
             return False
         acted = False
+
+        def opening_partial_ok(tgt, need, send_n):
+            return (
+                send_n >= need
+                or send_n >= 8
+                or send_n >= need * 0.70
+                or incoming.get(tgt.id, 0) > 0
+            )
+
         if len(my_p) == 1:
             src = my_p[0]
             tgt = choose_opening_target(src)
@@ -751,8 +769,13 @@ def agent(obs):
                 return False
             need = max(1, target_need(tgt, incoming) + (2 if step < 25 else 1))
             av = max(0, src.ships - committed.get(src.id, 0) - (1 if step < 25 else 2))
-            if av > 0 and (step < 25 or calculate_surplus(src) >= OPENING_MIN_SEND):
-                acted = fire(src, tgt, min(av, need), allow_partial=True) or acted
+            send_n = min(av, need)
+            if (
+                send_n > 0
+                and (step < 25 or calculate_surplus(src) >= OPENING_MIN_SEND)
+                and opening_partial_ok(tgt, need, send_n)
+            ):
+                acted = fire(src, tgt, send_n, allow_partial=True) or acted
         else:
             for src in sorted(my_p, key=lambda p: -calculate_surplus(p))[:3]:
                 av = calculate_surplus(src)
@@ -764,7 +787,9 @@ def agent(obs):
                 need = target_need(tgt, incoming) + 1
                 if need <= 0:
                     continue
-                acted = fire(src, tgt, min(av, need), allow_partial=True) or acted
+                send_n = min(av, need)
+                if opening_partial_ok(tgt, need, send_n):
+                    acted = fire(src, tgt, send_n, allow_partial=True) or acted
         return acted
 
     def normal_expansion():
@@ -913,7 +938,7 @@ def agent(obs):
     meaningful = collapse_attack() or meaningful
     meaningful = final_drain() or meaningful
 
-    if meaningful or moves:
+    if tempo_move["offensive_ships"] >= 15 or tempo_move["wave_attempted"]:
         agent._last_meaningful[me] = step
 
     return moves
