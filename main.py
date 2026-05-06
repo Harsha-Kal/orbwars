@@ -54,11 +54,17 @@ FAST_ROTATING_TURNS   = 20.0  # was 18.0
 SAME_TIME_MARGIN      = 4.0
 
 # Quick-capture: blitz cheap nearby planets every step until captured
-QUICK_SHIPS = 20
-QUICK_STEPS = 5
+QUICK_SHIPS       = 20
+QUICK_STEPS       = 5
+QUICK_MAX_PER_SRC = 3     # max quick-capture targets fired per source per turn
+
+# Finisher / micro-wave
+FINISHER_SHIPS = 4     # target with ≤ this remaining need gets a finisher fleet
+WAVE_FRAC      = 0.28  # send fraction for secondary micro-wave pass
 
 # Rotating-planet timing: fire when fleet meets tgt near its closest pass
 CLOSEST_APPROACH_MARGIN = 6.0   # steps of headroom before closest point
+HIT_MARGIN              = 3.0   # acceptable aimed-point miss beyond planet radius
 
 # Bridgehead: neutrals on the path to a far enemy get a value bonus
 BRIDGE_ANGLE_THRESH = 0.35   # radians; neutral within this cone = on-path
@@ -71,6 +77,49 @@ LARGE_RADIUS = 6.0
 # 4-player tuning
 SIDE_ENEMY_BONUS    = 1.35   # multiplier for ~90° side opponents
 POLAR_ENEMY_PENALTY = 0.70   # multiplier for ~180° polar opponents
+
+# Early-game aggression
+FIRST_CAPTURE_DEADLINE = 33   # force-capture 2nd planet by this step
+EARLY_STEPS            = 55   # lighter reserves and looser rotating timing before this step
+EARLY_WAIT_THRESH      = 8.0  # max closest-approach wait when step < EARLY_STEPS
+
+# Phase-based reserve tuning
+HIGH_PROD_THRESHOLD  = 4     # production >= this → core planet
+HIGH_PROD_EXTRA      = 8     # extra ships held on core planets (mid/late only)
+
+# Frontline / backline
+FRONTLINE_DIST        = 25.0  # distance to nearest enemy below which = frontline
+FRONTLINE_SEND_FRAC   = 0.35  # send fraction for frontline planets (vs SEND_FRAC)
+FRONTLINE_RESERVE_MULT = 1.5  # reserve multiplier for frontline planets
+
+# Source safety thresholds by move type
+SAFETY_EXPAND_THRESH = 0.40   # looser: expanding to a neutral
+SAFETY_ATTACK_THRESH = 0.65   # tighter: attacking an enemy planet
+
+# Endgame
+ENDGAME_STEPS   = 400   # all-in mode: use avail() not safe_avail(), allow_unsafe everywhere
+LATE_GAME_STEPS = 350   # prefer enemy planets over neutrals from this step on
+FINAL_STEPS     = 460   # drain pass: send all idle ships to any reachable target
+
+# Target selection
+ETA_SCORE_WEIGHT     = 0.8    # penalty per turn of capture ETA in idle planet scoring
+OPPORTUNISTIC_SHIPS  = 15     # attack enemy planets with ≤ this many ships before expanding
+BRIDGE_MIN_PLANETS = 2      # enable bridgehead bonus only once we own this many planets
+COMET_ARC_LIMIT    = 10.0   # skip low-production rotating planets with arc above this
+EXPAND_WAR_MAX     = 1      # max expansion launches per planet when under_attack
+
+# Opponent style detection
+SWARM_STYLE_FLEETS     = 3     # enemy fleet count at or above this → swarm classifier
+SWARM_STYLE_SIZE       = 20    # avg enemy fleet size at or below this → swarm classifier
+AGGRESSIVE_EXPAND_RATE = 0.07  # enemy_planets / step above this → aggressive classifier
+TURTLE_SHIP_THRESH     = 40    # avg ships per enemy planet above this → turtle classifier
+
+# Defense reactivity
+DEFENSE_ETA_HORIZON   = 30    # only count inbound fleets arriving within this many turns
+SWARM_FLEET_COUNT     = 2     # ≥ this many enemy fleets inbound → swarm threat
+SWARM_RESERVE_MULT    = 1.4   # global reserve multiplier under swarm attack
+WAR_MODE_DIST         = 20.0  # nearest enemy planet within this distance → war mode
+WAR_MODE_RESERVE_MULT = 1.25  # reserve multiplier in war mode
 
 
 # ── geometry ──────────────────────────────────────────────────────────────────
@@ -110,7 +159,7 @@ def safe_angle(sx, sy, tx, ty):
     if not hits_sun(sx, sy, tx, ty):
         return direct
     d = dist(sx, sy, tx, ty)
-    for off in [0.5, -0.5, 1.0, -1.0]:
+    for off in [0.2, -0.2, 0.4, -0.4, 0.6, -0.6, 0.8, -0.8, 1.0, -1.0, 1.3, -1.3]:
         ang = direct + off
         ex, ey = sx + d * math.cos(ang), sy + d * math.sin(ang)
         if not hits_sun(sx, sy, ex, ey):
@@ -129,14 +178,30 @@ def predict_pos(p, ang_vel, turns):
     new_ang = cur_ang + ang_vel * turns
     return SUN_X + orb_r * math.cos(new_ang), SUN_Y + orb_r * math.sin(new_ang)
 
-def aim_at(src, tgt, ang_vel, ships):
-    """Iteratively converge on the intercept angle for a moving target."""
+def aim_valid(src, tgt, ang_vel, ships):
+    """
+    Return (angle, hit_ok).  15 iterations for better convergence.
+    hit_ok is False when the aimed point misses a rotating target by > HIT_MARGIN.
+    Always True for idle targets (they don't move).
+    """
     tx, ty = tgt.x, tgt.y
-    for _ in range(10):
+    d_est = dp(src, tgt)
+    for _ in range(15):
         d_est = dist(src.x, src.y, tx, ty)
         t_est = travel_turns(d_est, ships)
         tx, ty = predict_pos(tgt, ang_vel, t_est)
-    return safe_angle(src.x, src.y, tx, ty)
+    angle = safe_angle(src.x, src.y, tx, ty)
+    if is_idle(tgt):
+        return angle, True
+    aimed_x = src.x + d_est * math.cos(angle)
+    aimed_y = src.y + d_est * math.sin(angle)
+    miss = dist(aimed_x, aimed_y, tx, ty)
+    return angle, miss <= tgt.radius + HIT_MARGIN
+
+def aim_at(src, tgt, ang_vel, ships):
+    """Iteratively converge on the intercept angle for a moving target."""
+    angle, _ = aim_valid(src, tgt, ang_vel, ships)
+    return angle
 
 def fleet_heading_to(fl, p, ang_vel):
     """True if fleet is heading toward p's predicted future position."""
@@ -269,9 +334,13 @@ def is_bridge(src_p, neutral, enemy_p):
 
 def agent(obs):
     g = lambda k, d: (obs.get(k, d) if isinstance(obs, dict) else getattr(obs, k, d))
-    me      = int(g("player", 0))
-    ang_vel = float(g("angular_velocity", g("angularVelocity", 0.033)))
-    step    = int(g("step", 0))
+    me   = int(g("player", 0))
+    step = int(g("step", 0))
+    # Try snake_case first, then camelCase, then a sane default
+    _av = g("angular_velocity", None)
+    if _av is None:
+        _av = g("angularVelocity", 0.033)
+    ang_vel = float(_av)
 
     planets = [Planet(*p) for p in g("planets", [])]
     fleets  = [Fleet(*f)  for f in g("fleets",  [])]
@@ -296,6 +365,33 @@ def agent(obs):
     def avail(p):
         return max(0, p.ships - committed.get(p.id, 0))
 
+    _inbound_enemy_fleet_count = sum(
+        1 for fl in enemy_fleets
+        for p2 in my_p if fleet_heading_to(fl, p2, ang_vel)
+    )
+    under_swarm  = _inbound_enemy_fleet_count >= SWARM_FLEET_COUNT
+    under_attack = (
+        _inbound_enemy_fleet_count > 0
+        or (bool(enemy_p) and bool(my_p)
+            and min(dp(p2, e) for p2 in my_p for e in enemy_p) < WAR_MODE_DIST)
+    )
+
+    # ── Opponent style detection ───────────────────────────────────────────────
+    _opp_fleet_n   = len(enemy_fleets)
+    _opp_avg_size  = sum(fl.ships for fl in enemy_fleets) / max(1, _opp_fleet_n)
+    _opp_avg_ships = sum(e.ships  for e in enemy_p)       / max(1, len(enemy_p))
+    opp_is_swarm = (
+        _opp_fleet_n >= SWARM_STYLE_FLEETS and _opp_avg_size <= SWARM_STYLE_SIZE
+    )
+    opp_is_aggressive = bool(enemy_p) and (
+        len(enemy_p) / max(1, step) > AGGRESSIVE_EXPAND_RATE
+        or (under_attack and step < EXPAND_STEPS // 2)
+    )
+    opp_is_turtle = bool(enemy_p) and (
+        _opp_avg_ships >= TURTLE_SHIP_THRESH
+        and _opp_fleet_n < max(1, len(enemy_p))
+    )
+
     def enemy_pressure_on(p, horizon=25):
         pressure = 0
         for e in enemy_p:
@@ -307,9 +403,22 @@ def agent(obs):
         return pressure
 
     def reserve_for(p):
-        base = 5 + p.production * 2
-        if p.production >= 4:
-            base += 8
+        if step < EARLY_STEPS:
+            base = 2 + p.production
+        elif step < EXPAND_STEPS:
+            base = 4 + p.production
+            if p.production >= HIGH_PROD_THRESHOLD:
+                base += HIGH_PROD_EXTRA
+        else:
+            base = 5 + p.production * 2
+            if p.production >= HIGH_PROD_THRESHOLD:
+                base += HIGH_PROD_EXTRA
+        if enemy_p and min(dp(p, e) for e in enemy_p) < FRONTLINE_DIST:
+            base = int(base * FRONTLINE_RESERVE_MULT)
+        if under_swarm:
+            base = int(base * SWARM_RESERVE_MULT)
+        elif under_attack:
+            base = int(base * WAR_MODE_RESERVE_MULT)
         return int(base + 0.45 * enemy_pressure_on(p))
 
     def safe_avail(p):
@@ -318,9 +427,29 @@ def agent(obs):
     def incoming_enemy_pressure_on(p):
         return sum(fl.ships for fl in enemy_fleets if fleet_heading_to(fl, p, ang_vel))
 
-    def source_safe_after_send(src, send_n):
+    def eta_incoming_counts(p):
+        """Like incoming_counts but only fleets arriving within DEFENSE_ETA_HORIZON turns."""
+        fi = sum(
+            fl.ships for fl in my_fleets
+            if fleet_heading_to(fl, p, ang_vel)
+            and travel_turns(dist(fl.x, fl.y, p.x, p.y), fl.ships) <= DEFENSE_ETA_HORIZON
+        )
+        ei = sum(
+            fl.ships for fl in enemy_fleets
+            if fleet_heading_to(fl, p, ang_vel)
+            and travel_turns(dist(fl.x, fl.y, p.x, p.y), fl.ships) <= DEFENSE_ETA_HORIZON
+        )
+        return fi, ei
+
+    def source_safe_after_send(src, send_n, safety_thresh=0.55):
         remaining = src.ships - committed.get(src.id, 0) - send_n
         nearby_enemy_power = incoming_enemy_pressure_on(src)
+        for fl in enemy_fleets:
+            if not fleet_heading_to(fl, src, ang_vel):
+                d = dist(fl.x, fl.y, src.x, src.y)
+                if d < 20:
+                    eta = travel_turns(d, fl.ships)
+                    nearby_enemy_power += fl.ships * max(0.0, 1.0 - eta / 20) * 0.5
         for e in enemy_p:
             possible = max(0, e.ships - 5)
             if possible <= 0:
@@ -329,15 +458,17 @@ def agent(obs):
             if eta <= 20:
                 nearby_enemy_power += possible * (1.0 - eta / 20)
         future_defense = remaining + src.production * 8
-        return future_defense >= nearby_enemy_power * 0.55
+        return future_defense >= nearby_enemy_power * safety_thresh
 
-    def fire(src, tgt, n, allow_unsafe=False):
+    def fire(src, tgt, n, allow_unsafe=False, safety_thresh=0.55):
         n = int(n)
         if n <= 0:
             return False
-        if not allow_unsafe and not source_safe_after_send(src, n):
+        if not allow_unsafe and not source_safe_after_send(src, n, safety_thresh):
             return False
-        ang = aim_at(src, tgt, ang_vel, n)
+        ang, hit_ok = aim_valid(src, tgt, ang_vel, n)
+        if not hit_ok:
+            return False  # shot would miss the rotating target
         committed[src.id] = committed.get(src.id, 0) + n
         moves.append([src.id, ang, n])
         incoming[tgt.id] = incoming.get(tgt.id, 0) + n
@@ -351,7 +482,7 @@ def agent(obs):
 
     # Precompute bridge status once: neutral ids that lie on the path to an enemy
     bridge_ids = set()
-    if enemy_p:
+    if enemy_p and len(my_p) >= BRIDGE_MIN_PLANETS:
         for m in my_p:
             for n in neutral_p:
                 for e in enemy_p:
@@ -363,7 +494,7 @@ def agent(obs):
 
     # ── Phase 1: Emergency defense / evacuation ───────────────────────────────
     for p in my_p:
-        fi, ei = incoming_counts(p, my_fleets, enemy_fleets, ang_vel)
+        fi, ei = eta_incoming_counts(p)
         net = p.ships + fi - ei
         threatened[p.id] = ei > fi and net < DEFEND_NET
 
@@ -371,14 +502,17 @@ def agent(obs):
             av = avail(p) - EVAC_RESERVE
             if av > 0:
                 if not is_idle(p):
-                    rotating_neutrals = [
-                        n for n in neutral_p
-                        if not is_idle(n) and target_need(n, incoming) <= av
-                    ]
-                    if rotating_neutrals:
-                        tgt = min(rotating_neutrals, key=lambda n: dp(p, n))
-                        fire(p, tgt, av, allow_unsafe=True)
-                        continue
+                    rotating_neu = [n for n in neutral_p if not is_idle(n) and target_need(n, incoming) > 0]
+                    idle_neu_ev  = [n for n in neutral_p if is_idle(n)       and target_need(n, incoming) > 0]
+                    friendly_ev  = [q for q in my_p if q.id != p.id]
+                    evac_tgt = (
+                        min(rotating_neu,  key=lambda n: dp(p, n)) if rotating_neu  else
+                        min(idle_neu_ev,   key=lambda n: dp(p, n)) if idle_neu_ev   else
+                        min(friendly_ev,   key=lambda q: dp(p, q)) if friendly_ev   else None
+                    )
+                    if evac_tgt is not None:
+                        fire(p, evac_tgt, av, allow_unsafe=True)
+                    continue
                 else:
                     bigger_idle = [
                         q for q in my_p
@@ -433,16 +567,48 @@ def agent(obs):
             if eta <= QUICK_STEPS:
                 quick_hits.append((eta, need, tgt))
         quick_hits.sort()
+        q_count = 0
         for eta, need, tgt in quick_hits:
+            if q_count >= QUICK_MAX_PER_SRC:
+                break
             av = safe_avail(src)
             send_n = min(av, need)
-            if send_n > 0:
-                fire(src, tgt, send_n)
-            break  # one quick-capture target per source per turn
+            if send_n > 0 and fire(src, tgt, send_n, safety_thresh=SAFETY_EXPAND_THRESH):
+                q_count += 1
+
+    # ── Phase 1c: Finisher pass ───────────────────────────────────────────────
+    # For any planet already receiving committed ships but still needing ≤
+    # finisher_limit more, find the nearest source and send a tiny finisher.
+    finisher_limit = FINISHER_SHIPS * 2 if opp_is_swarm else FINISHER_SHIPS
+    for tgt in sorted(neutral_p + enemy_p,
+                      key=lambda t: target_need(t, incoming)):
+        need = target_need(tgt, incoming)
+        if need <= 0 or need > finisher_limit:
+            continue
+        if incoming.get(tgt.id, 0) == 0:
+            continue  # only top-up attacks already in flight
+        for src in sorted(my_p, key=lambda p: dp(p, tgt)):
+            av = avail(src) - 1
+            send_n = min(av, need)
+            if send_n > 0 and fire(src, tgt, send_n, allow_unsafe=True):
+                need -= send_n
+            if need <= 0:
+                break
 
     # ── Single-planet opener ──────────────────────────────────────────────────
     if step < OPENING_STEPS and len(my_p) == 1 and neutral_p:
         src = my_p[0]
+        # Deadline: must own a 2nd planet by FIRST_CAPTURE_DEADLINE — force fire
+        if step >= FIRST_CAPTURE_DEADLINE:
+            av_dl = avail(src) - 1
+            in_prog = sorted(
+                [n for n in neutral_p if incoming.get(n.id, 0) > 0 and target_need(n, incoming) > 0],
+                key=lambda n: target_need(n, incoming)
+            )
+            dl_tgt = in_prog[0] if in_prog else min(neutral_p, key=lambda n: dp(src, n))
+            dl_need = target_need(dl_tgt, incoming)
+            if dl_need > 0 and av_dl > 0:
+                fire(src, dl_tgt, min(av_dl, dl_need), allow_unsafe=True)
         av = safe_avail(src)
         if av >= OPENING_MIN_SEND:
             idle_targets     = [n for n in neutral_p if     is_idle(n) and target_need(n, incoming) > 0]
@@ -492,9 +658,15 @@ def agent(obs):
 
     # ── Early economy roles ───────────────────────────────────────────────────
     if step < EXPAND_STEPS and neutral_p:
+        if opp_is_swarm:
+            effective_max = 0                   # vs swarm: stop expanding, defend and counter
+        elif opp_is_aggressive or under_attack:
+            effective_max = EXPAND_WAR_MAX      # vs aggressive: one launch max
+        else:
+            effective_max = EXPAND_MAX_PER_PLANET
         for src in sorted(my_p, key=lambda p: (is_idle(p), p.production, avail(p)), reverse=True):
             launched = 0
-            while launched < EXPAND_MAX_PER_PLANET:
+            while launched < effective_max:
                 if is_idle(src):
                     av = safe_avail(src)
                     if av < EXPAND_MIN_SEND:
@@ -509,8 +681,14 @@ def agent(obs):
                             continue
                         bridge = BRIDGE_BONUS if tgt.id in bridge_ids else 0.0
                         if is_idle(tgt):
-                            idle_targets.append((dp(src, tgt), -(idle_capture_value(src, tgt) + bridge), tgt.id, tgt, need))
+                            eta = capture_eta(src, tgt, max(1, need))
+                            prod_w = 150.0 if step < EARLY_STEPS else 100.0
+                            _icv = tgt.production * prod_w - tgt.ships * 4.0 - eta * ETA_SCORE_WEIGHT
+                            idle_targets.append((eta, -(_icv + bridge), tgt.id, tgt, need))
                         else:
+                            arc = arc_travel(tgt, ang_vel, src.x, src.y)
+                            if arc > COMET_ARC_LIMIT and tgt.production < HIGH_PROD_THRESHOLD:
+                                continue
                             score = rotating_capture_value(src, tgt, ang_vel)
                             if score > -1e8:
                                 front_score = rotating_front_score(src, tgt, ang_vel) + bridge
@@ -535,12 +713,13 @@ def agent(obs):
                     chosen = None
                     need   = 0
 
+                    rot_wait_thresh = EARLY_WAIT_THRESH if step < OPENING_STEPS else 1.0
                     if should_take_rotating_first:
                         # Pick best rotating that is within its timing window
                         for item in sorted(rotating_targets):
                             _, _, _, _, cand, cand_need = item
                             wait = closest_approach_timing(src, cand, ang_vel, min(av, cand_need))
-                            if wait <= 1.0:
+                            if wait <= rot_wait_thresh:
                                 chosen, need = cand, cand_need
                                 break
                         # Fall back to idle if no rotating target is ready
@@ -552,20 +731,27 @@ def agent(obs):
                         for item in sorted(rotating_targets):
                             _, _, _, _, cand, cand_need = item
                             wait = closest_approach_timing(src, cand, ang_vel, min(av, cand_need))
-                            if wait <= 1.0:
+                            if wait <= rot_wait_thresh:
                                 chosen, need = cand, cand_need
                                 break
                     elif enemy_targets:
                         _, _, _, chosen, need = min(enemy_targets)
 
                     if chosen is None:
-                        break
+                        fb = [n for n in neutral_p if target_need(n, incoming) > 0]
+                        if fb:
+                            chosen = min(fb, key=lambda n: dp(src, n))
+                            need = target_need(chosen, incoming)
+                        else:
+                            break
 
                     send_n = min(av, need)
                     if send_n < EXPAND_MIN_SEND and send_n < need:
                         break
-                    fire(src, chosen, send_n)
-                    launched += 1
+                    if fire(src, chosen, send_n):
+                        launched += 1
+                    else:
+                        break
                 else:
                     av = safe_avail(src)
                     if av < OPENING_MIN_SEND:
@@ -581,11 +767,17 @@ def agent(obs):
                             continue
                         bridge = BRIDGE_BONUS if tgt.id in bridge_ids else 0.0
                         if is_idle(tgt):
-                            item = (dp(src, tgt), -(idle_capture_value(src, tgt) + bridge), tgt.id, tgt, need)
+                            eta = capture_eta(src, tgt, max(1, need))
+                            prod_w = 150.0 if step < EARLY_STEPS else 100.0
+                            _icv = tgt.production * prod_w - tgt.ships * 4.0 - eta * ETA_SCORE_WEIGHT
+                            item = (eta, -(_icv + bridge), tgt.id, tgt, need)
                             if incoming.get(tgt.id, 0) > 0:
                                 claimed_idle.append(item)
-                            high_idle.append((-(idle_capture_value(src, tgt) + bridge), dp(src, tgt), tgt.id, tgt, need))
+                            high_idle.append((-(_icv + bridge), eta, tgt.id, tgt, need))
                         else:
+                            arc = arc_travel(tgt, ang_vel, src.x, src.y)
+                            if arc > COMET_ARC_LIMIT and tgt.production < HIGH_PROD_THRESHOLD:
+                                continue
                             score = rotating_front_score(src, tgt, ang_vel) + bridge
                             if score > -1e8:
                                 high_rotating.append((-score, dp(src, tgt), tgt.id, tgt, need))
@@ -604,10 +796,11 @@ def agent(obs):
                     elif launched % 2 == 0 and high_idle:
                         _, _, _, chosen, need = min(high_idle)
                     elif high_rotating:
+                        rot_wait_thresh = EARLY_WAIT_THRESH if step < OPENING_STEPS else 1.0
                         for item in sorted(high_rotating):
                             _, _, _, cand, cand_need = item
                             wait = closest_approach_timing(src, cand, ang_vel, min(av, cand_need))
-                            if wait <= 1.0:
+                            if wait <= rot_wait_thresh:
                                 chosen, need = cand, cand_need
                                 break
                         if chosen is None and high_idle:
@@ -618,47 +811,80 @@ def agent(obs):
                         _, _, _, chosen, need = min(high_enemy)
 
                     if chosen is None:
-                        break
+                        fb = [n for n in neutral_p if target_need(n, incoming) > 0]
+                        if fb:
+                            chosen = min(fb, key=lambda n: dp(src, n))
+                            need = target_need(chosen, incoming)
+                        else:
+                            break
                     send_n = min(av, need)
                     if send_n < OPENING_MIN_SEND and send_n < need:
                         break
-                    fire(src, chosen, send_n)
-                    launched += 1
+                    if fire(src, chosen, send_n):
+                        launched += 1
+                    else:
+                        break
 
     # ── Phase 2: Per-planet offensive ─────────────────────────────────────────
     rem_steps = max(1, TOTAL_STEPS - step)
+    endgame   = step >= ENDGAME_STEPS
+    late_game = (
+        step >= LATE_GAME_STEPS
+        or (opp_is_turtle     and step >= LATE_GAME_STEPS // 2)
+        or (opp_is_aggressive and step >= LATE_GAME_STEPS * 2 // 3)
+    )
 
-    # Idle neutrals sorted by effective distance (bridge targets bumped up)
+    # Idle neutrals sorted by fastest-capture ETA from any owned planet (bridge targets bumped up)
     idle_neu = sorted(
         [n for n in neutral_p if is_idle(n)],
         key=lambda n: (
-            min(dp(n, m) for m in my_p)
-            - (BRIDGE_BONUS * 0.4 if n.id in bridge_ids else 0.0)
+            min(capture_eta(m, n, max(1, target_need(n, incoming))) for m in my_p)
+            - (BRIDGE_BONUS * 0.4 if n.id in bridge_ids and len(my_p) >= BRIDGE_MIN_PLANETS else 0.0)
         )
     )
 
-    for src in sorted(my_p, key=lambda p: -safe_avail(p)):
-        av = safe_avail(src)
-        fleet_size = int(av * SEND_FRAC)
-        if fleet_size < MIN_FLEET:
-            if fleet_size < 5 or len(my_p) >= 3:
-                continue
+    for src in sorted(my_p, key=lambda p: -(avail(p) if endgame else safe_avail(p))):
+        av = avail(src) if endgame else safe_avail(src)
+        if endgame:
             fleet_size = av
+            if fleet_size < 2:
+                continue
+        else:
+            send_frac = FRONTLINE_SEND_FRAC if (enemy_p and min(dp(src, e) for e in enemy_p) < FRONTLINE_DIST) else SEND_FRAC
+            fleet_size = int(av * send_frac)
+            if fleet_size < MIN_FLEET:
+                if fleet_size < 5 or len(my_p) >= 3:
+                    continue
+                fleet_size = av
 
         chosen = None
 
+        # ── 2_opp: Kill any exposed enemy planet before expanding ─────────────
+        for e in sorted(enemy_p, key=lambda x: x.ships):
+            if e.ships > OPPORTUNISTIC_SHIPS:
+                break
+            if incoming.get(e.id, 0) >= e.ships + 1:
+                continue
+            need_n = enemy_need(src, e, fleet_size, incoming)
+            if 0 < need_n <= fleet_size:
+                chosen = e
+                break
+
         # ── 2a: Nearest idle neutral not fully covered ────────────────────────
-        for tgt in idle_neu:
-            already = incoming.get(tgt.id, 0)
-            if already >= tgt.ships + 1:
-                continue
-            if arc_travel(tgt, ang_vel, src.x, src.y) > MAX_ARC:
-                continue
-            chosen = tgt
-            break
+        if chosen is None and not (late_game and enemy_p):
+            for tgt in idle_neu:
+                already = incoming.get(tgt.id, 0)
+                if already >= tgt.ships + 1:
+                    continue
+                if arc_travel(tgt, ang_vel, src.x, src.y) > MAX_ARC:
+                    continue
+                if capture_eta(src, tgt, fleet_size) >= rem_steps:
+                    continue
+                chosen = tgt
+                break
 
         # ── 2b: Nearest orbiting neutral (closest-approach gated) ─────────────
-        if chosen is None:
+        if chosen is None and not (late_game and enemy_p):
             for tgt in sorted(neutral_p, key=lambda n: dp(src, n)):
                 if is_idle(tgt):
                     continue
@@ -666,6 +892,8 @@ def agent(obs):
                     continue
                 already = incoming.get(tgt.id, 0)
                 if already >= tgt.ships + 1:
+                    continue
+                if capture_eta(src, tgt, fleet_size) >= rem_steps:
                     continue
                 wait = closest_approach_timing(src, tgt, ang_vel, fleet_size)
                 if wait > 1.0:
@@ -675,14 +903,17 @@ def agent(obs):
 
         # ── 2c: Best enemy planet (4-player-aware) ────────────────────────────
         if chosen is None and enemy_p:
-            # In 4-player, keep expanding neutrals before attacking enemies
-            if not (four_player and len(neutral_p) > len(my_p)):
+            # In 4-player, keep expanding neutrals before attacking enemies;
+            # but once under_attack, switch to war mode immediately.
+            if not (four_player and len(neutral_p) > len(my_p) and not under_attack):
                 def en_val(e):
                     d       = dp(src, e)
                     t       = travel_turns(d, fleet_size)
+                    if t >= rem_steps - 5:
+                        return -1.0  # won't arrive before game ends
                     g_est   = e.ships + int(e.production * t)
                     already = incoming.get(e.id, 0)
-                    if already >= g_est * 3:
+                    if already >= g_est + 1:
                         return -1.0
                     rem_g = max(1, g_est - already)
                     base  = (e.production * rem_steps / (rem_g + 5)
@@ -701,9 +932,11 @@ def agent(obs):
                 if en_val(best_e) > 0:
                     chosen = best_e
 
-        # ── 2d: Force nearest enemy if nothing else ───────────────────────────
+        # ── 2d: Force nearest reachable enemy if nothing else ────────────────
         if chosen is None and enemy_p:
-            chosen = min(enemy_p, key=lambda e: dp(src, e))
+            reachable_e = [e for e in enemy_p if capture_eta(src, e, fleet_size) < rem_steps]
+            if reachable_e:
+                chosen = min(reachable_e, key=lambda e: dp(src, e))
 
         if chosen is None:
             continue
@@ -714,7 +947,31 @@ def agent(obs):
         still_needed = (g_est + 1) - incoming.get(chosen.id, 0)   # fixed: was always fleet_size
         send_n       = int(min(fleet_size, max(1, still_needed)))
 
-        fire(src, chosen, send_n, allow_unsafe=(rem_steps < 50))
+        s_thresh = SAFETY_ATTACK_THRESH if chosen.owner != -1 else SAFETY_EXPAND_THRESH
+        fire(src, chosen, send_n, allow_unsafe=(endgame or rem_steps < 50), safety_thresh=s_thresh)
+
+    # ── Phase 2e: Micro second-wave ───────────────────────────────────────────
+    # After the main wave, fire small second fleets at uncovered targets.
+    for src in sorted(my_p, key=lambda p: -safe_avail(p)):
+        av = safe_avail(src)
+        fleet2 = int(av * WAVE_FRAC)
+        if fleet2 < 2:
+            continue
+        micro_tgt = None
+        for n in sorted(neutral_p, key=lambda n: capture_eta(src, n, max(1, fleet2))):
+            if target_need(n, incoming) > 0:
+                micro_tgt = n
+                break
+        if micro_tgt is None and enemy_p:
+            candidates = [e for e in enemy_p if enemy_need(src, e, fleet2, incoming) > 0]
+            if candidates:
+                micro_tgt = min(candidates, key=lambda e: dp(src, e))
+        if micro_tgt is None:
+            continue
+        need2 = target_need(micro_tgt, incoming)
+        send2 = int(min(fleet2, max(1, need2)))
+        s2 = SAFETY_ATTACK_THRESH if micro_tgt.owner != -1 else SAFETY_EXPAND_THRESH
+        fire(src, micro_tgt, send2, safety_thresh=s2)
 
     # ── Phase 3: Multi-planet rotating coordination ───────────────────────────
     # When a rotating neutral target still has need > 0 after all per-planet
@@ -727,7 +984,9 @@ def agent(obs):
             continue
         contributors = []
         for src in sorted(my_p, key=lambda p: dp(p, tgt)):
-            av = avail(src) - 1
+            if threatened.get(src.id, False):
+                continue
+            av = safe_avail(src)
             if av < EXPAND_MIN_SEND:
                 continue
             wait = closest_approach_timing(src, tgt, ang_vel, max(1, av))
@@ -746,5 +1005,59 @@ def agent(obs):
             if send_n >= EXPAND_MIN_SEND:
                 fire(src, tgt, send_n, allow_unsafe=True)
                 remaining -= send_n
+
+    # ── Phase 4: Coordinated enemy assault ───────────────────────────────────
+    # Pool ships from multiple planets to take the most valuable exposed enemy.
+    # Only runs when Phase 2 left the target under-committed.
+    if enemy_p and my_p:
+        def assault_value(e):
+            nearest = min(my_p, key=lambda p2: dp(p2, e))
+            still = enemy_need(nearest, e, max(1, safe_avail(nearest)), incoming)
+            if still <= 0:
+                return -1.0
+            if sum(safe_avail(p2) for p2 in my_p) < still:
+                return -1.0
+            return e.production * rem_steps / (still + 5.0)
+
+        atgt = max(enemy_p, key=assault_value)
+        if assault_value(atgt) > 0:
+            nearest = min(my_p, key=lambda p2: dp(p2, atgt))
+            a_need = max(1, enemy_need(nearest, atgt, max(1, safe_avail(nearest)), incoming))
+            remaining = a_need
+            p4_min = 2 if opp_is_turtle else MIN_FLEET
+            for src in sorted(my_p, key=lambda p2: dp(p2, atgt)):
+                if remaining <= 0:
+                    break
+                if threatened.get(src.id, False):
+                    continue
+                av = safe_avail(src)
+                if av < p4_min:
+                    continue
+                send_n = min(av, remaining)
+                if fire(src, atgt, send_n, safety_thresh=SAFETY_ATTACK_THRESH):
+                    remaining -= send_n
+
+    # ── Endgame drain ─────────────────────────────────────────────────────────
+    # Near game end, send all idle ships to every reachable target.
+    if step >= FINAL_STEPS:
+        drain_targets = sorted(
+            [t for t in neutral_p + enemy_p if target_need(t, incoming) > 0],
+            key=lambda t: min(capture_eta(p2, t, max(1, avail(p2))) for p2 in my_p)
+        )
+        for src in sorted(my_p, key=lambda p: -avail(p)):
+            av = avail(src) - 1
+            if av <= 0:
+                continue
+            for tgt in drain_targets:
+                if capture_eta(src, tgt, max(1, av)) >= rem_steps:
+                    continue
+                need = target_need(tgt, incoming)
+                if need <= 0:
+                    continue
+                send_n = min(av, need)
+                if send_n > 0 and fire(src, tgt, send_n, allow_unsafe=True):
+                    av -= send_n
+                if av <= 0:
+                    break
 
     return moves
