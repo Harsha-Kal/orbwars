@@ -1,5 +1,5 @@
 """
-Orbit Wars – Competitive Agent v11
+Orbit Wars – Competitive Agent v12
 ====================================
 Action:  [from_planet_id, angle_radians, num_ships]
 Planet:  Planet(id, owner, x, y, radius, ships, production)
@@ -330,6 +330,80 @@ def is_bridge(src_p, neutral, enemy_p):
     return diff < BRIDGE_ANGLE_THRESH and dp(src_p, neutral) < dp(src_p, enemy_p)
 
 
+# ── Strategy phase ────────────────────────────────────────────────────────────
+
+def get_phase(my_p, enemy_p, enemy_fleets, step, ang_vel):
+    """Classify current state into one of six strategic phases."""
+    my_prod    = sum(p.production for p in my_p)
+    enemy_prod = sum(p.production for p in enemy_p)
+    factions   = set(p.owner for p in enemy_p)
+
+    if len(my_p) < 3 or step < 50:
+        return 'OPENING'
+    if len(enemy_p) <= 2:
+        return 'ENDGAME'
+    if my_p and (enemy_p or enemy_fleets):
+        in_contact = (
+            any(fleet_heading_to(fl, m, ang_vel) for fl in enemy_fleets for m in my_p)
+            or (enemy_p and min(dp(m, e) for m in my_p for e in enemy_p) < 30)
+        )
+        if in_contact:
+            return 'CONTACT'
+    if enemy_prod > my_prod * 1.3:
+        return 'BEHIND'
+    # COLLAPSE: clearly ahead in production or planet count
+    best_ep = max((sum(p.production for p in enemy_p if p.owner == o)
+                   for o in factions), default=0)
+    best_ec = max((sum(1 for p in enemy_p if p.owner == o)
+                   for o in factions), default=0)
+    if my_prod > best_ep * 1.35 or len(my_p) > best_ec + 3:
+        return 'COLLAPSE'
+    if len(factions) >= 2:
+        fp = {}
+        for e in enemy_p:
+            fp[e.owner] = fp.get(e.owner, 0) + e.production
+        if max(fp.values(), default=0) > my_prod * 1.25:
+            return 'ANTI_LEADER'
+    return 'EXPANSION'
+
+
+def planet_value_score(src, tgt, need, eta, already, enemy_p, rem_steps, phase,
+                       finish_bonus=0.0, chain_bonus=0.0, fresh_enemy=False):
+    """
+    Unified target score: 4*prod + 3*prod/ETA + 2*prod/need + bonuses - risks.
+    Higher = more attractive target.
+    """
+    if need <= 0:
+        return -1e9
+    eta  = max(0.1, eta)
+    prod = tgt.production
+    score  = 4.0 * prod
+    score += 3.0 * prod / eta
+    score += 2.0 * prod / max(1.0, need)
+    score += prod * min(rem_steps, 100) * 0.01  # future production value
+    score += finish_bonus
+    score += chain_bonus
+    if fresh_enemy:
+        score += 25.0
+    score -= dp(src, tgt) * 0.15
+    if enemy_p:
+        retake_d = min(dist(e.x, e.y, tgt.x, tgt.y) for e in enemy_p)
+        score -= max(0.0, 30.0 - retake_d) * 0.5
+    if already > need * 1.5:
+        score -= 20.0
+    if phase == 'BEHIND':
+        score += prod * 2.0
+    elif phase == 'OPENING':
+        score -= dp(src, tgt) * 0.3
+    return score
+
+
+def predicted_angle(src, tgt, ang_vel, ships):
+    """Intercept angle to a possibly-moving target (wraps aim_valid)."""
+    angle, _ = aim_valid(src, tgt, ang_vel, ships)
+    return angle
+
+
 # ── main agent ────────────────────────────────────────────────────────────────
 
 def agent(obs):
@@ -376,6 +450,14 @@ def agent(obs):
             and min(dp(p2, e) for p2 in my_p for e in enemy_p) < WAR_MODE_DIST)
     )
 
+    # ── Game phase ────────────────────────────────────────────────────────────
+    phase       = get_phase(my_p, enemy_p, enemy_fleets, step, ang_vel)
+    behind      = phase == 'BEHIND'
+    in_opening  = phase == 'OPENING'
+    in_contact  = phase == 'CONTACT'
+    anti_ldr    = phase == 'ANTI_LEADER'
+    in_collapse = phase == 'COLLAPSE'
+
     # ── Opponent style detection ───────────────────────────────────────────────
     _opp_fleet_n   = len(enemy_fleets)
     _opp_avg_size  = sum(fl.ships for fl in enemy_fleets) / max(1, _opp_fleet_n)
@@ -417,8 +499,10 @@ def agent(obs):
             base = int(base * FRONTLINE_RESERVE_MULT)
         if under_swarm:
             base = int(base * SWARM_RESERVE_MULT)
-        elif under_attack:
+        elif under_attack or in_contact:
             base = int(base * WAR_MODE_RESERVE_MULT)
+        if behind:
+            base = int(base * 1.15)
         return int(base + 0.45 * enemy_pressure_on(p))
 
     def safe_avail(p):
@@ -579,7 +663,8 @@ def agent(obs):
     # ── Phase 1c: Finisher pass ───────────────────────────────────────────────
     # For any planet already receiving committed ships but still needing ≤
     # finisher_limit more, find the nearest source and send a tiny finisher.
-    finisher_limit = FINISHER_SHIPS * 2 if opp_is_swarm else FINISHER_SHIPS
+    # BEHIND: disable tiny spam; SWARM: widen net to catch more targets
+    finisher_limit = 0 if behind else (FINISHER_SHIPS * 2 if opp_is_swarm else FINISHER_SHIPS)
     for tgt in sorted(neutral_p + enemy_p,
                       key=lambda t: target_need(t, incoming)):
         need = target_need(tgt, incoming)
@@ -611,8 +696,14 @@ def agent(obs):
                 fire(src, dl_tgt, min(av_dl, dl_need), allow_unsafe=True)
         av = safe_avail(src)
         if av >= OPENING_MIN_SEND:
-            idle_targets     = [n for n in neutral_p if     is_idle(n) and target_need(n, incoming) > 0]
-            rotating_targets = [n for n in neutral_p if not is_idle(n) and target_need(n, incoming) > 0]
+            def opening_ok(n):
+                if n.ships > 35 and n.production <= 2:
+                    return False
+                if enemy_p and min(dp(e, n) for e in enemy_p) < dp(src, n) * 0.85:
+                    return False  # enemy closer → they'll beat us there
+                return True
+            idle_targets     = [n for n in neutral_p if     is_idle(n) and target_need(n, incoming) > 0 and opening_ok(n)]
+            rotating_targets = [n for n in neutral_p if not is_idle(n) and target_need(n, incoming) > 0 and opening_ok(n)]
             nearest_idle = min(idle_targets,     key=lambda n: dp(src, n), default=None)
             nearest_rot  = min(rotating_targets, key=lambda n: dp(src, n), default=None)
 
@@ -658,10 +749,12 @@ def agent(obs):
 
     # ── Early economy roles ───────────────────────────────────────────────────
     if step < EXPAND_STEPS and neutral_p:
-        if opp_is_swarm:
-            effective_max = 0                   # vs swarm: stop expanding, defend and counter
-        elif opp_is_aggressive or under_attack:
-            effective_max = EXPAND_WAR_MAX      # vs aggressive: one launch max
+        if opp_is_swarm or in_contact:
+            effective_max = 0                           # stop expanding under pressure
+        elif opp_is_aggressive or under_attack or behind:
+            effective_max = EXPAND_WAR_MAX              # consolidate when at risk
+        elif in_opening:
+            effective_max = min(2, EXPAND_MAX_PER_PLANET)  # max 2 targets in opening
         else:
             effective_max = EXPAND_MAX_PER_PLANET
         for src in sorted(my_p, key=lambda p: (is_idle(p), p.production, avail(p)), reverse=True):
@@ -825,217 +918,386 @@ def agent(obs):
                     else:
                         break
 
-    # ── Phase 2: Per-planet offensive ─────────────────────────────────────────
-    rem_steps = max(1, TOTAL_STEPS - step)
-    endgame   = step >= ENDGAME_STEPS
-    late_game = (
-        step >= LATE_GAME_STEPS
-        or (opp_is_turtle     and step >= LATE_GAME_STEPS // 2)
-        or (opp_is_aggressive and step >= LATE_GAME_STEPS * 2 // 3)
-    )
+    # ── Macro wave engine ─────────────────────────────────────────────────────
+    rem_steps  = max(1, TOTAL_STEPS - step)
+    endgame    = step >= ENDGAME_STEPS  # kept for drain pass
+    late_game  = (in_collapse
+                  or step >= LATE_GAME_STEPS
+                  or (opp_is_turtle     and step >= LATE_GAME_STEPS // 2)
+                  or (opp_is_aggressive and step >= LATE_GAME_STEPS * 2 // 3)
+                  or (in_contact        and step >= LATE_GAME_STEPS * 2 // 3))
 
-    # Idle neutrals sorted by fastest-capture ETA from any owned planet (bridge targets bumped up)
-    idle_neu = sorted(
-        [n for n in neutral_p if is_idle(n)],
-        key=lambda n: (
-            min(capture_eta(m, n, max(1, target_need(n, incoming))) for m in my_p)
-            - (BRIDGE_BONUS * 0.4 if n.id in bridge_ids and len(my_p) >= BRIDGE_MIN_PLANETS else 0.0)
+    # ── Per-target scoring and shared helpers ──────────────────────────────────
+
+    def reserve_needed_fn(p):
+        base = reserve_for(p)
+        if p.ships < p.production * 6 and p.production > 0:
+            base = max(base, 6)   # recently captured — keep minimum cushion
+        if p.production >= HIGH_PROD_THRESHOLD:
+            base = max(base, 10)
+        if enemy_p and min(dp(p, e) for e in enemy_p) < 20:
+            base = max(base, 12)  # enemy-facing
+        return base
+
+    def target_score_fn(tgt):
+        """Unified score per target (higher = more attractive)."""
+        already = incoming.get(tgt.id, 0)
+        if tgt.owner == -1:
+            need = target_need(tgt, incoming)
+        else:
+            ref = min(my_p, key=lambda p: dp(p, tgt)) if my_p else None
+            if ref is None:
+                return -1e9
+            need = enemy_need(ref, tgt, max(1, safe_avail(ref)), incoming)
+        if need <= 0:
+            return -1e9
+        eta = min(capture_eta(p, tgt, max(1, need)) for p in my_p) if my_p else 1e9
+        if eta >= rem_steps - 5:
+            return -1e9
+        prod  = tgt.production
+        score = 5.0 * prod + 4.0 * prod / max(1.0, eta) + 3.0 * prod / max(1.0, need)
+        score += prod * min(rem_steps, 100) * 0.01
+        # finish bonus
+        if tgt.ships <= 5:
+            score += 35.0
+        elif tgt.ships <= 12:
+            score += 15.0
+        # chain bonus: nearby unclaimed neutrals reachable after capture
+        score += sum(1 for n in neutral_p if n.id != tgt.id and dp(tgt, n) < 22) * 6.0
+        # launchpad bonus
+        if prod >= 3:
+            score += 12.0
+        # fresh enemy capture
+        if tgt.owner not in (-1, me) and tgt.ships <= 10:
+            score += 20.0
+        # 4-player side/polar modifier
+        if four_player and my_p and tgt.owner not in (-1, me):
+            src_ang = math.atan2(my_p[0].y - SUN_Y, my_p[0].x - SUN_X)
+            t_ang   = math.atan2(tgt.y - SUN_Y, tgt.x - SUN_X)
+            adiff   = abs(math.atan2(math.sin(t_ang - src_ang), math.cos(t_ang - src_ang)))
+            score  *= SIDE_ENEMY_BONUS if adiff < math.pi * 0.67 else POLAR_ENEMY_PENALTY
+        # enemy retake risk
+        if enemy_p:
+            min_ed = min(dist(e.x, e.y, tgt.x, tgt.y) for e in enemy_p)
+            score -= max(0.0, 28.0 - min_ed) * 0.7
+        score -= eta * 0.25
+        if already > need * 1.5:
+            score -= 30.0
+        if in_collapse and tgt.owner not in (-1, me):
+            score += prod * 3.0
+        elif behind:
+            score += prod * 2.5
+        return score
+
+    def can_hold(tgt):
+        """True when we can reasonably defend tgt after capture."""
+        if not enemy_p:
+            return True
+        return min(dist(e.x, e.y, tgt.x, tgt.y) for e in enemy_p) > 18 or tgt.production >= 3
+
+    def send_wave(tgt, need, allow_u=False, max_src=4, min_send=EXPAND_MIN_SEND):
+        """Pool ships from up to max_src nearest unthreatened sources."""
+        s = SAFETY_ATTACK_THRESH if tgt.owner != -1 else SAFETY_EXPAND_THRESH
+        sources = sorted([p for p in my_p if not threatened.get(p.id, False)],
+                         key=lambda p: dp(p, tgt))[:max_src]
+        pooled = 0
+        for src in sources:
+            to_send = min(safe_avail(src) if not allow_u else avail(src) - 1,
+                         need - pooled)
+            if to_send >= (1 if allow_u else min_send):
+                if fire(src, tgt, to_send, allow_unsafe=allow_u, safety_thresh=s):
+                    pooled += to_send
+            if pooled >= need:
+                break
+        return pooled
+
+    # ── Macro decision functions ───────────────────────────────────────────────
+
+    def choose_expand_wave():
+        """Priority 4: decisive grouped wave to highest-scoring reachable target."""
+        if behind and not in_contact:
+            return
+        prefer_enemy = late_game or in_collapse
+        scored = sorted(
+            [(target_score_fn(t), t) for t in
+             (enemy_p if prefer_enemy else neutral_p + enemy_p)
+             if target_need(t, incoming) > 0],
+            reverse=True
         )
-    )
+        for score, tgt in scored:
+            if score <= 0:
+                break
+            if tgt.owner == -1:
+                need = target_need(tgt, incoming)
+            else:
+                ref  = min(my_p, key=lambda p: dp(p, tgt))
+                need = enemy_need(ref, tgt, max(1, safe_avail(ref)), incoming)
+            if need <= 0:
+                continue
+            if not can_hold(tgt):
+                continue
+            # Require 80 % pooling coverage before committing
+            pool_cap = sum(safe_avail(p) for p in my_p if not threatened.get(p.id, False))
+            if pool_cap < need * 0.8:
+                continue
+            if send_wave(tgt, need) > 0:
+                return
 
-    for src in sorted(my_p, key=lambda p: -(avail(p) if endgame else safe_avail(p))):
-        av = avail(src) if endgame else safe_avail(src)
-        if endgame:
+    def choose_launchpad_chain():
+        """Priority 5: use border planets as relay to chain neutral expansion."""
+        if not neutral_p or behind:
+            return
+        frontier = sorted(
+            [p for p in my_p
+             if safe_avail(p) >= reserve_needed_fn(p) + 3
+             and (not enemy_p or min(dp(p, e) for e in enemy_p) < 40)],
+            key=lambda p: -safe_avail(p)
+        )
+        for src in frontier[:2]:
+            cands = sorted(
+                [n for n in neutral_p
+                 if target_need(n, incoming) > 0
+                 and capture_eta(src, n, max(1, target_need(n, incoming))) < rem_steps - 5],
+                key=lambda n: dp(src, n)
+            )
+            for tgt in cands[:1]:
+                need = target_need(tgt, incoming)
+                av   = safe_avail(src)
+                if av >= need:  # only decisive sends
+                    fire(src, tgt, need, safety_thresh=SAFETY_EXPAND_THRESH)
+                    break
+
+    def choose_enemy_attack_wave():
+        """Priority 6: multi-source assault on best enemy planet."""
+        if not enemy_p:
+            return
+        best = max(enemy_p, key=target_score_fn)
+        if target_score_fn(best) <= 0:
+            return
+        ref      = min(my_p, key=lambda p: dp(p, best))
+        need     = max(1, enemy_need(ref, best, max(1, safe_avail(ref)), incoming))
+        min_chip = 2 if opp_is_turtle else EXPAND_MIN_SEND  # turtle: smaller chips allowed
+        if sum(safe_avail(p) for p in my_p if not threatened.get(p.id, False)) < need:
+            return
+        send_wave(best, need, max_src=6 if opp_is_turtle else 4, min_send=min_chip)
+
+    def choose_collapse_move():
+        """Priority 7 (COLLAPSE): harvest all enemy production with large waves."""
+        if not in_collapse or not enemy_p:
+            return
+        for tgt in sorted(enemy_p, key=lambda e: -e.production):
+            ref  = min(my_p, key=lambda p: dp(p, tgt))
+            need = max(1, enemy_need(ref, tgt, max(1, avail(ref) - 2), incoming))
+            if need <= 0:
+                continue
+            remaining = need
+            for src in sorted(my_p, key=lambda p: dp(p, tgt)):
+                if remaining <= 0:
+                    break
+                to_send = min(avail(src) - 2, remaining)
+                if to_send >= 3 and fire(src, tgt, to_send, allow_unsafe=True):
+                    remaining -= to_send
+
+    def choose_consolidate():
+        """Priority 8 (BEHIND): pull ships toward strongest core planet."""
+        if not behind:
+            return
+        core = max(my_p, key=lambda p: p.production, default=None)
+        if core is None:
+            return
+        for src in sorted([p for p in my_p if p.id != core.id],
+                          key=lambda p: -safe_avail(p))[:2]:
+            if dp(src, core) < 10:
+                continue
+            send_n = safe_avail(src) // 2
+            if send_n >= 5:
+                fire(src, core, send_n)
+
+    def choose_rotating_coordination():
+        """Rotating-planet coordination: pool ships for planets in timing window."""
+        for tgt in sorted([n for n in neutral_p if not is_idle(n)],
+                          key=lambda t: -t.production):
+            need = target_need(tgt, incoming)
+            if need <= 0:
+                continue
+            contributors = []
+            for src in sorted(my_p, key=lambda p: dp(p, tgt)):
+                if threatened.get(src.id, False):
+                    continue
+                av   = safe_avail(src)
+                wait = closest_approach_timing(src, tgt, ang_vel, max(1, av))
+                if av >= EXPAND_MIN_SEND and wait <= 1.0:
+                    contributors.append((src, av))
+            total = sum(a for _, a in contributors)
+            if total < need:
+                continue
+            remaining = need
+            for src, av in sorted(contributors, key=lambda x: -x[1]):
+                if remaining <= 0:
+                    break
+                send_n = min(av, remaining)
+                if send_n >= EXPAND_MIN_SEND and fire(src, tgt, send_n, allow_unsafe=True):
+                    remaining -= send_n
+
+    def choose_comet_chase():
+        """Priority 10: chase fast-moving planets only when safe and high-value."""
+        if behind or in_contact:
+            return
+        for src in sorted(my_p, key=lambda p: -safe_avail(p)):
+            av = safe_avail(src)
+            if av < 5:
+                continue
+            comets = [
+                n for n in neutral_p
+                if not is_idle(n)
+                and target_need(n, incoming) > 0
+                and arc_travel(n, ang_vel, src.x, src.y) <= COMET_ARC_LIMIT
+                and capture_eta(src, n, max(1, target_need(n, incoming))) < 15
+                and n.production >= HIGH_PROD_THRESHOLD
+            ]
+            for tgt in sorted(comets, key=lambda n: -n.production)[:1]:
+                need   = target_need(tgt, incoming)
+                send_n = min(av, need)
+                if send_n >= need:
+                    fire(src, tgt, send_n, safety_thresh=SAFETY_EXPAND_THRESH)
+                    break
+
+    # Run the macro wave priority sequence
+    choose_rotating_coordination()   # always pool rotating planets first
+    choose_expand_wave()             # decisive grouped wave to best target
+    choose_launchpad_chain()         # chain from frontier planets
+    choose_enemy_attack_wave()       # dedicated enemy assault pass
+    choose_collapse_move()           # all-in when clearly ahead
+    choose_consolidate()             # pull together when behind
+    choose_comet_chase()             # opportunistic fast-moving planets last
+
+    # Endgame all-in: use avail() instead of safe_avail for reachable targets
+    if endgame:
+        for src in sorted(my_p, key=lambda p: -avail(p)):
+            av = avail(src)
             fleet_size = av
             if fleet_size < 2:
                 continue
-        else:
-            send_frac = FRONTLINE_SEND_FRAC if (enemy_p and min(dp(src, e) for e in enemy_p) < FRONTLINE_DIST) else SEND_FRAC
-            fleet_size = int(av * send_frac)
-            if fleet_size < MIN_FLEET:
-                if fleet_size < 5 or len(my_p) >= 3:
+            for tgt in sorted(neutral_p + enemy_p,
+                               key=lambda t: capture_eta(src, t, max(1, fleet_size))):
+                if capture_eta(src, tgt, max(1, fleet_size)) >= rem_steps:
                     continue
-                fleet_size = av
-
-        chosen = None
-
-        # ── 2_opp: Kill any exposed enemy planet before expanding ─────────────
-        for e in sorted(enemy_p, key=lambda x: x.ships):
-            if e.ships > OPPORTUNISTIC_SHIPS:
+                if tgt.owner == -1:
+                    need = target_need(tgt, incoming)
+                else:
+                    need = enemy_need(src, tgt, fleet_size, incoming)
+                if need <= 0:
+                    continue
+                send_n = int(min(fleet_size, max(1, need)))
+                s = SAFETY_ATTACK_THRESH if tgt.owner != -1 else SAFETY_EXPAND_THRESH
+                fire(src, tgt, send_n, allow_unsafe=True, safety_thresh=s)
                 break
-            if incoming.get(e.id, 0) >= e.ships + 1:
+
+    # ── Priority functions (helpers for the structured decision loop) ─────────
+
+    def projected_state(tgt, eta):
+        """Estimate tgt.ships at fleet arrival; positive = still defending."""
+        e_in  = sum(fl.ships for fl in enemy_fleets  if fleet_heading_to(fl, tgt, ang_vel))
+        f_in  = incoming.get(tgt.id, 0)
+        prod  = int(tgt.production * eta) if tgt.owner != -1 else 0
+        return max(0, tgt.ships + prod + e_in - f_in)
+
+    def choose_reinforce():
+        """Priority 2: top up thin border/new planets from safe backline sources."""
+        for tgt in sorted(my_p, key=lambda p: p.ships):
+            if tgt.ships >= tgt.production * 10:
                 continue
-            need_n = enemy_need(src, e, fleet_size, incoming)
-            if 0 < need_n <= fleet_size:
-                chosen = e
-                break
-
-        # ── 2a: Nearest idle neutral not fully covered ────────────────────────
-        if chosen is None and not (late_game and enemy_p):
-            for tgt in idle_neu:
-                already = incoming.get(tgt.id, 0)
-                if already >= tgt.ships + 1:
-                    continue
-                if arc_travel(tgt, ang_vel, src.x, src.y) > MAX_ARC:
-                    continue
-                if capture_eta(src, tgt, fleet_size) >= rem_steps:
-                    continue
-                chosen = tgt
-                break
-
-        # ── 2b: Nearest orbiting neutral (closest-approach gated) ─────────────
-        if chosen is None and not (late_game and enemy_p):
-            for tgt in sorted(neutral_p, key=lambda n: dp(src, n)):
-                if is_idle(tgt):
-                    continue
-                if arc_travel(tgt, ang_vel, src.x, src.y) > MAX_ARC:
-                    continue
-                already = incoming.get(tgt.id, 0)
-                if already >= tgt.ships + 1:
-                    continue
-                if capture_eta(src, tgt, fleet_size) >= rem_steps:
-                    continue
-                wait = closest_approach_timing(src, tgt, ang_vel, fleet_size)
-                if wait > 1.0:
-                    continue  # not at closest approach yet; try next candidate
-                chosen = tgt
-                break
-
-        # ── 2c: Best enemy planet (4-player-aware) ────────────────────────────
-        if chosen is None and enemy_p:
-            # In 4-player, keep expanding neutrals before attacking enemies;
-            # but once under_attack, switch to war mode immediately.
-            if not (four_player and len(neutral_p) > len(my_p) and not under_attack):
-                def en_val(e):
-                    d       = dp(src, e)
-                    t       = travel_turns(d, fleet_size)
-                    if t >= rem_steps - 5:
-                        return -1.0  # won't arrive before game ends
-                    g_est   = e.ships + int(e.production * t)
-                    already = incoming.get(e.id, 0)
-                    if already >= g_est + 1:
-                        return -1.0
-                    rem_g = max(1, g_est - already)
-                    base  = (e.production * rem_steps / (rem_g + 5)
-                             / (1 + 0.02 * t) * 30 / (30 + d))
-                    if four_player:
-                        src_ang  = math.atan2(src.y - SUN_Y, src.x - SUN_X)
-                        e_ang    = math.atan2(e.y   - SUN_Y, e.x   - SUN_X)
-                        ang_diff = abs(math.atan2(math.sin(e_ang - src_ang),
-                                                  math.cos(e_ang - src_ang)))
-                        if ang_diff < math.pi * 0.67:   # side opponent
-                            base *= SIDE_ENEMY_BONUS
-                        else:                            # polar opponent
-                            base *= POLAR_ENEMY_PENALTY
-                    return base
-                best_e = max(enemy_p, key=en_val)
-                if en_val(best_e) > 0:
-                    chosen = best_e
-
-        # ── 2d: Force nearest reachable enemy if nothing else ────────────────
-        if chosen is None and enemy_p:
-            reachable_e = [e for e in enemy_p if capture_eta(src, e, fleet_size) < rem_steps]
-            if reachable_e:
-                chosen = min(reachable_e, key=lambda e: dp(src, e))
-
-        if chosen is None:
-            continue
-
-        d            = dp(src, chosen)
-        t            = travel_turns(d, fleet_size)
-        g_est        = chosen.ships + (int(chosen.production * t) if chosen.owner != -1 else 0)
-        still_needed = (g_est + 1) - incoming.get(chosen.id, 0)   # fixed: was always fleet_size
-        send_n       = int(min(fleet_size, max(1, still_needed)))
-
-        s_thresh = SAFETY_ATTACK_THRESH if chosen.owner != -1 else SAFETY_EXPAND_THRESH
-        fire(src, chosen, send_n, allow_unsafe=(endgame or rem_steps < 50), safety_thresh=s_thresh)
-
-    # ── Phase 2e: Micro second-wave ───────────────────────────────────────────
-    # After the main wave, fire small second fleets at uncovered targets.
-    for src in sorted(my_p, key=lambda p: -safe_avail(p)):
-        av = safe_avail(src)
-        fleet2 = int(av * WAVE_FRAC)
-        if fleet2 < 2:
-            continue
-        micro_tgt = None
-        for n in sorted(neutral_p, key=lambda n: capture_eta(src, n, max(1, fleet2))):
-            if target_need(n, incoming) > 0:
-                micro_tgt = n
-                break
-        if micro_tgt is None and enemy_p:
-            candidates = [e for e in enemy_p if enemy_need(src, e, fleet2, incoming) > 0]
-            if candidates:
-                micro_tgt = min(candidates, key=lambda e: dp(src, e))
-        if micro_tgt is None:
-            continue
-        need2 = target_need(micro_tgt, incoming)
-        send2 = int(min(fleet2, max(1, need2)))
-        s2 = SAFETY_ATTACK_THRESH if micro_tgt.owner != -1 else SAFETY_EXPAND_THRESH
-        fire(src, micro_tgt, send2, safety_thresh=s2)
-
-    # ── Phase 3: Multi-planet rotating coordination ───────────────────────────
-    # When a rotating neutral target still has need > 0 after all per-planet
-    # phases, pool ships from multiple nearby planets that are in their timing
-    # window to cover it in a single coordinated wave.
-    for tgt in sorted([n for n in neutral_p if not is_idle(n)],
-                      key=lambda t: -t.production):
-        need = target_need(tgt, incoming)
-        if need <= 0:
-            continue
-        contributors = []
-        for src in sorted(my_p, key=lambda p: dp(p, tgt)):
-            if threatened.get(src.id, False):
+            if not enemy_p:
                 continue
-            av = safe_avail(src)
-            if av < EXPAND_MIN_SEND:
-                continue
-            wait = closest_approach_timing(src, tgt, ang_vel, max(1, av))
-            if wait <= 1.0:
-                contributors.append((src, av))
-        if not contributors:
-            continue
-        total = sum(av for _, av in contributors)
-        if total < need:
-            continue
-        remaining = need
-        for src, av in sorted(contributors, key=lambda x: -x[1]):
-            if remaining <= 0:
-                break
-            send_n = min(av, remaining)
-            if send_n >= EXPAND_MIN_SEND:
-                fire(src, tgt, send_n, allow_unsafe=True)
-                remaining -= send_n
-
-    # ── Phase 4: Coordinated enemy assault ───────────────────────────────────
-    # Pool ships from multiple planets to take the most valuable exposed enemy.
-    # Only runs when Phase 2 left the target under-committed.
-    if enemy_p and my_p:
-        def assault_value(e):
-            nearest = min(my_p, key=lambda p2: dp(p2, e))
-            still = enemy_need(nearest, e, max(1, safe_avail(nearest)), incoming)
-            if still <= 0:
-                return -1.0
-            if sum(safe_avail(p2) for p2 in my_p) < still:
-                return -1.0
-            return e.production * rem_steps / (still + 5.0)
-
-        atgt = max(enemy_p, key=assault_value)
-        if assault_value(atgt) > 0:
-            nearest = min(my_p, key=lambda p2: dp(p2, atgt))
-            a_need = max(1, enemy_need(nearest, atgt, max(1, safe_avail(nearest)), incoming))
-            remaining = a_need
-            p4_min = 2 if opp_is_turtle else MIN_FLEET
-            for src in sorted(my_p, key=lambda p2: dp(p2, atgt)):
-                if remaining <= 0:
+            if min(dp(tgt, e) for e in enemy_p) > 40:
+                continue  # not close enough to the front to matter
+            want = tgt.production * 10 - tgt.ships
+            for src in sorted([q for q in my_p if q.id != tgt.id],
+                               key=lambda q: -safe_avail(q)):
+                av = safe_avail(src)
+                send_n = min(av, want)
+                if send_n >= 3:
+                    fire(src, tgt, send_n)
                     break
+
+    def choose_finish_lock():
+        """Priority 3: commit to damaged targets (low ships + incoming already sent)."""
+        finish_cap = 0 if behind else 18
+        # Score candidates: smaller projected state + bigger finish bonus = higher priority
+        candidates = []
+        for tgt in neutral_p + enemy_p:
+            if tgt.ships > finish_cap:
+                continue
+            if incoming.get(tgt.id, 0) == 0:
+                continue
+            need = target_need(tgt, incoming)
+            if need <= 0:
+                continue
+            src_ref = min(my_p, key=lambda p: dp(p, tgt), default=None)
+            if src_ref is None:
+                continue
+            eta = capture_eta(src_ref, tgt, max(1, need))
+            proj = projected_state(tgt, eta)        # ships remaining at arrival
+            fb   = 40.0 if proj <= 5 else 20.0     # finish bonus: used for sorting
+            candidates.append((-fb, proj, tgt, need))
+        for _, proj, tgt, need in sorted(candidates):
+            for src in sorted(my_p, key=lambda p: dp(p, tgt)):
                 if threatened.get(src.id, False):
                     continue
                 av = safe_avail(src)
-                if av < p4_min:
+                send_n = min(av, need)
+                if send_n > 0:
+                    fire(src, tgt, send_n, allow_unsafe=True)
+                    break
+
+    def choose_punish():
+        """Priority 6: exploit freshly captured or low-ship enemy planets."""
+        punish_cap = 14
+        for tgt in sorted(enemy_p, key=lambda e: e.ships):
+            if tgt.ships > punish_cap:
+                break
+            already = incoming.get(tgt.id, 0)
+            if already >= tgt.ships + 1:
+                continue
+            for src in sorted(my_p, key=lambda p: dp(p, tgt)):
+                if threatened.get(src.id, False):
                     continue
-                send_n = min(av, remaining)
-                if fire(src, atgt, send_n, safety_thresh=SAFETY_ATTACK_THRESH):
-                    remaining -= send_n
+                av = safe_avail(src)
+                need_n = enemy_need(src, tgt, av, incoming)
+                if 0 < need_n <= av:
+                    fire(src, tgt, min(av, need_n), safety_thresh=SAFETY_ATTACK_THRESH)
+                    break
+
+    def choose_anti_leader():
+        """Priority 7: in 4-player, attack the production leader's weakest planets."""
+        if not anti_ldr:
+            return
+        fp = {}
+        for e in enemy_p:
+            fp[e.owner] = fp.get(e.owner, 0) + e.production
+        if not fp:
+            return
+        leader = max(fp, key=fp.get)
+        targets = sorted([e for e in enemy_p if e.owner == leader], key=lambda e: e.ships)
+        for tgt in targets[:2]:
+            already = incoming.get(tgt.id, 0)
+            for src in sorted(my_p, key=lambda p: dp(p, tgt)):
+                if threatened.get(src.id, False):
+                    continue
+                av = safe_avail(src)
+                need_n = enemy_need(src, tgt, av, incoming)
+                if need_n <= 0 or already >= need_n:
+                    continue
+                send_n = min(av, need_n)
+                if send_n >= need_n // 2:
+                    fire(src, tgt, send_n, safety_thresh=SAFETY_ATTACK_THRESH)
+                    break
+
+    # Run structured priority loop (phases 1-5 already ran; these fill remaining gaps)
+    choose_reinforce()
+    choose_finish_lock()
+    choose_punish()
+    choose_anti_leader()
 
     # ── Endgame drain ─────────────────────────────────────────────────────────
     # Near game end, send all idle ships to every reachable target.
