@@ -626,6 +626,10 @@ def agent(obs):
         srcs = [p for p in my_p if not threatened.get(p.id, False)]
         return sorted(srcs, key=lambda p: (dp(p, tgt), -calculate_surplus(p)))[:max_src]
 
+    def chain_source_list_for(tgt, max_src=7):
+        srcs = [p for p in my_p if not threatened.get(p.id, False) and calculate_surplus(p) > 0]
+        return sorted(srcs, key=lambda p: (dp(p, tgt), -p.production, -calculate_surplus(p)))[:max_src]
+
     def build_grouped_wave(tgt, need, max_src=6, allow_partial=False,
                            budget_fraction=1.0, min_send=EXPAND_MIN_SEND):
         sources = source_list_for(tgt, max_src=max_src)
@@ -647,6 +651,32 @@ def agent(obs):
                 continue
             send_n = min(av, target_amount - sent)
             if send_n < min_send and sent + send_n < target_amount:
+                continue
+            if fire(src, tgt, send_n, allow_partial=allow_partial):
+                sent += send_n
+        if sent > 0 and tgt.owner != me:
+            tempo_move["wave_attempted"] = True
+        return sent
+
+    def build_chain_wave(tgt, need, allow_partial=True):
+        sources = chain_source_list_for(tgt)
+        pool = sum(calculate_surplus(p) for p in sources)
+        if pool <= 0 or need <= 0:
+            return 0
+        target_amount = need if pool >= need else int(pool * 0.55)
+        if allow_partial and pool >= need * 0.70:
+            target_amount = min(need, pool)
+        if target_amount < min(8, need):
+            return 0
+
+        sent = 0
+        for src in sources:
+            if sent >= target_amount:
+                break
+            send_n = min(calculate_surplus(src), target_amount - sent)
+            if send_n <= 0:
+                continue
+            if send_n < 3 and sent + send_n < target_amount:
                 continue
             if fire(src, tgt, send_n, allow_partial=allow_partial):
                 sent += send_n
@@ -695,6 +725,79 @@ def agent(obs):
             score += max(0, 35 - tgt.ships) * 2.0 + tgt.production * 8.0
             cands.append((score, tgt))
         return max(cands, default=(None, None), key=lambda x: x[0])[1]
+
+    def choose_chain_anchor():
+        if not enemy_p:
+            return None
+        leader_target = choose_leader_target()
+        if leader_target is not None:
+            return leader_target
+        return max(
+            enemy_p,
+            key=lambda e: e.production * 10 + max(0, 45 - e.ships) - min(dp(p, e) for p in my_p)
+        )
+
+    def chain_corridor_score(src, anchor, tgt):
+        ax, ay = anchor.x - src.x, anchor.y - src.y
+        seg_len = math.hypot(ax, ay)
+        if seg_len < 1e-6:
+            return -1e9
+        tx, ty = tgt.x - src.x, tgt.y - src.y
+        proj = (tx * ax + ty * ay) / seg_len
+        if proj <= 0:
+            return -1e9
+        lateral = abs(tx * ay - ty * ax) / seg_len
+        if lateral > 28 and tgt.owner == -1 and tgt.production < 5:
+            return -1e9
+        eta = capture_eta(src, tgt, max(1, need_for(src, tgt)))
+        static_bonus = 25.0 if is_idle(tgt) else 0.0
+        enemy_bonus = 35.0 if tgt.owner not in (-1, me) else 0.0
+        bridge_bonus = 20.0 if tgt.id in bridge_ids else 0.0
+        return (
+            tgt.production * 22.0 + static_bonus + enemy_bonus + bridge_bonus
+            + proj * 0.15 - lateral * 0.9 - eta * 2.0 - max(0, need_for(src, tgt)) * 0.25
+        )
+
+    def choose_bridge_start():
+        """Pick the first bridge planet: high production, static, fast, and toward enemy."""
+        cands = []
+        anchor = choose_chain_anchor()
+        for tgt in neutral_p:
+            if tgt.production < 5 or target_need(tgt, incoming) <= 0:
+                continue
+            src = min(my_p, key=lambda p: capture_eta(p, tgt, max(1, target_need(tgt, incoming))))
+            need = target_need(tgt, incoming) + 1
+            eta = capture_eta(src, tgt, max(1, need))
+            static_bonus = 70.0 if is_idle(tgt) else 0.0
+            fast_bonus = max(0.0, 10.0 - eta) * 18.0
+            route_bonus = 0.0
+            if anchor is not None:
+                route_bonus = max(0.0, dp(src, anchor) - dp(tgt, anchor)) * 1.2
+                route_bonus += max(0.0, 18.0 - abs(dp(src, tgt) + dp(tgt, anchor) - dp(src, anchor))) * 4.0
+            score = tgt.production * 120.0 + static_bonus + fast_bonus + route_bonus - need * 2.0 - eta * 8.0
+            cands.append((score, tgt, need))
+        return max(cands, default=(None, None, None), key=lambda x: x[0])
+
+    def choose_chain_corridor_target():
+        anchor = choose_chain_anchor()
+        if anchor is None:
+            return None, None
+        frontier = min(my_p, key=lambda p: dp(p, anchor), default=None)
+        if frontier is None:
+            return None, None
+        cands = []
+        for tgt in neutral_p + enemy_p:
+            need = need_for(frontier, tgt)
+            if need <= 0:
+                continue
+            score = chain_corridor_score(frontier, anchor, tgt)
+            if score <= -1e8:
+                continue
+            if tgt.production >= 5:
+                score += 45.0
+            cands.append((score, tgt, need))
+        _, tgt, need = max(cands, default=(None, None, None), key=lambda x: x[0])
+        return tgt, need
 
     def best_collapse_target():
         pool = max(1, total_surplus())
@@ -836,6 +939,46 @@ def agent(obs):
                 acted = fire(src, tgt, send_n) or acted
         return acted
 
+    def strategic_chain_wave():
+        """Build a stepping-stone route toward enemy planets with pooled sends."""
+        score, tgt, need = choose_bridge_start()
+        if tgt is not None:
+            sent = build_chain_wave(tgt, need, allow_partial=True)
+            if sent > 0:
+                return True
+
+        tgt, need = choose_chain_corridor_target()
+        if tgt is None or need is None:
+            return False
+        return build_chain_wave(tgt, need, allow_partial=True) > 0
+
+    def opponent_capture_wave():
+        """After bridge building, try to actually capture an opponent planet."""
+        if not enemy_p:
+            return False
+        cands = []
+        pool = total_surplus()
+        if pool < 10:
+            return False
+        for tgt in enemy_p:
+            ref = min(my_p, key=lambda p: dp(p, tgt), default=None)
+            if ref is None:
+                continue
+            need = need_for(ref, tgt, pool)
+            if need <= 0:
+                continue
+            score = (
+                target_score_fn(tgt, ref, leader_focus=(tgt.owner == leader))
+                + max(0, 45 - tgt.ships) * 1.5
+                + tgt.production * 10.0
+                - need * 0.20
+            )
+            cands.append((score, tgt, need))
+        for _, tgt, need in sorted(cands, reverse=True):
+            if sum(calculate_surplus(p) for p in source_list_for(tgt, max_src=7)) >= need:
+                return build_grouped_wave(tgt, need, max_src=7, allow_partial=False, min_send=3) > 0
+        return False
+
     def weak_enemy_attacks():
         acted = False
         for tgt in sorted(enemy_p, key=lambda e: (e.ships, -e.production))[:3]:
@@ -906,6 +1049,54 @@ def agent(obs):
             budget_fraction=0.55, min_send=5
         ) > 0
 
+    def endgame_multi_front_attack():
+        """End play: find any opponent planet and attack from many sources."""
+        if not enemy_p or (step < 330 and neutral_p):
+            return False
+        cands = []
+        pool = total_surplus()
+        if pool < 15:
+            return False
+        for tgt in enemy_p:
+            ref = min(my_p, key=lambda p: dp(p, tgt), default=None)
+            if ref is None:
+                continue
+            need = need_for(ref, tgt, pool)
+            if need <= 0:
+                continue
+            score = tgt.production * 16.0 + max(0, 60 - tgt.ships) - need * 0.15 - dp(ref, tgt) * 0.2
+            cands.append((score, tgt, need))
+        _, tgt, need = max(cands, default=(None, None, None), key=lambda x: x[0])
+        if tgt is None:
+            return False
+        return build_grouped_wave(tgt, need, max_src=8, allow_partial=True,
+                                  budget_fraction=0.55, min_send=4) > 0
+
+    def nearest_exact_capture(initial=False):
+        """Baseline tactic: exact ships to the nearest non-owned target."""
+        if initial and step >= EARLY_STEPS:
+            return False
+        if not initial and moves:
+            return False
+        targets = neutral_p if initial else neutral_p + enemy_p
+        if not targets:
+            return False
+        acted = False
+        for src in sorted(my_p, key=lambda p: -calculate_surplus(p)):
+            if initial and len(my_p) == 1 and step < 25:
+                av = max(0, src.ships - committed.get(src.id, 0) - 1)
+            else:
+                av = calculate_surplus(src)
+            if av <= 0:
+                continue
+            nearest = min(targets, key=lambda t: dp(src, t))
+            ships_needed = nearest.ships + 1 - incoming.get(nearest.id, 0)
+            if ships_needed <= 0:
+                continue
+            if av >= ships_needed and fire(src, nearest, ships_needed):
+                acted = True
+        return acted
+
     def final_drain():
         if step < FINAL_STEPS:
             return False
@@ -929,13 +1120,18 @@ def agent(obs):
     meaningful = False
     meaningful = emergency_defense() or meaningful
     meaningful = choose_finish_lock() or meaningful
+    meaningful = nearest_exact_capture(initial=True) or meaningful
     meaningful = opening_phase() or meaningful
+    meaningful = strategic_chain_wave() or meaningful
+    meaningful = opponent_capture_wave() or meaningful
     meaningful = normal_expansion() or meaningful
     meaningful = launchpad_chain() or meaningful
     meaningful = weak_enemy_attacks() or meaningful
     meaningful = anti_leader_overlay() or meaningful
     meaningful = force_wave_if_inactive() or meaningful
     meaningful = collapse_attack() or meaningful
+    meaningful = endgame_multi_front_attack() or meaningful
+    meaningful = nearest_exact_capture() or meaningful
     meaningful = final_drain() or meaningful
 
     if tempo_move["offensive_ships"] >= 15 or tempo_move["wave_attempted"]:
