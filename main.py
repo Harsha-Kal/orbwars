@@ -1150,6 +1150,238 @@ def fallback_tempo(world, moves):
     return acted
 
 
+_missed_skipped: dict = {}
+
+
+def first_capture_360(world, moves):
+    """Steps 0-70 or <2 planets: pure 360-degree nearest neutral scan.
+    No Dijkstra, beam search, bridge scoring, or production weighting.
+    ETA/distance dominate; production is tie-breaker only."""
+    if world.step > 70 and len(world.my_planets) >= 2:
+        return False
+    if not world.neutral_planets:
+        return False
+
+    candidates = []
+    for src in world.my_planets:
+        opening_reserve = 1 if world.step < 40 else 2
+        available = int(src.ships) - world.committed.get(src.id, 0) - opening_reserve
+        if available <= 0:
+            continue
+        for tgt in world.neutral_planets:
+            need = int(tgt.ships) + 1
+            if world.step < 80:
+                need += 1
+            if need > available:
+                continue
+            d = dp(src, tgt)
+            eta = world.eta(src, tgt, need)
+            if eta > 45:
+                continue
+            angle, ok = world.aim(src, tgt, need)
+            if not ok:
+                continue
+            candidates.append((eta, d, need, -int(tgt.production), src, tgt, angle))
+
+    if not candidates:
+        return False
+
+    candidates.sort()
+    eta_val, d, need, _, src, tgt, angle = candidates[0]
+    moves.append([src.id, angle, need])
+    world.committed[src.id] = world.committed.get(src.id, 0) + need
+    world.incoming_to_targets[tgt.id] = world.incoming_to_targets.get(tgt.id, 0) + need
+    world.offensive_ships += need
+    world.wave_attempted = True
+    world.add_debug(
+        f"FIRST_CAPTURE_360 src={src.id} tgt={tgt.id} d={d:.1f} eta={eta_val:.1f} need={need} prod={tgt.production}"
+    )
+    return True
+
+
+def early_nearest_expansion_360(world, moves):
+    """Steps 0-140 or <4 planets: nearest-first expansion.
+    Single-source if possible; grouped from 2-3 nearest sources if needed."""
+    if world.step >= 140 and len(world.my_planets) >= 4:
+        return False
+    if not world.neutral_planets:
+        return False
+
+    candidates = []
+    for src in world.my_planets:
+        av = world.surplus(src)
+        if av < 5:
+            continue
+        for tgt in world.neutral_planets:
+            need = world.target_need_now(tgt)
+            if need <= 0:
+                continue
+            d = dp(src, tgt)
+            eta = world.eta(src, tgt, max(1, need))
+            if eta > 60:
+                continue
+            angle, ok = world.aim(src, tgt, max(1, min(need, av)))
+            if not ok:
+                continue
+            candidates.append((eta, d, need, -int(tgt.production), src, tgt, angle))
+
+    if not candidates:
+        return False
+
+    candidates.sort()
+    seen: set = set()
+    for eta_val, d, need, _, src, tgt, _ in candidates:
+        if tgt.id in seen:
+            continue
+        seen.add(tgt.id)
+        av = world.surplus(src)
+        if av >= need:
+            if world.commit(src, tgt, need, moves):
+                world.add_debug(
+                    f"EARLY_EXPANSION_360 src={src.id} tgt={tgt.id} d={d:.1f} eta={eta_val:.1f} need={need}"
+                )
+                return True
+        else:
+            pool_srcs = sorted(
+                [p for p in world.my_planets if world.real_incoming_threat(p)["deficit"] <= 0],
+                key=lambda p: dp(p, tgt),
+            )[:3]
+            if sum(world.surplus(p) for p in pool_srcs) >= need:
+                sent = 0
+                for psrc in pool_srcs:
+                    if sent >= need:
+                        break
+                    sn = min(world.surplus(psrc), need - sent)
+                    if sn < 3 and sent + sn < need:
+                        continue
+                    if world.commit(psrc, tgt, sn, moves):
+                        sent += sn
+                if sent >= need:
+                    world.wave_attempted = True
+                    world.add_debug(
+                        f"EARLY_EXPANSION_360_GROUPED tgt={tgt.id} d={d:.1f} need={need} sent={sent}"
+                    )
+                    return True
+    return False
+
+
+def astar_route_to_target(world, goal_planet, deadline, max_depth=4):
+    """True A* for specific enemy/leader/collapse targets only. Not used in early expansion."""
+    goal = goal_planet
+
+    def heuristic(node):
+        d = dp(node, goal)
+        time_est = d / fleet_speed(max(1, int(node.ships)))
+        capture_cost = world.ships_needed_to_capture(node, goal, max(1, int(node.ships))) * 0.45
+        pressure = world.enemy_pressure_near(goal, radius=25.0) * 0.3
+        sun_pen = 12.0 if hits_sun(node.x, node.y, goal.x, goal.y) else 0.0
+        overextension = max(0.0, 18.0 - world.nearest_enemy_distance(goal)) * 0.6
+        return time_est * 3.5 + capture_cost + pressure + sun_pen + overextension
+
+    queue: list = []
+    best_cost: dict = {}
+    for src in world.my_planets:
+        h = heuristic(src)
+        heapq.heappush(queue, (h, 0.0, src.id, src.id, ()))
+        best_cost[(src.id, ())] = 0.0
+
+    best_plan = None
+    while queue and time.perf_counter() < deadline:
+        _, g_cost, node_id, source_id, route = heapq.heappop(queue)
+        node = world.planet_by_id.get(node_id)
+        if node is None:
+            continue
+        if node_id == goal.id and route:
+            if best_plan is None or g_cost < best_plan.cost:
+                best_plan = RoutePlan(
+                    target_id=goal.id,
+                    first_target_id=route[0],
+                    score=-g_cost,
+                    cost=g_cost,
+                    route=list(route),
+                )
+            continue
+        if len(route) >= max_depth:
+            continue
+        for nxt in world.neutral_planets + [goal]:
+            if nxt.id == node_id or nxt.id in route:
+                continue
+            edge = route_edge_cost(world, node, nxt)
+            new_g = g_cost + edge
+            new_route = route + (nxt.id,)
+            key = (nxt.id, new_route)
+            if new_g + 1e-6 >= best_cost.get(key, 1e18):
+                continue
+            best_cost[key] = new_g
+            h = heuristic(nxt) if nxt.id != goal.id else 0.0
+            heapq.heappush(queue, (new_g + h, new_g, nxt.id, source_id, new_route))
+
+    return best_plan
+
+
+def missed_opportunity_detector(world, chosen_moves):
+    """Debug tool: logs nearby neutrals being skipped. Forces capture after 3 consecutive skips."""
+    global _missed_skipped
+    if not world.neutral_planets or not world.my_planets:
+        return
+
+    chosen_tgt_ids: set = set()
+    for move in chosen_moves:
+        src_id, angle, ships = move[0], move[1], move[2]
+        src = world.planet_by_id.get(src_id)
+        if src is None:
+            continue
+        best_match, best_diff = None, 0.3
+        for tgt in world.neutral_planets + world.enemy_planets:
+            aim_angle, _ = world.aim(src, tgt, max(1, int(ships)))
+            diff = abs(math.atan2(math.sin(angle - aim_angle), math.cos(angle - aim_angle)))
+            if diff < best_diff:
+                best_diff = diff
+                best_match = tgt
+        if best_match:
+            chosen_tgt_ids.add(best_match.id)
+
+    best_c = None
+    best_key = None
+    for tgt in world.neutral_planets:
+        src = min(world.my_planets, key=lambda p: dp(p, tgt), default=None)
+        if src is None:
+            continue
+        need = world.target_need_now(tgt)
+        if need <= 0:
+            continue
+        pool = sum(world.surplus(p) for p in world.my_planets)
+        if pool < need:
+            continue
+        d = dp(src, tgt)
+        eta = world.eta(src, tgt, max(1, need))
+        _, enemy_eta = world.reaction_times(tgt)
+        key = (eta, d, need)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_c = (tgt, src, d, eta, need, pool, enemy_eta)
+
+    if best_c is None:
+        _missed_skipped.clear()
+        return
+
+    tgt, src, d, eta, need, pool, enemy_eta = best_c
+    if tgt.id not in chosen_tgt_ids:
+        _missed_skipped[tgt.id] = _missed_skipped.get(tgt.id, 0) + 1
+        count = _missed_skipped[tgt.id]
+        world.add_debug(
+            f"MISSED_OPP step={world.step} nearest=p{tgt.id} src=p{src.id} "
+            f"d={d:.1f} eta={eta:.1f} need={need} pool={pool} enemy_eta={enemy_eta:.1f} "
+            f"skipped={count}" + (" FORCE_NEXT" if count >= 3 else "")
+        )
+        if count >= 3 and world.step < 200 and not chosen_moves:
+            if world.commit(src, tgt, need, chosen_moves):
+                _missed_skipped[tgt.id] = 0
+                world.add_debug(f"MISSED_OPP FORCED p{tgt.id}")
+    else:
+        _missed_skipped.pop(tgt.id, None)
+
+
 def agent(obs, config=None):
     start = time.perf_counter()
     act_timeout = _read(config, "actTimeout", 1.0) if config is not None else 1.0
@@ -1166,6 +1398,30 @@ def agent(obs, config=None):
 
     moves = []
     emergency_defense(world, moves)
+
+    # Phase 1: Simple 360-degree nearest capture (steps 0-70 or <2 planets)
+    if time.perf_counter() < deadline:
+        if first_capture_360(world, moves):
+            if world.step < 60 or len(world.my_planets) < 2:
+                if world.offensive_ships >= 15 or world.wave_attempted:
+                    agent._last_meaningful[world.player] = world.step
+                if DEBUG:
+                    for event in world.debug_events:
+                        print(event)
+                return moves
+
+    # Phase 2: Early nearest expansion (steps 0-140 or <4 planets)
+    if time.perf_counter() < deadline:
+        if early_nearest_expansion_360(world, moves):
+            if world.step < 100 or len(world.my_planets) < 3:
+                if world.offensive_ships >= 15 or world.wave_attempted:
+                    agent._last_meaningful[world.player] = world.step
+                if DEBUG:
+                    for event in world.debug_events:
+                        print(event)
+                return moves
+
+    # Phase 3+: Existing Dijkstra / beam / war layers
     if time.perf_counter() < deadline:
         nearest_expansion_plan(world, moves, mode, deadline)
     if time.perf_counter() < deadline:
@@ -1182,6 +1438,8 @@ def agent(obs, config=None):
         force_wave_if_inactive(world, moves, idle_turns)
     final_drain(world, moves)
     fallback_tempo(world, moves)
+
+    missed_opportunity_detector(world, moves)
 
     if world.offensive_ships >= 15 or world.wave_attempted:
         agent._last_meaningful[world.player] = world.step
