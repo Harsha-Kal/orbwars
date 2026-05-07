@@ -23,6 +23,7 @@ v11 improvements over v10:
 
 import math
 import time
+import heapq
 from dataclasses import dataclass
 from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
 
@@ -53,6 +54,16 @@ DEFENSE_ETA_HORIZON   = 30    # only count inbound fleets arriving within this m
 # Search planner margins
 HOSTILE_MARGIN_BASE = 5
 HOSTILE_MARGIN_CAP = 16
+
+# Proactive expansion.  Keep these early and explicit: the beam planner is good
+# at weighing options, but nearest safe neutrals need a hard tempo bias.
+DEBUG = False
+NEAREST_LOCK_DIST = 28.0
+NEAREST_LOCK_ETA = 18.0
+NEAREST_LOCK_MAX_SOURCES = 3
+PROACTIVE_EXPANSION_MAX_SOURCES = 4
+STALL_FORCE_TURNS = 6
+STALL_FORCE_SHIPS = 180
 
 
 # ── geometry ──────────────────────────────────────────────────────────────────
@@ -200,6 +211,21 @@ class RoutePlan:
     route: list
 
 
+@dataclass
+class NearestCandidate:
+    score: float
+    target_id: int
+    source_id: int
+    need: int
+    eta: float
+    distance: float
+    enemy_eta: float
+    grouped_pool: int
+    route: list
+    can_lock: bool
+    reason: str
+
+
 def _read(obs, key, default=None):
     return obs.get(key, default) if isinstance(obs, dict) else getattr(obs, key, default)
 
@@ -225,6 +251,7 @@ class WorldModel:
         self.planet_by_id = {p.id: p for p in self.planets}
 
         self.my_planets = [p for p in self.planets if p.owner == self.player]
+        self.owned_planets = self.my_planets
         self.neutral_planets = [p for p in self.planets if p.owner == -1]
         self.enemy_planets = [p for p in self.planets if p.owner not in (-1, self.player)]
         self.my_fleets = [f for f in self.fleets if f.owner == self.player]
@@ -270,6 +297,7 @@ class WorldModel:
         self.committed = {}
         self.offensive_ships = 0
         self.wave_attempted = False
+        self.debug_events = []
         self.features = {}
         self._compute_features()
 
@@ -334,6 +362,31 @@ class WorldModel:
     def nearest_enemy_distance(self, p):
         return min((dp(p, e) for e in self.enemy_planets), default=999.0)
 
+    def is_frontline(self, p):
+        return self.nearest_enemy_distance(p) < FRONTLINE_DIST
+
+    def is_backline(self, p):
+        return not self.is_frontline(p)
+
+    def enemy_pressure_near(self, p, radius=30.0):
+        pressure = 0.0
+        for enemy in self.enemy_planets:
+            d = max(1.0, dp(p, enemy))
+            if d <= radius:
+                pressure += max(0, int(enemy.ships) - 3) * (radius - d + 1.0) / radius
+        for fl in self.enemy_fleets:
+            d = max(1.0, dist(p.x, p.y, fl.x, fl.y))
+            if d <= radius:
+                pressure += int(fl.ships) * 0.5
+        return pressure
+
+    def cluster_distance(self, p, count=3):
+        distances = sorted(dp(p, m) for m in self.my_planets)
+        if not distances:
+            return 999.0
+        top = distances[:count]
+        return sum(top) / len(top)
+
     def reserve_for(self, p):
         if self.step < EARLY_STEPS:
             base = min(3, 1 + int(p.production))
@@ -352,6 +405,9 @@ class WorldModel:
 
     def surplus(self, p):
         return max(0, int(p.ships) - self.committed.get(p.id, 0) - self.reserve_for(p))
+
+    def available_ships_after_reserve(self, p):
+        return self.surplus(p)
 
     def target_need_now(self, tgt):
         return int(tgt.ships) + 1 + self.enemy_incoming_to_targets.get(tgt.id, 0) - self.incoming_to_targets.get(tgt.id, 0)
@@ -408,13 +464,26 @@ class WorldModel:
         eta = self.eta(src, tgt, hint)
         if tgt.owner == -1:
             need = self.target_need_now(tgt)
+            if need <= 0:
+                return 0
         else:
             need = int(tgt.ships + tgt.production * eta) + 1 + self.enemy_incoming_to_targets.get(tgt.id, 0) - self.incoming_to_targets.get(tgt.id, 0)
+            if need <= 0:
+                return 0
         if tgt.owner != -1:
             need += min(HOSTILE_MARGIN_CAP, HOSTILE_MARGIN_BASE + int(tgt.production))
         elif is_idle(tgt):
             need += 2
-        return max(1, int(need))
+        return max(0, int(need))
+
+    def required_ships_to_capture(self, tgt, src=None):
+        src = src or min(self.my_planets, key=lambda p: dp(p, tgt), default=None)
+        if src is None:
+            return int(tgt.ships) + 1
+        return self.ships_needed_to_capture(src, tgt)
+
+    def production_value(self, p):
+        return int(p.production) * max(1, self.remaining)
 
     def can_hold_after_capture(self, tgt, eta, sent, final_all_in=False):
         if final_all_in or tgt.owner not in (-1, self.player):
@@ -430,6 +499,14 @@ class WorldModel:
         enemy_t = min((self.eta(e, tgt, max(1, int(e.ships))) for e in self.enemy_planets), default=999.0)
         self.reaction_cache[tgt.id] = (my_t, enemy_t)
         return my_t, enemy_t
+
+    def enemy_reaches_faster(self, tgt, my_eta, margin=1.5):
+        _, enemy_t = self.reaction_times(tgt)
+        return enemy_t + margin < my_eta
+
+    def add_debug(self, message):
+        if DEBUG:
+            self.debug_events.append(message)
 
     def commit(self, src, tgt, ships, moves):
         ships = int(min(ships, int(src.ships) - self.committed.get(src.id, 0)))
@@ -469,6 +546,8 @@ def choose_strategy_mode(world, idle_turns):
 
 def score_target(world, src, tgt, mode):
     need = world.ships_needed_to_capture(src, tgt)
+    if need <= 0:
+        return -1e9
     eta = world.eta(src, tgt, min(max(1, world.surplus(src)), need))
     if eta > world.remaining - 3:
         return -1e9
@@ -503,6 +582,248 @@ def route_bridge_value(world, src, tgt):
     enemy_anchor = min(world.enemy_planets, key=lambda e: dp(tgt, e))
     closer = max(0.0, dp(src, enemy_anchor) - dp(tgt, enemy_anchor))
     return closer * 0.8 + (25.0 if tgt.production >= 5 else 0.0)
+
+
+def route_edge_cost(world, src, tgt):
+    """Non-negative travel/capture risk cost for Dijkstra/A* style routing."""
+    if src.id == tgt.id:
+        return 0.0
+    need = world.ships_needed_to_capture(src, tgt, max(1, int(tgt.ships) + 1))
+    eta = world.eta(src, tgt, need)
+    _, enemy_eta = world.reaction_times(tgt)
+    sun_penalty = 14.0 if hits_sun(src.x, src.y, tgt.x, tgt.y) else 0.0
+    contest_penalty = max(0.0, eta - enemy_eta + 1.5) * 12.0 if tgt.owner == -1 else 0.0
+    pressure_penalty = world.enemy_pressure_near(tgt) * 0.25
+    overextension = max(0.0, 18.0 - world.nearest_enemy_distance(tgt)) * 0.8
+    reward = int(tgt.production) * 3.0 + route_bridge_value(world, src, tgt) * 0.25
+    return max(0.25, eta * 3.5 + need * 0.45 + sun_penalty + contest_penalty + pressure_penalty + overextension - reward)
+
+
+def multi_source_dijkstra_from_owned(world, deadline, max_depth=3):
+    """Map each reachable neutral to the cheapest hypothetical route from my cluster."""
+    routes = {}
+    if not world.my_planets or not world.neutral_planets:
+        return routes
+
+    queue = []
+    best = {}
+    for src in world.my_planets:
+        heapq.heappush(queue, (0.0, src.id, src.id, ()))
+        best[(src.id, ())] = 0.0
+
+    neutral_ids = {p.id for p in world.neutral_planets}
+    expansion_nodes = world.neutral_planets
+    while queue and time.perf_counter() < deadline:
+        cost, node_id, source_id, route = heapq.heappop(queue)
+        node = world.planet_by_id.get(node_id)
+        if node is None:
+            continue
+        if node_id in neutral_ids and route:
+            first_hop = route[0]
+            current = routes.get(node_id)
+            score = -cost
+            if current is None or cost < current.cost:
+                routes[node_id] = RoutePlan(node_id, first_hop, score, cost, list(route))
+        if len(route) >= max_depth:
+            continue
+        for nxt in expansion_nodes:
+            if nxt.id == node_id or nxt.id in route:
+                continue
+            edge = route_edge_cost(world, node, nxt)
+            new_cost = cost + edge
+            new_route = route + (nxt.id,)
+            key = (nxt.id, new_route)
+            if new_cost + 1e-6 >= best.get(key, 1e18):
+                continue
+            best[key] = new_cost
+            heapq.heappush(queue, (new_cost, nxt.id, source_id, new_route))
+    return routes
+
+
+def estimate_grouped_sources(world, tgt, need, max_sources=NEAREST_LOCK_MAX_SOURCES):
+    """Pick nearby safe sources and the amount each can contribute to a neutral capture."""
+    buffer = 1 if world.step < EARLY_STEPS else min(4, max(1, int(tgt.production)))
+    goal = max(1, int(need + buffer))
+    sources = sorted(
+        [
+            p for p in world.my_planets
+            if world.real_incoming_threat(p)["deficit"] <= 0 and world.surplus(p) > 0
+        ],
+        key=lambda p: (
+            world.eta(p, tgt, max(1, min(world.surplus(p), goal))),
+            0 if world.is_backline(p) else 1,
+            -world.surplus(p),
+        ),
+    )
+    selected = []
+    total = 0
+    for src in sources[:max_sources]:
+        if total >= goal:
+            break
+        available = world.surplus(src)
+        send = min(available, goal - total)
+        if send < 3 and total + send < need:
+            continue
+        angle, ok = world.aim(src, tgt, send)
+        if not ok:
+            continue
+        selected.append((src, int(send), angle))
+        total += int(send)
+    return selected, total, goal
+
+
+def nearest_neutral_candidates(world, deadline):
+    """Nearest-first expansion scoring. Distance dominates early; production breaks ties."""
+    if not world.neutral_planets or not world.my_planets:
+        return []
+    route_map = multi_source_dijkstra_from_owned(world, deadline)
+    candidates = []
+    for tgt in world.neutral_planets:
+        if time.perf_counter() > deadline:
+            break
+        src = min(world.my_planets, key=lambda p: dp(p, tgt), default=None)
+        if src is None:
+            continue
+        need = world.ships_needed_to_capture(src, tgt)
+        if need <= 0:
+            continue
+        selected, grouped_pool, _ = estimate_grouped_sources(world, tgt, need, max_sources=PROACTIVE_EXPANSION_MAX_SOURCES)
+        if not selected:
+            continue
+        closest_eta = world.eta(src, tgt, max(1, min(max(need, 1), max(1, int(src.ships)))))
+        closest_dist = dp(src, tgt)
+        my_eta, enemy_eta = world.reaction_times(tgt)
+        enemy_faster = enemy_eta + 1.5 < closest_eta
+        route = route_map.get(tgt.id)
+        route_cost = route.cost if route is not None else closest_eta * 3.5 + need * 0.45
+        cluster_dist = world.cluster_distance(tgt)
+        cluster_bonus = max(0.0, 34.0 - cluster_dist) * 2.5
+        close_bonus = max(0.0, NEAREST_LOCK_DIST - closest_dist) * (5.0 if world.step < 140 else 3.0)
+        bridge_bonus = route_bridge_value(world, src, tgt)
+        weak_bonus = max(0.0, 24.0 - need) * 2.0
+        static_bonus = 18.0 if is_idle(tgt) else 0.0
+        contest_risk = max(0.0, closest_eta - enemy_eta + 1.0) if enemy_eta < 999 else 0.0
+        missing_penalty = 120.0 if grouped_pool < need else 0.0
+        early_distance_weight = 16.0 if world.step < 140 or len(world.my_planets) < 4 else 9.0
+        score = (
+            int(tgt.production) * 40.0
+            - closest_eta * early_distance_weight
+            - closest_dist * 1.35
+            - need * 1.75
+            - contest_risk * 24.0
+            - route_cost * 0.35
+            - missing_penalty
+            + bridge_bonus
+            + cluster_bonus
+            + close_bonus
+            + weak_bonus
+            + static_bonus
+        )
+        can_lock = (
+            grouped_pool >= need
+            and not enemy_faster
+            and closest_dist <= NEAREST_LOCK_DIST
+            and closest_eta <= NEAREST_LOCK_ETA
+        )
+        if grouped_pool >= need and not enemy_faster and int(tgt.production) >= 4 and closest_dist <= NEAREST_LOCK_DIST + 6:
+            can_lock = True
+        if can_lock:
+            score += 110.0
+        reason = (
+            f"p{tgt.id} score={score:.1f} d={closest_dist:.1f} eta={closest_eta:.1f} "
+            f"need={need} pool={grouped_pool} prod={int(tgt.production)} enemy_eta={enemy_eta:.1f}"
+        )
+        candidates.append(
+            NearestCandidate(
+                score=score,
+                target_id=tgt.id,
+                source_id=src.id,
+                need=need,
+                eta=closest_eta,
+                distance=closest_dist,
+                enemy_eta=enemy_eta,
+                grouped_pool=grouped_pool,
+                route=route.route if route is not None else [tgt.id],
+                can_lock=can_lock,
+                reason=reason,
+            )
+        )
+    candidates.sort(key=lambda c: (-c.can_lock, -c.score, c.distance, -world.planet_by_id[c.target_id].production))
+    return candidates
+
+
+def plan_grouped_capture(world, tgt, moves, need=None, max_sources=NEAREST_LOCK_MAX_SOURCES, force=False):
+    """Capture a close neutral with one or a few nearby planets without draining reserves."""
+    if tgt.owner != -1:
+        return False
+    src = min(world.my_planets, key=lambda p: dp(p, tgt), default=None)
+    if src is None:
+        return False
+    need = int(need if need is not None else world.ships_needed_to_capture(src, tgt))
+    if need <= 0:
+        return False
+    selected, total, goal = estimate_grouped_sources(world, tgt, need, max_sources=max_sources)
+    if total < need:
+        return False
+    if not force and total < max(need, min(goal, need + 1)):
+        return False
+    sent = 0
+    for src, send, _angle in selected:
+        if sent >= goal:
+            break
+        n = min(send, goal - sent)
+        if n <= 0:
+            continue
+        if world.commit(src, tgt, n, moves):
+            sent += n
+    if sent >= need:
+        world.wave_attempted = True
+        world.add_debug(f"grouped_capture target=p{tgt.id} need={need} sent={sent} sources={[s.id for s, _, _ in selected]}")
+        return True
+    return False
+
+
+def nearest_expansion_plan(world, moves, mode, deadline, force=False):
+    """Hard proactive neutral capture pass before combat and leader pressure."""
+    if not world.neutral_planets or world.remaining < 35:
+        return False
+    candidates = nearest_neutral_candidates(world, deadline)
+    if not candidates:
+        world.add_debug("nearest_expansion no candidates")
+        return False
+    world.add_debug(
+        f"phase={mode} owned={len(world.my_planets)} prod={world.my_prod} "
+        f"top_neutrals={[c.reason for c in candidates[:5]]}"
+    )
+    locked = [c for c in candidates if c.can_lock]
+    if locked:
+        chosen = locked[0]
+        trigger = "NEAREST_LOCK"
+    elif force:
+        chosen = candidates[0]
+        trigger = "FORCE_NEAREST"
+    elif mode in (StrategyMode.OPENING_TEMPO, StrategyMode.SAFE_EXPANSION, StrategyMode.CONTEST_NEUTRALS, StrategyMode.BEHIND_STEAL, StrategyMode.ANTI_LEADER):
+        chosen = candidates[0] if candidates[0].score > -60.0 and candidates[0].grouped_pool >= candidates[0].need else None
+        trigger = "PROACTIVE_EXPANSION"
+    else:
+        chosen = candidates[0] if candidates[0].can_lock else None
+        trigger = "LOCK_ONLY"
+    if chosen is None:
+        world.add_debug(f"nearest_expansion skipped best={candidates[0].reason}")
+        return False
+    target = world.planet_by_id.get(chosen.target_id)
+    if target is None:
+        return False
+    acted = plan_grouped_capture(
+        world,
+        target,
+        moves,
+        need=chosen.need,
+        max_sources=PROACTIVE_EXPANSION_MAX_SOURCES if force else NEAREST_LOCK_MAX_SOURCES,
+        force=force or chosen.can_lock,
+    )
+    world.add_debug(f"{trigger} target=p{target.id} acted={acted} route={chosen.route} reason={chosen.reason}")
+    return acted
 
 
 def route_search_to_enemy(world, mode, deadline):
@@ -571,6 +892,8 @@ def build_grouped_wave(world, tgt, need, moves, max_sources=MAX_GROUP_SOURCES, a
 
 def make_shot_option(world, src, tgt, mode, mission):
     need = world.ships_needed_to_capture(src, tgt)
+    if need <= 0:
+        return None
     surplus = world.surplus(src)
     if surplus <= 0:
         return None
@@ -739,6 +1062,33 @@ def force_wave_if_inactive(world, moves, idle_turns):
     return build_grouped_wave(world, tgt, max(20, int(pool * 0.28)), moves, max_sources=7, allow_partial=True, sync=tgt.owner != -1) > 0
 
 
+def force_action_if_stalling(world, moves, idle_turns, deadline):
+    """Prefer forced nearest expansion before falling back to enemy pressure."""
+    if idle_turns < STALL_FORCE_TURNS or world.my_total_ships < STALL_FORCE_SHIPS:
+        return False
+    if world.neutral_planets and nearest_expansion_plan(world, moves, StrategyMode.FORCE_WAVE, deadline, force=True):
+        return True
+    if idle_turns < 8 or world.my_total_ships <= 230:
+        return False
+    targets = sorted(
+        world.enemy_planets,
+        key=lambda p: (
+            min(dp(m, p) for m in world.my_planets),
+            -int(p.production),
+            int(p.ships),
+        ),
+    )
+    for tgt in targets[:4]:
+        src = min(world.my_planets, key=lambda p: dp(p, tgt), default=None)
+        if src is None:
+            continue
+        need = world.ships_needed_to_capture(src, tgt, world.my_total_ships)
+        if build_grouped_wave(world, tgt, max(18, int(min(need, sum(world.surplus(p) for p in world.my_planets) * 0.30))), moves, max_sources=6, allow_partial=True, sync=True) > 0:
+            world.add_debug(f"stall_force_enemy target=p{tgt.id} need={need}")
+            return True
+    return False
+
+
 def final_drain(world, moves):
     if world.step < FINAL_STEPS and world.remaining > 45:
         return False
@@ -752,7 +1102,7 @@ def final_drain(world, moves):
             if world.eta(src, tgt, spare) > world.remaining - 1:
                 continue
             need = world.ships_needed_to_capture(src, tgt, spare)
-            if need <= spare and world.commit(src, tgt, need, moves):
+            if 0 < need <= spare and world.commit(src, tgt, need, moves):
                 acted = True
                 break
     return acted
@@ -795,7 +1145,7 @@ def fallback_tempo(world, moves):
             continue
         tgt = min(targets, key=lambda t: dp(src, t))
         need = world.ships_needed_to_capture(src, tgt, surplus)
-        if surplus >= need and world.commit(src, tgt, need, moves):
+        if 0 < need <= surplus and world.commit(src, tgt, need, moves):
             acted = True
     return acted
 
@@ -816,6 +1166,10 @@ def agent(obs, config=None):
 
     moves = []
     emergency_defense(world, moves)
+    if time.perf_counter() < deadline:
+        nearest_expansion_plan(world, moves, mode, deadline)
+    if time.perf_counter() < deadline:
+        force_action_if_stalling(world, moves, idle_turns, deadline)
     finish_started_captures(world, moves)
 
     if time.perf_counter() < deadline:
@@ -831,4 +1185,7 @@ def agent(obs, config=None):
 
     if world.offensive_ships >= 15 or world.wave_attempted:
         agent._last_meaningful[world.player] = world.step
+    if DEBUG:
+        for event in world.debug_events:
+            print(event)
     return moves
