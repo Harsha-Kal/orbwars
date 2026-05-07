@@ -841,6 +841,10 @@ def route_search_to_enemy(world, mode, deadline):
             direct_cost = world.eta(best_src, enemy, direct_need) + direct_need * 0.18
             direct_score = score_target(world, best_src, enemy, mode) - direct_cost
             routes.append(RoutePlan(enemy.id, enemy.id, direct_score, direct_cost, [enemy.id]))
+        if time.perf_counter() < deadline:
+            astar_plan = astar_route_to_target(world, enemy, deadline)
+            if astar_plan is not None:
+                routes.append(astar_plan)
         for bridge in bridges:
             if time.perf_counter() > deadline:
                 break
@@ -1153,6 +1157,17 @@ def fallback_tempo(world, moves):
 _missed_skipped: dict = {}
 
 
+def early_surplus(world, p):
+    """Light reserve for early game: avoids over-holding during expansion."""
+    if world.step < 80:
+        reserve = 2
+    elif world.step < 140:
+        reserve = 3
+    else:
+        reserve = world.reserve_for(p)
+    return max(0, int(p.ships) - world.committed.get(p.id, 0) - reserve)
+
+
 def first_capture_360(world, moves):
     """Steps 0-70 or <2 planets: pure 360-degree nearest neutral scan.
     No Dijkstra, beam search, bridge scoring, or production weighting.
@@ -1169,8 +1184,10 @@ def first_capture_360(world, moves):
         if available <= 0:
             continue
         for tgt in world.neutral_planets:
-            need = int(tgt.ships) + 1
-            if world.step < 80:
+            need = int(tgt.ships) + 1 - world.incoming_to_targets.get(tgt.id, 0)
+            if need <= 0:
+                continue
+            if world.step < 80 and need > 0:
                 need += 1
             if need > available:
                 continue
@@ -1186,7 +1203,7 @@ def first_capture_360(world, moves):
     if not candidates:
         return False
 
-    candidates.sort()
+    candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4].id, x[5].id))
     eta_val, d, need, _, src, tgt, angle = candidates[0]
     moves.append([src.id, angle, need])
     world.committed[src.id] = world.committed.get(src.id, 0) + need
@@ -1209,7 +1226,7 @@ def early_nearest_expansion_360(world, moves):
 
     candidates = []
     for src in world.my_planets:
-        av = world.surplus(src)
+        av = early_surplus(world, src)
         if av < 5:
             continue
         for tgt in world.neutral_planets:
@@ -1228,13 +1245,13 @@ def early_nearest_expansion_360(world, moves):
     if not candidates:
         return False
 
-    candidates.sort()
+    candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4].id, x[5].id))
     seen: set = set()
     for eta_val, d, need, _, src, tgt, _ in candidates:
         if tgt.id in seen:
             continue
         seen.add(tgt.id)
-        av = world.surplus(src)
+        av = early_surplus(world, src)
         if av >= need:
             if world.commit(src, tgt, need, moves):
                 world.add_debug(
@@ -1246,12 +1263,12 @@ def early_nearest_expansion_360(world, moves):
                 [p for p in world.my_planets if world.real_incoming_threat(p)["deficit"] <= 0],
                 key=lambda p: dp(p, tgt),
             )[:3]
-            if sum(world.surplus(p) for p in pool_srcs) >= need:
+            if sum(early_surplus(world, p) for p in pool_srcs) >= need:
                 sent = 0
                 for psrc in pool_srcs:
                     if sent >= need:
                         break
-                    sn = min(world.surplus(psrc), need - sent)
+                    sn = min(early_surplus(world, psrc), need - sent)
                     if sn < 3 and sent + sn < need:
                         continue
                     if world.commit(psrc, tgt, sn, moves):
@@ -1319,8 +1336,67 @@ def astar_route_to_target(world, goal_planet, deadline, max_depth=4):
     return best_plan
 
 
+def _nearest_capturable_neutral(world):
+    """Return (tgt, src, d, eta, need, pool, enemy_eta) for the closest capturable neutral, or None."""
+    best_c = None
+    best_key = None
+    for tgt in world.neutral_planets:
+        src = min(world.my_planets, key=lambda p: dp(p, tgt), default=None)
+        if src is None:
+            continue
+        need = world.target_need_now(tgt)
+        if need <= 0:
+            continue
+        pool = sum(world.surplus(p) for p in world.my_planets)
+        if pool < need:
+            continue
+        d = dp(src, tgt)
+        eta = world.eta(src, tgt, max(1, need))
+        _, enemy_eta = world.reaction_times(tgt)
+        key = (eta, d, need)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_c = (tgt, src, d, eta, need, pool, enemy_eta)
+    return best_c
+
+
+def force_repeated_missed_neutral(world, moves):
+    """Before beam search: if the same close neutral has been skipped 3+ turns, force-capture it."""
+    global _missed_skipped
+    if not world.neutral_planets or not world.my_planets:
+        return False
+    best_c = _nearest_capturable_neutral(world)
+    if best_c is None:
+        return False
+    tgt, _, _, _, need, _, _ = best_c
+    count = _missed_skipped.get(tgt.id, 0)
+    if count < 3 or world.step >= 200:
+        return False
+    any_threatened = any(world.real_incoming_threat(p)["deficit"] > 0 for p in world.my_planets)
+    if any_threatened:
+        return False
+    pool_srcs = sorted(
+        [p for p in world.my_planets if world.real_incoming_threat(p)["deficit"] <= 0],
+        key=lambda p: dp(p, tgt),
+    )[:3]
+    sent = 0
+    for psrc in pool_srcs:
+        if sent >= need:
+            break
+        sn = min(world.surplus(psrc), need - sent)
+        if sn <= 0:
+            continue
+        if world.commit(psrc, tgt, sn, moves):
+            sent += sn
+    if sent >= need:
+        _missed_skipped[tgt.id] = 0
+        world.add_debug(f"FORCE_MISSED_NEUTRAL p{tgt.id} after {count} skips sent={sent}")
+        return True
+    return False
+
+
 def missed_opportunity_detector(world, chosen_moves):
-    """Debug tool: logs nearby neutrals being skipped. Forces capture after 3 consecutive skips."""
+    """Debug tool: logs nearby neutrals being skipped each turn. Updates _missed_skipped."""
     global _missed_skipped
     if not world.neutral_planets or not world.my_planets:
         return
@@ -1341,26 +1417,7 @@ def missed_opportunity_detector(world, chosen_moves):
         if best_match:
             chosen_tgt_ids.add(best_match.id)
 
-    best_c = None
-    best_key = None
-    for tgt in world.neutral_planets:
-        src = min(world.my_planets, key=lambda p: dp(p, tgt), default=None)
-        if src is None:
-            continue
-        need = world.target_need_now(tgt)
-        if need <= 0:
-            continue
-        pool = sum(world.surplus(p) for p in world.my_planets)
-        if pool < need:
-            continue
-        d = dp(src, tgt)
-        eta = world.eta(src, tgt, max(1, need))
-        _, enemy_eta = world.reaction_times(tgt)
-        key = (eta, d, need)
-        if best_key is None or key < best_key:
-            best_key = key
-            best_c = (tgt, src, d, eta, need, pool, enemy_eta)
-
+    best_c = _nearest_capturable_neutral(world)
     if best_c is None:
         _missed_skipped.clear()
         return
@@ -1374,10 +1431,6 @@ def missed_opportunity_detector(world, chosen_moves):
             f"d={d:.1f} eta={eta:.1f} need={need} pool={pool} enemy_eta={enemy_eta:.1f} "
             f"skipped={count}" + (" FORCE_NEXT" if count >= 3 else "")
         )
-        if count >= 3 and world.step < 200 and not chosen_moves:
-            if world.commit(src, tgt, need, chosen_moves):
-                _missed_skipped[tgt.id] = 0
-                world.add_debug(f"MISSED_OPP FORCED p{tgt.id}")
     else:
         _missed_skipped.pop(tgt.id, None)
 
@@ -1427,6 +1480,9 @@ def agent(obs, config=None):
     if time.perf_counter() < deadline:
         force_action_if_stalling(world, moves, idle_turns, deadline)
     finish_started_captures(world, moves)
+
+    if time.perf_counter() < deadline:
+        force_repeated_missed_neutral(world, moves)
 
     if time.perf_counter() < deadline:
         missions = beam_search_planner(world, mode, deadline)
