@@ -144,20 +144,12 @@ MIDGAME_ATTACK_SOURCE_MAX   = 4      # grouped attacks should be compact and nea
 DEBUG = False
 
 # ── persistent global state ───────────────────────────────────────────────────
-_wave_reservation = {
-    "target_id": None,
-    "source_ids": [],
-    "started_step": -1,
-    "launch_by_step": -1,
-    "required_ships": 0,
-    "reason": ""
-}
-
-_prev_owners: dict = {}           # planet_id -> owner at start of previous turn
-_prev_ships: dict = {}            # planet_id -> ship count at start of previous turn
-_backyard_threats: dict = {}      # planet_id -> step when it was first detected as a threat
+_prev_owners: dict = {}           # player -> {planet_id -> owner at start of previous turn}
+_prev_ships: dict = {}            # player -> {planet_id -> ship count at start of previous turn}
+_backyard_threats: dict = {}      # player -> {planet_id -> step when first detected as threat}
 _midgame_recent_losses: dict = {} # player -> {planet_id -> step when lost}
 _midgame_infection_sources: dict = {} # player -> {planet_id -> step when local planet was lost}
+_wave_reservations: dict = {}     # player -> wave reservation state
 
 
 # ── geometry ──────────────────────────────────────────────────────────────────
@@ -390,6 +382,34 @@ _mission_ledger: dict = {}          # player -> mission_id -> MissionLedgerEntry
 _mission_seq: dict = {}             # player -> next id
 _recently_reinforced: dict = {}     # player -> planet_id -> last step
 _doomed_owned_targets: dict = {}    # player -> planet_id -> last doomed step
+_mission_observed: dict = {}        # player -> mission_id -> last outcome observation step
+
+
+def default_wave_reservation():
+    return {
+        "target_id": None,
+        "source_ids": [],
+        "started_step": -1,
+        "launch_by_step": -1,
+        "required_ships": 0,
+        "reason": "",
+    }
+
+
+def wave_reservation_for(world):
+    return _wave_reservations.setdefault(world.player, default_wave_reservation())
+
+
+def prev_owners_for(world):
+    return _prev_owners.setdefault(world.player, {})
+
+
+def prev_ships_for(world):
+    return _prev_ships.setdefault(world.player, {})
+
+
+def backyard_threats_for(world):
+    return _backyard_threats.setdefault(world.player, {})
 
 
 def canonical_mission_type(kind):
@@ -414,6 +434,7 @@ class MissionLedger:
 
     def update_active_missions(self):
         world = self.world
+        observed = _mission_observed.setdefault(world.player, {})
         for entry in list(self.entries.values()):
             if entry.status in ("completed", "invalidated") and world.step - entry.launch_step > 20:
                 del self.entries[entry.mission_id]
@@ -448,6 +469,64 @@ class MissionLedger:
                         )
                     elif need > max(25, world.my_total_ships * 1.4):
                         self.invalidate(entry.mission_id, "mission invalidated: target too heavily defended")
+            self.observe_mission_outcome(entry, tgt, observed)
+
+    def observe_mission_outcome(self, entry, tgt, observed):
+        world = self.world
+        if entry.status not in ("active", "completed", "invalidated") or not entry.expected_arrival_steps:
+            return
+        expected = max(entry.expected_arrival_steps)
+        stage = observed.get(entry.mission_id, -1)
+        if stage < 0 and world.step >= expected:
+            source_hollowed = []
+            for src_id in entry.source_ids:
+                src = world.planet_by_id.get(src_id)
+                if src is not None and src.owner == world.player and int(src.ships) < world.reserve_for(src):
+                    source_hollowed.append(src_id)
+            if source_hollowed:
+                world.add_debug(
+                    f"SOURCE_HOLLOWED mission={entry.mission_id} type={entry.mission_type} "
+                    f"sources={source_hollowed} target=p{entry.target_id}"
+                )
+            if entry.mission_type in OFFENSIVE_MISSIONS:
+                if tgt.owner == world.player:
+                    world.add_debug(
+                        f"MISSION_SUCCESS id={entry.mission_id} type={entry.mission_type} "
+                        f"target=p{entry.target_id} ships_sent={entry.ships_committed} "
+                        f"sources={entry.source_ids} expected={expected} owner={tgt.owner}"
+                    )
+                    world.add_debug(f"FRONT_GAINED mission={entry.mission_id} target=p{entry.target_id}")
+                else:
+                    incoming_left = world.incoming_to_targets.get(entry.target_id, 0)
+                    label = "MISSION_WASTED_SHIPS" if incoming_left <= 0 else "MISSION_FAILED_NO_CAPTURE"
+                    world.add_debug(
+                        f"{label} id={entry.mission_id} type={entry.mission_type} target=p{entry.target_id} "
+                        f"ships_sent={entry.ships_committed} owner={tgt.owner} incoming_left={incoming_left}"
+                    )
+            elif entry.mission_type in REINFORCEMENT_MISSIONS:
+                if tgt.owner == world.player:
+                    world.add_debug(
+                        f"MISSION_SUCCESS id={entry.mission_id} type={entry.mission_type} "
+                        f"target=p{entry.target_id} held_at_arrival ships={int(tgt.ships)}"
+                    )
+                else:
+                    world.add_debug(
+                        f"MISSION_FAILED_NO_HOLD id={entry.mission_id} type={entry.mission_type} "
+                        f"target=p{entry.target_id} owner={tgt.owner}"
+                    )
+            observed[entry.mission_id] = 0
+        if stage < 1 and world.step >= expected + 20:
+            if tgt.owner == world.player:
+                world.add_debug(
+                    f"MISSION_SUCCESS id={entry.mission_id} type={entry.mission_type} target=p{entry.target_id} held_20=True"
+                )
+            else:
+                world.add_debug(
+                    f"MISSION_FAILED_NO_HOLD id={entry.mission_id} type={entry.mission_type} "
+                    f"target=p{entry.target_id} owner={tgt.owner} hold_window=20"
+                )
+                world.add_debug(f"FRONT_LOST mission={entry.mission_id} target=p{entry.target_id}")
+            observed[entry.mission_id] = 1
 
     def create(self, mission_type, target_id, source_ids, required_ships, expected_arrival_steps, reason):
         mission_type = canonical_mission_type(mission_type)
@@ -860,8 +939,8 @@ class WorldModel:
             return False, f"source unsafe: below reserve {remaining}<{reserve}"
         if self.is_recently_reinforced(src) and mission_type in OFFENSIVE_MISSIONS and not evacuating:
             return False, "source unsafe: recently reinforced cooldown"
-        prev_owner = _prev_owners.get(src.id)
-        prev_ships = _prev_ships.get(src.id)
+        prev_owner = prev_owners_for(self).get(src.id)
+        prev_ships = prev_ships_for(self).get(src.id)
         if prev_owner == self.player and prev_ships is not None and not critical and not evacuating:
             recent_loss = int(prev_ships) + int(src.production) - int(src.ships)
             if recent_loss >= max(5, int(src.production) * 2):
@@ -1122,9 +1201,8 @@ def should_block_early_enemy_attack_4p(world, target):
 
 def update_ownership_memory(world):
     """Snapshot current planet state for next turn's threat/source-safety checks."""
-    global _prev_owners, _prev_ships
-    _prev_owners = {p.id: p.owner for p in world.normal_planets}
-    _prev_ships = {p.id: int(p.ships) for p in world.normal_planets}
+    _prev_owners[world.player] = {p.id: p.owner for p in world.normal_planets}
+    _prev_ships[world.player] = {p.id: int(p.ships) for p in world.normal_planets}
 
 
 def detect_backyard_threats(world):
@@ -1133,35 +1211,36 @@ def detect_backyard_threats(world):
     mine and are inside or very close to my cluster.  Also keeps track of ongoing threats
     that were detected in earlier turns.
     """
-    global _backyard_threats
     if not world.my_planets:
         return []
 
+    backyard_threats = backyard_threats_for(world)
+    prev_owners = prev_owners_for(world)
     current_enemy_ids = {p.id for p in world.enemy_planets}
 
     # Detect newly flipped planets (mine last turn, enemy now, inside backyard)
-    if _prev_owners:
+    if prev_owners:
         for p in world.enemy_planets:
-            if _prev_owners.get(p.id) == world.player:
+            if prev_owners.get(p.id) == world.player:
                 dist_to_cluster = min(dp(p, m) for m in world.my_planets)
                 if dist_to_cluster <= BACKYARD_THREAT_DIST:
-                    if p.id not in _backyard_threats:
-                        _backyard_threats[p.id] = world.step
+                    if p.id not in backyard_threats:
+                        backyard_threats[p.id] = world.step
 
     # Expire threats: recaptured, gone neutral, too old, or drifted out of range
-    for pid in list(_backyard_threats.keys()):
+    for pid in list(backyard_threats.keys()):
         p = world.planet_by_id.get(pid)
         if p is None or p.owner == world.player:
-            del _backyard_threats[pid]
+            del backyard_threats[pid]
         elif pid not in current_enemy_ids:
-            del _backyard_threats[pid]
-        elif world.step - _backyard_threats[pid] > BACKYARD_THREAT_TTL:
-            del _backyard_threats[pid]
+            del backyard_threats[pid]
+        elif world.step - backyard_threats[pid] > BACKYARD_THREAT_TTL:
+            del backyard_threats[pid]
         elif min(dp(p, m) for m in world.my_planets) > BACKYARD_THREAT_DIST * 1.8:
-            del _backyard_threats[pid]
+            del backyard_threats[pid]
 
     threats = []
-    for pid in _backyard_threats:
+    for pid in backyard_threats:
         p = world.planet_by_id.get(pid)
         if p is None or p.owner == world.player:
             continue
@@ -2283,6 +2362,101 @@ def generate_local_strike_missions(world):
     return proposals
 
 
+def required_attack_ships_to_hold(world, tgt, eta, pool=0):
+    enemy_support = sum(
+        ships for arr_eta, owner, ships in world.arrivals_by_target.get(tgt.id, [])
+        if owner != world.player and arr_eta <= eta + 8
+    )
+    production_until_arrival = int(tgt.production) * max(0, int(math.ceil(eta))) if tgt.owner not in (-1, world.player) else 0
+    hold_buffer = max(8, int(tgt.production) * 5)
+    current = int(tgt.ships)
+    projected_need = 0
+    src = min(world.my_planets, key=lambda p: dp(p, tgt), default=None)
+    if src is not None:
+        projected_need = world.ships_needed_to_capture(src, tgt, pool)
+    return max(1, projected_need, current + production_until_arrival + enemy_support + hold_buffer + 1)
+
+
+def build_exact_synced_attack_plan(world, tgt, mission_type, max_sources=MIDGAME_ATTACK_SOURCE_MAX):
+    if tgt is None or world.is_comet(tgt) or tgt.owner in (-1, world.player):
+        return None, "bad target"
+    candidates = []
+    for src in sorted(world.my_planets, key=lambda p: dp(p, tgt)):
+        av = world.surplus(src)
+        if av < 5:
+            continue
+        ok, reason = world.source_is_safe_for(src, tgt, mission_type, min(av, max(8, int(av * 0.5))))
+        if not ok:
+            world.add_debug(
+                f"{mission_type}_SOURCE_SKIP target=p{tgt.id} src=p{src.id} avail={av} reason={reason}"
+            )
+            continue
+        candidates.append(src)
+        if len(candidates) >= max_sources + 2:
+            break
+    if len(candidates) < 2:
+        return None, "need grouped sources"
+
+    best_plan = None
+    best_spread = 999.0
+    for anchor in candidates[:max_sources + 1]:
+        selected = []
+        pool = 0
+        for src in candidates:
+            av = world.surplus(src)
+            probe = max(5, min(av, int(av * 0.65)))
+            eta = world.eta(src, tgt, probe)
+            anchor_eta = world.eta(anchor, tgt, max(5, min(world.surplus(anchor), int(world.surplus(anchor) * 0.65))))
+            if abs(eta - anchor_eta) <= ETA_SYNC_WINDOW:
+                selected.append(src)
+                pool += av
+            if len(selected) >= max_sources:
+                break
+        if len(selected) < 2:
+            continue
+        rough_eta = max(world.eta(src, tgt, max(5, min(world.surplus(src), int(world.surplus(src) * 0.65)))) for src in selected)
+        need = required_attack_ships_to_hold(world, tgt, rough_eta, pool)
+        if pool < need * MIN_WAVE_FRACTION:
+            continue
+
+        planned = []
+        remaining = need
+        for src in selected:
+            if remaining <= 0:
+                break
+            send = min(world.surplus(src), remaining)
+            if send < 5 and remaining > send:
+                continue
+            angle, ok = world.aim(src, tgt, send)
+            if not ok:
+                continue
+            planned.append((src.id, send, angle, world.eta(src, tgt, send)))
+            remaining -= send
+        sent = sum(s for _, s, _, _ in planned)
+        if sent < need * MIN_WAVE_FRACTION or not planned:
+            continue
+        eta_vals = [eta for _, _, _, eta in planned]
+        spread = max(eta_vals) - min(eta_vals)
+        if spread > ETA_SYNC_WINDOW:
+            continue
+        avg_send = sent / max(1, len(planned))
+        if avg_send < MIDGAME_MIN_AVG_SHIPS:
+            continue
+        if not world.can_hold_after_capture(tgt, max(eta_vals), sent):
+            continue
+        if spread < best_spread:
+            best_spread = spread
+            best_plan = (planned, need, min(eta_vals), max(eta_vals))
+
+    if best_plan is None:
+        src = min(candidates, key=lambda p: dp(p, tgt), default=None)
+        pool = sum(world.surplus(s) for s in candidates[:max_sources])
+        eta = world.eta(src, tgt, max(1, min(pool, int(tgt.ships) + 1))) if src else 999.0
+        need = required_attack_ships_to_hold(world, tgt, eta, pool)
+        return None, f"pool={pool} need={need} eta={eta:.1f}"
+    return best_plan, ""
+
+
 def generate_sync_attack_missions(world, mode, deadline):
     """Coordinated multi-source attacks where all fleets arrive within ETA_SYNC_WINDOW turns."""
     proposals = []
@@ -2301,43 +2475,22 @@ def generate_sync_attack_missions(world, mode, deadline):
             break
         if should_block_early_enemy_attack_4p(world, tgt):
             continue
-        pool_srcs = sorted(world.my_planets, key=lambda p: dp(p, tgt))[:6]
-        if not pool_srcs:
+        plan, reason = build_exact_synced_attack_plan(world, tgt, "SYNC_ATTACK")
+        if plan is None:
+            world.add_debug(f"SYNC_ATTACK_SKIP target=p{tgt.id} fleet={compute_fleet_ratio(world):.2f} reason={reason}")
             continue
-        pool = sum(world.surplus(p) for p in pool_srcs)
-        need = world.ships_needed_to_capture(min(pool_srcs, key=lambda p: dp(p, tgt)), tgt, pool)
-        if need <= 0 or pool < need:
-            continue
-        source_etas = []
-        for src in pool_srcs:
-            av = world.surplus(src)
-            if av < 8:
-                continue
-            send = min(av, max(8, int(av * 0.6)))
-            angle, ok = world.aim(src, tgt, send)
-            if not ok:
-                continue
-            eta = world.eta(src, tgt, send)
-            source_etas.append((eta, src, send, angle))
-        if len(source_etas) < 2:
-            continue
-        source_etas.sort()
-        anchor_eta = source_etas[-1][0]
-        synced = [(eta, src, send, angle) for eta, src, send, angle in source_etas
-                  if anchor_eta - eta <= ETA_SYNC_WINDOW]
-        if sum(s for _, _, s, _ in synced) < need:
-            continue
-        planned = [(src.id, send, angle, eta) for eta, src, send, angle in synced]
-        base_score = score_target(world, synced[0][1], tgt, mode)
+        planned, need, eta_min, eta_max = plan
+        src0 = world.planet_by_id.get(planned[0][0])
+        base_score = score_target(world, src0, tgt, mode) if src0 else 0
         proposals.append(MissionProposal(
             kind="SYNC_ATTACK",
             target_id=tgt.id,
             priority=62.0 + base_score * 0.25,
             required_ships=need,
             planned_sources=planned,
-            eta_min=source_etas[0][0],
-            eta_max=anchor_eta,
-            reason=f"sync p{tgt.id} need={need} sources={len(synced)} spread={anchor_eta - source_etas[0][0]:.1f}",
+            eta_min=eta_min,
+            eta_max=eta_max,
+            reason=f"sync p{tgt.id} need={need} sources={len(planned)} spread={eta_max - eta_min:.1f}",
         ))
     return proposals
 
@@ -2589,11 +2742,21 @@ def coordinate_missions(world, proposals, moves, fleet_ratio, deadline, midgame_
         if prop.target_id in used_targets:
             continue
 
-        # Fleet ratio guards — after 0.60 stop normal launches; after 0.70 only critical saves/finishes/drain.
-        if fleet_ratio > FLEET_RATIO_HARD and prop.kind not in CRITICAL_MISSIONS | {"SAVE_UNDER_ATTACK"}:
+        tgt = world.planet_by_id.get(prop.target_id)
+        immediate_capture = (
+            tgt is not None
+            and tgt.owner == -1
+            and prop.kind in ("LOCAL_PRODUCTION_CAPTURE", "HIGH_VALUE_NEUTRAL_RACE", "CAPTURE_NEUTRAL")
+            and prop.eta_max <= 8
+        )
+        allowed_ratio_hard = CRITICAL_MISSIONS | {"SAVE_UNDER_ATTACK", "HIGH_VALUE_NEUTRAL_RACE"}
+        allowed_ratio_soft = allowed_ratio_hard | {"LOCAL_PRODUCTION_CAPTURE", "CAPTURE_NEUTRAL"}
+
+        # Fleet ratio guards — after 0.60 stop normal launches; after 0.70 only critical or immediate-value captures.
+        if fleet_ratio > FLEET_RATIO_HARD and prop.kind not in allowed_ratio_hard and not immediate_capture:
             world.add_debug(f"COORD_SKIP blocked: fleet ratio too high ratio={fleet_ratio:.2f} mission={prop.kind}")
             continue
-        if fleet_ratio > FLEET_RATIO_SOFT and prop.kind not in CRITICAL_MISSIONS | {"SAVE_UNDER_ATTACK"}:
+        if fleet_ratio > FLEET_RATIO_SOFT and prop.kind not in allowed_ratio_soft and not immediate_capture:
             world.add_debug(f"COORD_SKIP blocked: fleet ratio too high ratio={fleet_ratio:.2f} mission={prop.kind}")
             continue
 
@@ -2635,7 +2798,6 @@ def coordinate_missions(world, proposals, moves, fleet_ratio, deadline, midgame_
         if total_send < 5 and prop.kind not in ("FINISH_ZERO_CAPTURE", "DEFEND_HOLD", "SAVE_UNDER_ATTACK", "DOOMED_EVACUATION"):
             continue
 
-        tgt = world.planet_by_id.get(prop.target_id)
         if tgt is None:
             continue
 
@@ -2673,14 +2835,15 @@ def coordinate_missions(world, proposals, moves, fleet_ratio, deadline, midgame_
             continue
 
         # Block speculative offensive moves from wave-reserved sources
-        if _wave_reservation["target_id"] is not None and prop.kind in (
+        wave_reservation = wave_reservation_for(world)
+        if wave_reservation["target_id"] is not None and prop.kind in (
             "SYNC_ATTACK", "COLLAPSE"
-        ) and prop.target_id != _wave_reservation["target_id"]:
-            rsv_set = set(_wave_reservation["source_ids"])
+        ) and prop.target_id != wave_reservation["target_id"]:
+            rsv_set = set(wave_reservation["source_ids"])
             if any(src_id in rsv_set for src_id, _, _, _ in prop.planned_sources):
                 world.add_debug(
                     f"WAVE_RESERVE_BLOCK {prop.kind} p{prop.target_id} "
-                    f"blocked for wave on p{_wave_reservation['target_id']}"
+                    f"blocked for wave on p{wave_reservation['target_id']}"
                 )
                 continue
 
@@ -2770,8 +2933,6 @@ def generate_breach_kill_missions(world):
     if not forward:
         return []
 
-    all_sources = [p for p in world.my_planets if world.surplus(p) >= 5]
-
     seen_targets: set = set()
     for fwd in sorted(forward, key=lambda p: -world.surplus(p)):
         nearby_enemies = sorted(
@@ -2782,41 +2943,11 @@ def generate_breach_kill_missions(world):
         for d_to_enemy, tgt in nearby_enemies:
             if tgt.id in seen_targets:
                 continue
-            pool_srcs = sorted(
-                [s for s in all_sources if dp(s, tgt) <= BREACH_KILL_DIST + 10],
-                key=lambda s: dp(s, tgt),
-            )[:6]
-            if not pool_srcs:
+            plan, reason = build_exact_synced_attack_plan(world, tgt, "BREACH_KILL")
+            if plan is None:
+                world.add_debug(f"BREACH_KILL_SKIP target=p{tgt.id} fwd=p{fwd.id} reason={reason}")
                 continue
-            pool = sum(world.surplus(s) for s in pool_srcs)
-            need = world.ships_needed_to_capture(
-                min(pool_srcs, key=lambda s: dp(s, tgt)), tgt, pool
-            )
-            if need <= 0 or pool < need:
-                continue
-
-            source_etas = []
-            for src in pool_srcs:
-                av = world.surplus(src)
-                if av < 5:
-                    continue
-                send = min(av, max(5, int(av * 0.7)))
-                angle, ok = world.aim(src, tgt, send)
-                if not ok:
-                    continue
-                eta = world.eta(src, tgt, send)
-                source_etas.append((eta, src, send, angle))
-
-            if not source_etas:
-                continue
-            source_etas.sort()
-            anchor_eta = source_etas[-1][0]
-            synced = [
-                (eta, src, send, angle) for eta, src, send, angle in source_etas
-                if anchor_eta - eta <= BREACH_ETA_SYNC
-            ]
-            if sum(s for _, _, s, _ in synced) < need:
-                continue
+            planned, need, eta_min, eta_max = plan
 
             score = (
                 int(tgt.production) * 120.0
@@ -2827,7 +2958,6 @@ def generate_breach_kill_missions(world):
             if tgt.owner == world.leader:
                 score += 60.0
 
-            planned = [(src.id, send, angle, eta) for eta, src, send, angle in synced]
             breach_base_priority = 90.0 + (15.0 if kill_close else 0.0)
             proposals.append(MissionProposal(
                 kind="BREACH_KILL",
@@ -2835,12 +2965,12 @@ def generate_breach_kill_missions(world):
                 priority=breach_base_priority + score * 0.1,
                 required_ships=need,
                 planned_sources=planned,
-                eta_min=source_etas[0][0],
-                eta_max=anchor_eta,
+                eta_min=eta_min,
+                eta_max=eta_max,
                 reason=(
                     f"breach p{tgt.id} prod={tgt.production} ships={int(tgt.ships)} "
                     f"d={d_to_enemy:.1f} fwd=p{fwd.id} need={need} "
-                    f"sources={len(synced)} spread={anchor_eta - source_etas[0][0]:.1f}"
+                    f"sources={len(planned)} spread={eta_max - eta_min:.1f}"
                 ),
             ))
             seen_targets.add(tgt.id)
@@ -2888,10 +3018,9 @@ def should_wait_for_better_wave(world, target):
 
 def reserve_wave(world, target, sources):
     """Record a wave reservation so other missions don't consume these sources."""
-    global _wave_reservation
     src = min(world.my_planets, key=lambda p: dp(p, target), default=None)
     need = world.ships_needed_to_capture(src, target, world.my_total_ships) if src else 0
-    _wave_reservation.update({
+    wave_reservation_for(world).update({
         "target_id": target.id,
         "source_ids": [s.id for s in sources],
         "started_step": world.step,
@@ -3686,8 +3815,9 @@ def update_midgame_loss_tracker(world):
     global _midgame_recent_losses, _midgame_infection_sources
     losses = _midgame_recent_losses.setdefault(world.player, {})
     infections = _midgame_infection_sources.setdefault(world.player, {})
-    if _prev_owners:
-        for pid, prev_owner in _prev_owners.items():
+    prev_owners = prev_owners_for(world)
+    if prev_owners:
+        for pid, prev_owner in prev_owners.items():
             if prev_owner == world.player:
                 p = world.planet_by_id.get(pid)
                 if p is not None and p.owner != world.player:
@@ -3961,13 +4091,14 @@ def generate_midgame_neutral_contest_missions(world, deadline):
 def generate_capture_and_hold_missions(world):
     """Reinforce freshly captured forward planets that are thin and near enemy."""
     proposals = []
-    if not world.my_planets or not _prev_owners:
+    prev_owners = prev_owners_for(world)
+    if not world.my_planets or not prev_owners:
         return proposals
 
     for tgt in world.my_planets:
         if world.is_comet(tgt):
             continue
-        if _prev_owners.get(tgt.id, world.player) == world.player:
+        if prev_owners.get(tgt.id, world.player) == world.player:
             continue  # not a fresh capture this turn
         if world.nearest_enemy_distance(tgt) > FRONTLINE_DIST + 18:
             continue  # far from enemy, no urgency
@@ -4190,6 +4321,151 @@ def generate_midgame_control_missions(world, mg_state, front_planet, fleet_ratio
     return proposals
 
 
+class MissionCommander:
+    """Collect, rank, filter, and launch this turn's mission proposals from one place."""
+
+    def __init__(self, world, moves, fleet_ratio, deadline, *, midgame_active=False,
+                 midgame_front=None, cluster_stability=1.0, protect_lead=False):
+        self.world = world
+        self.moves = moves
+        self.fleet_ratio = fleet_ratio
+        self.deadline = deadline
+        self.midgame_active = midgame_active
+        self.midgame_front = midgame_front
+        self.cluster_stability = cluster_stability
+        self.protect_lead = protect_lead
+        self.items = []
+
+    def add(self, source, proposals):
+        for prop in proposals or []:
+            prop.kind = canonical_mission_type(prop.kind)
+            self.items.append((source, prop))
+
+    def _front_desc(self):
+        return f"p{self.midgame_front.id}" if self.midgame_front is not None else "none"
+
+    def _is_emergency_allowed(self, prop):
+        return prop.kind in (
+            "DEFEND_HOLD", "SAVE_UNDER_ATTACK", "RECAPTURE_LOST", "CONTAIN_BACKYARD_THREAT",
+            "FINISH_ZERO_CAPTURE", "REINFORCE_CAPTURE", "DOOMED_EVACUATION"
+        )
+
+    def _is_high_value_neutral(self, prop):
+        return prop.kind in ("LOCAL_PRODUCTION_CAPTURE", "HIGH_VALUE_NEUTRAL_RACE")
+
+    def _supports_front(self, prop):
+        if not self.midgame_active or self.midgame_front is None:
+            return True
+        if self._is_emergency_allowed(prop) or prop.kind in ("HIGH_VALUE_NEUTRAL_RACE", "FINAL_DRAIN"):
+            return True
+        tgt = self.world.planet_by_id.get(prop.target_id)
+        if tgt is None:
+            return False
+        if prop.kind == "LOCAL_PRODUCTION_CAPTURE" and tgt.owner == -1:
+            return dp(tgt, self.midgame_front) <= MIDGAME_FRONT_RADIUS or self.world.cluster_distance(tgt) <= MIDGAME_CONTEST_MAX_DIST
+        if prop.kind in OFFENSIVE_MISSIONS and prop.kind not in ("CAPTURE_NEUTRAL", "SNIPE_NEUTRAL"):
+            return dp(tgt, self.midgame_front) <= MIDGAME_FRONT_RADIUS
+        return True
+
+    def _filter(self):
+        filtered = []
+        high_value = [p for _src, p in self.items if self._is_high_value_neutral(p)]
+        hv_reserved_sources = {
+            src_id for p in high_value for src_id, _ships, _angle, _eta in p.planned_sources
+        }
+        hv_exists = bool(high_value)
+
+        for source, prop in self.items:
+            tgt = self.world.planet_by_id.get(prop.target_id)
+            if tgt is None:
+                self.world.add_debug(f"COMMANDER_SKIP {prop.kind} target=p{prop.target_id} reason=missing target")
+                continue
+            if self.world.is_comet(tgt):
+                self.world.add_debug(f"COMMANDER_SKIP {prop.kind} target=p{prop.target_id} reason=comet blocked")
+                continue
+
+            if self.protect_lead and prop.kind in ("SYNC_ATTACK", "BREACH_KILL", "COLLAPSE"):
+                self.world.add_debug(f"COMMANDER_SKIP {prop.kind} target=p{prop.target_id} reason=protect-lead")
+                continue
+
+            if hv_exists and source == "normal" and not self._is_emergency_allowed(prop):
+                guaranteed_kill = prop.kind == "BREACH_KILL" and len(self.world.enemy_planets) <= 3
+                if not guaranteed_kill:
+                    self.world.add_debug(
+                        f"COMMANDER_SKIP {prop.kind} target=p{prop.target_id} reason=high-value neutral pending"
+                    )
+                    continue
+
+            if hv_reserved_sources and source == "normal":
+                used = {src_id for src_id, _ships, _angle, _eta in prop.planned_sources}
+                stolen = sorted(used & hv_reserved_sources)
+                if stolen:
+                    self.world.add_debug(
+                        f"COMMANDER_SKIP {prop.kind} target=p{prop.target_id} "
+                        f"reason=source reserved sources={stolen}"
+                    )
+                    continue
+
+            if self.midgame_active:
+                if self.fleet_ratio > MIDGAME_FLEET_PANIC and not (
+                    self._is_emergency_allowed(prop)
+                    or prop.kind == "HIGH_VALUE_NEUTRAL_RACE"
+                    or (self._is_high_value_neutral(prop) and prop.eta_max <= 8)
+                ):
+                    self.world.add_debug(
+                        f"COMMANDER_SKIP {prop.kind} target=p{prop.target_id} "
+                        f"reason=fleet ratio panic ratio={self.fleet_ratio:.2f}"
+                    )
+                    continue
+                if self.fleet_ratio > MIDGAME_FLEET_HARD and source == "normal" and not self._is_emergency_allowed(prop):
+                    self.world.add_debug(
+                        f"COMMANDER_SKIP {prop.kind} target=p{prop.target_id} "
+                        f"reason=fleet ratio too high ratio={self.fleet_ratio:.2f}"
+                    )
+                    continue
+                if self.fleet_ratio > MIDGAME_FLEET_SOFT and prop.kind in ("SYNC_ATTACK", "BREACH_KILL", "COLLAPSE", "SNIPE_NEUTRAL"):
+                    self.world.add_debug(
+                        f"COMMANDER_SKIP {prop.kind} target=p{prop.target_id} "
+                        f"reason=midgame reduce speculative ratio={self.fleet_ratio:.2f}"
+                    )
+                    continue
+                if self.cluster_stability < MIDGAME_STABILITY_THRESHOLD and not (
+                    self._is_emergency_allowed(prop) or self._is_high_value_neutral(prop)
+                ):
+                    self.world.add_debug(
+                        f"COMMANDER_SKIP {prop.kind} target=p{prop.target_id} "
+                        f"reason=instability stab={self.cluster_stability:.2f}"
+                    )
+                    continue
+                if not self._supports_front(prop):
+                    self.world.add_debug(
+                        f"COMMANDER_SKIP {prop.kind} target=p{prop.target_id} "
+                        f"reason=outside selected front front={self._front_desc()}"
+                    )
+                    continue
+
+            filtered.append(prop)
+        return filtered
+
+    def launch(self):
+        if not self.items or time.perf_counter() > self.deadline:
+            return False
+        proposals = self._filter()
+        if not proposals:
+            return False
+        before = len(self.moves)
+        coordinate_missions(
+            self.world,
+            proposals,
+            self.moves,
+            self.fleet_ratio,
+            self.deadline,
+            midgame_active=self.midgame_active,
+            midgame_front=self.midgame_front,
+        )
+        return len(self.moves) > before
+
+
 def agent(obs, config=None):
     start = time.perf_counter()
     act_timeout = _read(config, "actTimeout", 1.0) if config is not None else 1.0
@@ -4201,7 +4477,15 @@ def agent(obs, config=None):
 
     if not hasattr(agent, "_last_meaningful") or world.step <= 1:
         agent._last_meaningful = {}
-        _wave_reservation["target_id"] = None
+        _prev_owners[world.player] = {}
+        _prev_ships[world.player] = {}
+        _backyard_threats[world.player] = {}
+        _midgame_recent_losses[world.player] = {}
+        _midgame_infection_sources[world.player] = {}
+        _wave_reservations[world.player] = default_wave_reservation()
+        _mission_ledger[world.player] = {}
+        _mission_seq[world.player] = 1
+        _mission_observed[world.player] = {}
         _recently_reinforced[world.player] = {}
         _doomed_owned_targets[world.player] = {}
     last_meaningful = agent._last_meaningful.get(world.player, world.step)
@@ -4251,10 +4535,35 @@ def agent(obs, config=None):
                 if retarget:
                     world.incoming_to_targets[tgt_id] = max(incoming, 999)
 
-    # ── 3. Urgent missions (defense / save / fall-recapture / evacuation) ────
+    # ── 3. Mission Commander: collect urgent, value, midgame, and normal proposals ─
     protect_lead = is_protect_lead_mode(world)
     if protect_lead:
         world.add_debug("PROTECT_LEAD active")
+
+    active_front_planet = None
+    cluster_stab = 1.0
+    mg_state = None
+    if mg_active and time.perf_counter() < deadline:
+        mg_state = classify_midgame_state(world, fleet_ratio)
+        cluster_stab = compute_cluster_stability(world, fleet_ratio)
+        active_front_planet, front_desc = select_active_front(world)
+        world.add_debug(
+            f"MIDGAME mode={mg_state} unstable={midgame_is_unstable(world, fleet_ratio)} "
+            f"stab={cluster_stab:.2f} front={front_desc} fleet={fleet_ratio:.2f}"
+        )
+        if fleet_ratio > MIDGAME_FLEET_HARD:
+            world.add_debug(f"MIDGAME_RATIO_GUARD fleet={fleet_ratio:.2f}")
+
+    commander = MissionCommander(
+        world,
+        moves,
+        fleet_ratio,
+        deadline,
+        midgame_active=mg_active,
+        midgame_front=active_front_planet,
+        cluster_stability=cluster_stab,
+        protect_lead=protect_lead,
+    )
 
     urgent: list = []
     if threat_planets and time.perf_counter() < deadline:
@@ -4270,18 +4579,55 @@ def agent(obs, config=None):
         urgent += generate_doomed_evacuation_missions(world)
     if time.perf_counter() < deadline:
         urgent += generate_protect_lead_missions(world)
-    if urgent and time.perf_counter() < deadline:
-        coordinate_missions(world, urgent, moves, fleet_ratio, deadline)
+    commander.add("urgent", urgent)
 
-    high_value_neutral_block = False
     hv_props = []
-    if not moves and not threat_planets and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline:
+    if time.perf_counter() < deadline:
         hv_props = generate_high_value_neutral_missions(world, deadline)
-        high_value_neutral_block = bool(hv_props)
-        if hv_props:
-            coordinate_missions(world, hv_props, moves, fleet_ratio, deadline)
+        commander.add("high_value_neutral", hv_props)
+    high_value_neutral_block = bool(hv_props)
 
-    # ── 4. Missed-neutral force (before opening, while ratio is low) ─────────
+    if mg_active and time.perf_counter() < deadline:
+        if cluster_stab >= MIDGAME_STABILITY_THRESHOLD:
+            commander.add(
+                "midgame",
+                generate_midgame_control_missions(world, mg_state, active_front_planet, fleet_ratio, deadline),
+            )
+        else:
+            world.add_debug(f"MIDGAME_OFFENSE_BLOCKED stab={cluster_stab:.2f} fleet={fleet_ratio:.2f}")
+
+    normal_props: list = []
+    if time.perf_counter() < deadline and not in_forced_opening:
+        if not protect_lead:
+            normal_props += generate_breach_kill_missions(world)
+        normal_props += generate_snipe_missions(world)
+        normal_props += generate_expansion_missions(world, deadline)
+        if not protect_lead:
+            normal_props += generate_local_strike_missions(world)
+            normal_props += generate_sync_attack_missions(world, mode, deadline)
+            normal_props += generate_anti_leader_missions(world)
+            normal_props += generate_collapse_missions(world, mode)
+        normal_props += generate_final_drain_missions(world)
+
+    wave_reservation = wave_reservation_for(world)
+    if wave_reservation["target_id"] is not None and time.perf_counter() < deadline:
+        rsv_tgt = world.planet_by_id.get(wave_reservation["target_id"])
+        if rsv_tgt is None or rsv_tgt.owner == world.player:
+            wave_reservation["target_id"] = None
+        else:
+            rsv_pool = sum(world.surplus(p) for p in world.my_planets
+                          if p.id in set(wave_reservation["source_ids"]))
+            force_launch = world.step >= wave_reservation["launch_by_step"]
+            if rsv_pool >= wave_reservation["required_ships"] or force_launch:
+                wave_prop = generate_organized_wave_mission(world, rsv_tgt)
+                if wave_prop is not None:
+                    normal_props.insert(0, wave_prop)
+                wave_reservation["target_id"] = None
+
+    commander.add("normal", normal_props)
+    commander.launch()
+
+    # ── 4. Missed-neutral force (only if commander found no valid mission) ───
     if (
         not moves
         and not high_value_neutral_block
@@ -4307,109 +4653,6 @@ def agent(obs, config=None):
     if not moves and not high_value_neutral_block and in_forced_opening and world.step >= OPENING_STUCK_STEP and time.perf_counter() < deadline:
         if forced_opening_capture(world, moves):
             return _finish()
-
-    # ── 6. MIDGAME_CONTROL (step 55–220, 3+ planets, not opening or final) ───
-    active_front_planet = None  # shared with coordinator below
-    if mg_active and time.perf_counter() < deadline:
-        mg_state = classify_midgame_state(world, fleet_ratio)
-        cluster_stab = compute_cluster_stability(world, fleet_ratio)
-        active_front_planet, front_desc = select_active_front(world)
-        world.add_debug(
-            f"MIDGAME mode={mg_state} unstable={midgame_is_unstable(world, fleet_ratio)} "
-            f"stab={cluster_stab:.2f} front={front_desc} fleet={fleet_ratio:.2f}"
-        )
-        # Tighter fleet-ratio gates during midgame. The coordinator filters speculative
-        # proposals, but still lets recapture/hold missions through at high ratios.
-        mg_blocked = fleet_ratio > MIDGAME_FLEET_HARD
-        if mg_blocked:
-            world.add_debug(f"MIDGAME_RATIO_GUARD fleet={fleet_ratio:.2f}")
-        if not high_value_neutral_block and cluster_stab >= MIDGAME_STABILITY_THRESHOLD:
-            mg_props = generate_midgame_control_missions(
-                world, mg_state, active_front_planet, fleet_ratio, deadline
-            )
-            if mg_props and time.perf_counter() < deadline:
-                coordinate_missions(
-                    world, mg_props, moves, fleet_ratio, deadline,
-                    midgame_active=True, midgame_front=active_front_planet
-                )
-        elif high_value_neutral_block:
-            world.add_debug("MIDGAME_OFFENSE_BLOCKED reason=high-value neutral pending")
-        else:
-            world.add_debug(
-                f"MIDGAME_OFFENSE_BLOCKED stab={cluster_stab:.2f} fleet={fleet_ratio:.2f}"
-            )
-
-    # ── 7. Mission coordinator (breach-kill, snipe, expansion, attacks) ──────
-    proposals: list = []
-    if high_value_neutral_block:
-        world.add_debug("NORMAL_OFFENSE_BLOCKED reason=high-value neutral exists")
-    if not high_value_neutral_block and not protect_lead and time.perf_counter() < deadline:
-        proposals += generate_breach_kill_missions(world)
-    if not high_value_neutral_block and time.perf_counter() < deadline:
-        proposals += generate_snipe_missions(world)
-    if not high_value_neutral_block and time.perf_counter() < deadline:
-        proposals += generate_expansion_missions(world, deadline)
-    if not high_value_neutral_block and not protect_lead and time.perf_counter() < deadline:
-        proposals += generate_local_strike_missions(world)
-    if not high_value_neutral_block and not protect_lead and time.perf_counter() < deadline:
-        proposals += generate_sync_attack_missions(world, mode, deadline)
-    if not high_value_neutral_block and not protect_lead and time.perf_counter() < deadline:
-        proposals += generate_anti_leader_missions(world)
-    if not high_value_neutral_block and not protect_lead and time.perf_counter() < deadline:
-        proposals += generate_collapse_missions(world, mode)
-    if time.perf_counter() < deadline:
-        proposals += generate_final_drain_missions(world)
-
-    # Inject organized wave if reservation is ready or overdue
-    if _wave_reservation["target_id"] is not None and time.perf_counter() < deadline:
-        rsv_tgt = world.planet_by_id.get(_wave_reservation["target_id"])
-        if rsv_tgt is None or rsv_tgt.owner == world.player:
-            _wave_reservation["target_id"] = None
-        else:
-            rsv_pool = sum(world.surplus(p) for p in world.my_planets
-                          if p.id in set(_wave_reservation["source_ids"]))
-            force_launch = world.step >= _wave_reservation["launch_by_step"]
-            if rsv_pool >= _wave_reservation["required_ships"] or force_launch:
-                wave_prop = generate_organized_wave_mission(world, rsv_tgt)
-                if wave_prop is not None:
-                    proposals.insert(0, wave_prop)
-                _wave_reservation["target_id"] = None
-
-    # Midgame: tighter fleet cap and one-active-front filter on coordinator proposals
-    if mg_active:
-        if fleet_ratio > MIDGAME_FLEET_HARD:
-            proposals = [p for p in proposals if p.kind in CRITICAL_MISSIONS]
-        elif fleet_ratio > MIDGAME_FLEET_SOFT:
-            proposals = [
-                p for p in proposals
-                if p.kind in CRITICAL_MISSIONS or p.kind in (
-                    "CAPTURE_NEUTRAL", "LOCAL_PRODUCTION_CAPTURE", "HIGH_VALUE_NEUTRAL_RACE"
-                )
-            ]
-        if active_front_planet is not None:
-            keep = []
-            for prop in proposals:
-                if prop.kind in CRITICAL_MISSIONS or prop.kind in (
-                    "CAPTURE_NEUTRAL", "LOCAL_PRODUCTION_CAPTURE", "HIGH_VALUE_NEUTRAL_RACE",
-                    "FINISH_ZERO_CAPTURE", "REINFORCE_CAPTURE"
-                ):
-                    keep.append(prop)
-                    continue
-                tgt = world.planet_by_id.get(prop.target_id)
-                if tgt is not None and dp(tgt, active_front_planet) <= MIDGAME_FRONT_RADIUS:
-                    keep.append(prop)
-                else:
-                    world.add_debug(
-                        f"MG_FRONT_FILTER {prop.kind} p{prop.target_id} "
-                        f"d={dp(tgt, active_front_planet) if tgt else '?':.1f}"
-                    )
-            proposals = keep
-
-    if not moves and proposals and time.perf_counter() < deadline:
-        coordinate_missions(
-            world, proposals, moves, fleet_ratio, deadline,
-            midgame_active=mg_active, midgame_front=active_front_planet
-        )
 
     # ── 8. Fallback (last resort) ─────────────────────────────────────────────
     if not moves and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline:
