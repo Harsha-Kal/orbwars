@@ -1,24 +1,25 @@
 """
-Orbit Wars – Competitive Agent v12
-====================================
+Orbit Wars – Competitive Agent
+================================
 Action:  [from_planet_id, angle_radians, num_ships]
 Planet:  Planet(id, owner, x, y, radius, ships, production)
 Fleet:   Fleet(id, owner, x, y, angle, from_planet_id, ships)
 
-v11 improvements over v10:
-  * planet_size(): classify planets as small / medium / large by radius.
-  * Quick-capture pass (Phase 1b): planets needing ≤ QUICK_SHIPS ships and
-    reachable in ≤ QUICK_STEPS turns are blitzed every step until captured.
-  * Rotating-planet timing: closest_approach_timing() scans the next 60 steps
-    to find the minimum-distance window; fleets wait until that window opens.
-  * Multi-planet rotating coordination (Phase 3): when a rotating target needs
-    more ships than any single planet can provide, nearby planets pool ships.
-  * Bridgehead strategy: neutrals on the direct path to a far enemy receive a
-    value bonus, building stepping-stone chains toward distant opponents.
-  * 4-player awareness: when ≥ 3 factions exist, idle neutrals are saturated
-    first; side opponents (~90°) are scored higher than polar ones (~180°).
-  * Bug fix: send_n cap in Phase 2 now correctly limits to still_needed.
-  * Tuned constants throughout.
+Decision order each turn (agent()):
+  1. Emergency defense (immediate threat response)
+  2. Backyard recapture / containment
+  3. Finish-zero / save-under-attack / fall-recapture / doomed evacuation
+  4. Forced opening tempo (first 2-3 planets, bypass safety layers)
+  5. Missed-neutral force (stuck detector)
+  6. Mission coordinator — breach-kill, snipe, expansion, sync attacks,
+     anti-leader, collapse, final drain
+  7. Fallback tempo (last resort)
+
+Key systems:
+  - MissionLedger: central coordination, prevents trickle attacks
+  - WorldModel: per-turn state, ownership simulation, source safety checks
+  - Forced opening tempo: FORCED_OPENING_STEP / FORCED_OPENING_PLANETS gates
+  - No comet targeting (enforced in valid_fleet_launch and every selector)
 """
 
 import math
@@ -27,48 +28,96 @@ import heapq
 from dataclasses import dataclass
 from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
 
+# ── game / geometry ───────────────────────────────────────────────────────────
 SUN_X, SUN_Y   = 50.0, 50.0
 SUN_R          = 10.0
 MAX_SPEED      = 6.0
 ROTATION_LIMIT = 50.0
 TOTAL_STEPS    = 500
+HIT_MARGIN     = 3.0    # acceptable aimed-point miss beyond planet radius
+INCOMING_T     = 0.85   # angular tolerance for fleet-target matching
 
-DEFEND_NET = 8      # reinforce if net projected ships < this (was 5)
-INCOMING_T = 0.85
+# ── timing / phases ───────────────────────────────────────────────────────────
+EARLY_STEPS      = 55    # lighter reserves before this step
+LATE_GAME_STEPS  = 350   # prefer enemy planets over neutrals
+FINAL_STEPS      = 460   # drain pass: send all idle ships to any reachable target
 
-HIT_MARGIN              = 3.0   # acceptable aimed-point miss beyond planet radius
-
-EARLY_STEPS            = 55   # lighter reserves and looser rotating timing before this step
-FRONTLINE_DIST        = 25.0  # distance to nearest enemy below which = frontline
-
-# Endgame
-LATE_GAME_STEPS = 350   # prefer enemy planets over neutrals from this step on
-FINAL_STEPS     = 460   # drain pass: send all idle ships to any reachable target
-
-# Opponent style detection
-TURTLE_SHIP_THRESH     = 40    # avg ships per enemy planet above this → turtle classifier
-
-# Defense reactivity
-DEFENSE_ETA_HORIZON   = 30    # only count inbound fleets arriving within this many turns
-
-# Search planner margins
-HOSTILE_MARGIN_BASE = 5
-HOSTILE_MARGIN_CAP = 16
-
-# Proactive expansion.  Keep these early and explicit: the beam planner is good
-# at weighing options, but nearest safe neutrals need a hard tempo bias.
-DEBUG = False
-NEAREST_LOCK_DIST = 28.0
-NEAREST_LOCK_ETA = 18.0
-NEAREST_LOCK_MAX_SOURCES = 3
+# ── opening / expansion ───────────────────────────────────────────────────────
+FORCED_OPENING_STEP     = 80    # step below which forced opening tempo is active
+FORCED_OPENING_PLANETS  = 3     # owned-planet count below which forced opening is active
+OPENING_STUCK_STEP      = 25    # if still 1 planet at this step: force-capture
+NEAREST_LOCK_DIST       = 28.0
+NEAREST_LOCK_ETA        = 18.0
+NEAREST_LOCK_MAX_SOURCES       = 3
 PROACTIVE_EXPANSION_MAX_SOURCES = 4
-STALL_FORCE_TURNS = 6
-STALL_FORCE_SHIPS = 180
-MAX_WAVE_WAIT = 3
-MIN_OFFENSIVE_SHIPS = 5
-MIN_CAMPAIGN_SHIPS = 10
-MIN_WAVE_FRACTION = 0.90
+STALL_FORCE_TURNS  = 6
+STALL_FORCE_SHIPS  = 180
+MAX_WAVE_WAIT      = 3
+MIN_WAVE_FRACTION  = 0.90
 
+# ── defense ───────────────────────────────────────────────────────────────────
+DEFEND_NET           = 8     # reinforce if net projected ships < this
+DEFENSE_ETA_HORIZON  = 30    # only count inbound fleets arriving within this many turns
+FRONTLINE_DIST       = 25.0  # distance to nearest enemy below which = frontline
+FRONTLINE_FAR_ATTACK_DIST = 42.0
+HOSTILE_MARGIN_BASE  = 5
+HOSTILE_MARGIN_CAP   = 16
+
+# ── fleet ratio caps ──────────────────────────────────────────────────────────
+FLEET_RATIO_SOFT = 0.60   # above this: block new non-critical launches
+FLEET_RATIO_HARD = 0.70   # above this: only defense/reinforce/finish allowed
+
+# ── finish-zero capture ───────────────────────────────────────────────────────
+FINISH_ZERO_MAX_SHIPS = 2
+FINISH_ZERO_MAX_ETA   = 16.0
+FINISH_ZERO_NEAR_DIST = 34.0
+
+# ── save / fall-turn recapture ────────────────────────────────────────────────
+FALL_RECAPTURE_LOOKAHEAD = 10
+FALL_RECAPTURE_HORIZON   = 28
+DOOMED_EVAC_HORIZON      = 24
+DOOMED_EVAC_MIN_SHIPS    = 8
+
+# ── snipe ─────────────────────────────────────────────────────────────────────
+SNIPE_LOOKAHEAD = 22
+SNIPE_ETA_SLACK = 2
+
+# ── mission coordinator ───────────────────────────────────────────────────────
+LOCAL_HUB_SHIPS  = 60      # planet with >= this many ships acts as a command hub
+LOCAL_HUB_RADIUS = 40.0    # command hub targets within this distance first
+ETA_SYNC_WINDOW  = 8       # max turn spread for a sync attack to be valid
+SOURCE_COOLDOWN_TURNS = 8
+
+# ── backyard threat ───────────────────────────────────────────────────────────
+BACKYARD_DIST             = 22.0   # enemy planet within this distance of my nearest = backyard
+BACKYARD_THREAT_DIST      = 25.0   # enemy planet within this dist of cluster = threat
+BACKYARD_SOURCE_LOCK_DIST = 32.0   # sources within this dist of a backyard threat get locked
+BACKYARD_THREAT_TTL       = 12     # turns an active threat stays tracked
+RECAPTURE_PRIORITY        = 112.0
+CONTAIN_PRIORITY          = 102.0
+
+# ── breach-kill ───────────────────────────────────────────────────────────────
+BREACH_KILL_DIST    = 45.0
+BREACH_KILL_STEP_MIN = 70
+BREACH_ETA_SYNC     = 10
+
+# ── endgame ───────────────────────────────────────────────────────────────────
+PROTECT_LEAD_STEP      = 420
+PROTECT_LEAD_REMAINING = 85
+TURTLE_SHIP_THRESH     = 40   # avg ships per enemy planet above this → turtle
+
+# ── search / simulation ───────────────────────────────────────────────────────
+SOFT_DEADLINE    = 0.82
+SIM_HORIZON      = 100
+MAX_GROUP_SOURCES = 7
+
+# ── 4-player ──────────────────────────────────────────────────────────────────
+FOUR_P_ATTACK_STEP = 80
+FOUR_P_EXPAND_STEP = 100
+
+DEBUG = False
+
+# ── persistent global state ───────────────────────────────────────────────────
 _wave_reservation = {
     "target_id": None,
     "source_ids": [],
@@ -81,20 +130,6 @@ _wave_reservation = {
 _prev_owners: dict = {}      # planet_id -> owner at start of previous turn
 _prev_ships: dict = {}       # planet_id -> ship count at start of previous turn
 _backyard_threats: dict = {} # planet_id -> step when it was first detected as a threat
-
-# Mission Coordinator
-LOCAL_HUB_SHIPS = 60        # planet with >= this many ships acts as a command hub
-LOCAL_HUB_RADIUS = 40.0     # command hub targets within this distance first
-ETA_SYNC_WINDOW = 8         # max turn spread for a sync attack to be valid
-FLEET_RATIO_SOFT = 0.60     # above this: block new non-critical launches
-FLEET_RATIO_HARD = 0.70     # above this: only defense/reinforce/finish allowed
-
-# Backyard threat system
-BACKYARD_THREAT_DIST = 25.0       # enemy planet within this dist of my cluster = backyard threat
-BACKYARD_SOURCE_LOCK_DIST = 32.0  # sources within this dist of a backyard threat get locked
-BACKYARD_THREAT_TTL = 12          # turns an active threat stays tracked after initial detection
-RECAPTURE_PRIORITY = 112.0        # mission priority for recapturing a lost backyard planet
-CONTAIN_PRIORITY = 102.0          # mission priority for reinforcing planets near a backyard threat
 
 
 # ── geometry ──────────────────────────────────────────────────────────────────
@@ -191,13 +226,6 @@ def fleet_target(fl, targets, ang_vel):
 def is_idle(p):
     """True when planet does not orbit the sun."""
     return dist(p.x, p.y, SUN_X, SUN_Y) + p.radius >= ROTATION_LIMIT
-
-# ── Search / simulation architecture ─────────────────────────────────────────
-
-SOFT_DEADLINE = 0.82
-SIM_HORIZON = 100
-MAX_GROUP_SOURCES = 7
-
 
 class StrategyMode:
     OPENING_TEMPO = "OPENING_TEMPO"
@@ -313,20 +341,6 @@ OFFENSIVE_MISSIONS = {
     "COLLAPSE",
     "FINAL_DRAIN",
 }
-
-SOURCE_COOLDOWN_TURNS = 8
-FRONTLINE_FAR_ATTACK_DIST = 42.0
-FINISH_ZERO_MAX_SHIPS = 2
-FINISH_ZERO_MAX_ETA = 16.0
-FINISH_ZERO_NEAR_DIST = 34.0
-FALL_RECAPTURE_LOOKAHEAD = 10
-FALL_RECAPTURE_HORIZON = 28
-SNIPE_LOOKAHEAD = 22
-SNIPE_ETA_SLACK = 2
-DOOMED_EVAC_HORIZON = 24
-DOOMED_EVAC_MIN_SHIPS = 8
-PROTECT_LEAD_STEP = 420
-PROTECT_LEAD_REMAINING = 85
 
 _mission_ledger: dict = {}          # player -> mission_id -> MissionLedgerEntry
 _mission_seq: dict = {}             # player -> next id
@@ -493,13 +507,10 @@ class WorldModel:
 
         self.normal_planets = [p for p in self.planets if p.id not in self.comet_ids]
         self.my_planets = [p for p in self.normal_planets if p.owner == self.player]
-        self.owned_planets = self.my_planets
         self.neutral_planets = [p for p in self.normal_planets if p.owner == -1]
         self.enemy_planets = [p for p in self.normal_planets if p.owner not in (-1, self.player)]
         self.my_fleets = [f for f in self.fleets if f.owner == self.player]
         self.enemy_fleets = [f for f in self.fleets if f.owner != self.player]
-        self.static_planets = [p for p in self.planets if is_idle(p)]
-        self.rotating_planets = [p for p in self.planets if not is_idle(p)]
         self.remaining = max(1, TOTAL_STEPS - self.step)
 
         self.my_total_ships = sum(int(p.ships) for p in self.my_planets) + sum(int(f.ships) for f in self.my_fleets)
@@ -600,10 +611,6 @@ class WorldModel:
             "final": self.step >= FINAL_STEPS or self.remaining < 45,
         }
 
-    def planet_pos(self, p, turns):
-        base = self.initial_planets.get(p.id, p)
-        return predict_pos(base, self.ang_vel, turns)
-
     def aim(self, src, tgt, ships):
         key = (src.id, tgt.id, int(ships), int(self.step))
         if key not in self.shot_cache:
@@ -679,9 +686,6 @@ class WorldModel:
     def surplus(self, p):
         return max(0, int(p.ships) - self.committed.get(p.id, 0) - self.reserve_for(p))
 
-    def available_ships_after_reserve(self, p):
-        return self.surplus(p)
-
     def target_need_now(self, tgt):
         return int(tgt.ships) + 1 + self.enemy_incoming_to_targets.get(tgt.id, 0) - self.incoming_to_targets.get(tgt.id, 0)
 
@@ -755,9 +759,6 @@ class WorldModel:
             return int(tgt.ships) + 1
         return self.ships_needed_to_capture(src, tgt)
 
-    def production_value(self, p):
-        return int(p.production) * max(1, self.remaining)
-
     def can_hold_after_capture(self, tgt, eta, sent, final_all_in=False):
         if final_all_in or tgt.owner not in (-1, self.player):
             return True if final_all_in else self.nearest_enemy_distance(tgt) > 16 or tgt.production >= 3
@@ -773,10 +774,6 @@ class WorldModel:
         self.reaction_cache[tgt.id] = (my_t, enemy_t)
         return my_t, enemy_t
 
-    def enemy_reaches_faster(self, tgt, my_eta, margin=1.5):
-        _, enemy_t = self.reaction_times(tgt)
-        return enemy_t + margin < my_eta
-
     def add_debug(self, message):
         if DEBUG:
             self.debug_events.append(message)
@@ -787,6 +784,19 @@ class WorldModel:
 
     def source_is_safe_for(self, src, tgt, mission_type, ships, mission_reason=""):
         if mission_type == "FINAL_DRAIN":
+            return True, ""
+        # Opening tempo fast-path: bypass all safety layers for CAPTURE_NEUTRAL during the
+        # first 2-3 planet acquisitions.  Only block on a real incoming enemy fleet.
+        if (mission_type == "CAPTURE_NEUTRAL"
+                and self.step < FORCED_OPENING_STEP
+                and len(self.my_planets) < FORCED_OPENING_PLANETS):
+            threat = self.real_incoming_threat(src)
+            if threat["deficit"] > 0:
+                return False, "source unsafe: under attack"
+            opening_reserve = 1 if len(self.my_planets) <= 1 else 2
+            remaining = int(src.ships) - self.committed.get(src.id, 0) - int(ships)
+            if remaining < opening_reserve:
+                return False, f"opening reserve blocked {remaining}<{opening_reserve}"
             return True, ""
         evac_fall_turn = None
         if mission_type == "DOOMED_EVACUATION":
@@ -842,17 +852,6 @@ class WorldModel:
         tl = self.simulate_planet_timeline(target, turn, planned=normalized)
         return tl["owner_at"].get(turn, target.owner), tl["ships_at"].get(turn, int(target.ships))
 
-    def projected_timeline(self, target_id, horizon, extra_arrivals=()):
-        target = self.planet_by_id.get(target_id)
-        if target is None:
-            return None
-        normalized = tuple(
-            (max(1, int(math.ceil(eta))), owner, int(ships))
-            for eta, owner, ships in extra_arrivals
-            if int(ships) > 0
-        )
-        return self.simulate_planet_timeline(target, min(SIM_HORIZON, max(1, int(math.ceil(horizon)))), planned=normalized)
-
     def min_ships_to_own_by(self, target_id, eval_turn, attacker_owner, arrival_turn=None, extra_arrivals=(), upper_bound=None):
         eval_turn = max(1, min(SIM_HORIZON, int(math.ceil(eval_turn))))
         arrival_turn = eval_turn if arrival_turn is None else max(1, int(math.ceil(arrival_turn)))
@@ -892,20 +891,6 @@ class WorldModel:
             else:
                 lo = mid + 1
         return lo
-
-    def min_ships_to_own_at(self, target_id, arrival_turn, attacker_owner=None, extra_arrivals=(), upper_bound=None):
-        return self.min_ships_to_own_by(
-            target_id,
-            arrival_turn,
-            self.player if attacker_owner is None else attacker_owner,
-            arrival_turn=arrival_turn,
-            extra_arrivals=extra_arrivals,
-            upper_bound=upper_bound,
-        )
-
-    def will_own_at(self, target_id, eval_turn, owner=None, extra_arrivals=()):
-        projected_owner, _ = self.projected_state(target_id, eval_turn, extra_arrivals=extra_arrivals)
-        return projected_owner == (self.player if owner is None else owner)
 
     def mark_doomed(self, tgt):
         _doomed_owned_targets.setdefault(self.player, {})[tgt.id] = self.step
@@ -1045,11 +1030,6 @@ class WorldModel:
             self.recently_reinforced_planets[tgt.id] = self.step
         self.mission_ledger.record_launch(mission_id, src.id, ships, eta=self.eta(src, tgt, ships))
         return True
-
-
-BACKYARD_DIST = 22.0          # enemy planet within this distance of my nearest = backyard
-FOUR_P_ATTACK_STEP = 80       # step below which 4-player early-attack block is active
-FOUR_P_EXPAND_STEP = 100      # step below which FOUR_PLAYER_EXPAND_FIRST mode activates
 
 
 def is_in_my_backyard(world, p):
@@ -2625,11 +2605,6 @@ def coordinate_missions(world, proposals, moves, fleet_ratio, deadline):
                 attack_count += 1
 
 
-BREACH_KILL_DIST = 45.0      # forward planet is within this distance of an enemy
-BREACH_KILL_STEP_MIN = 70    # activate after this step (or sooner if expansion is done)
-BREACH_ETA_SYNC = 10         # max ETA spread for a breach grouped attack
-
-
 def is_breach_kill_mode(world):
     """True when we have a forward planet inside enemy territory and can press the kill."""
     if not world.enemy_planets or not world.my_planets:
@@ -2780,18 +2755,6 @@ def should_wait_for_better_wave(world, target):
     return False
 
 
-def wave_readiness_score(world, target, wait_turns=0):
-    """Pool / need ratio, optionally projecting production over wait_turns."""
-    src = min(world.my_planets, key=lambda p: dp(p, target), default=None)
-    if src is None:
-        return 0.0
-    need = max(1, world.ships_needed_to_capture(src, target, world.my_total_ships))
-    pool = sum(world.surplus(p) for p in world.my_planets)
-    if wait_turns > 0:
-        pool += sum(int(p.production) * wait_turns for p in world.my_planets)
-    return pool / need
-
-
 def reserve_wave(world, target, sources):
     """Record a wave reservation so other missions don't consume these sources."""
     global _wave_reservation
@@ -2862,20 +2825,7 @@ def generate_organized_wave_mission(world, target):
     )
 
 
-def is_trickle_attack(world, mission):
-    """True if a mission would send far fewer ships than needed (weak partial pressure)."""
-    tgt = world.planet_by_id.get(mission.target_id)
-    if tgt is None or tgt.owner in (-1, world.player):
-        return False
-    src = min(world.my_planets, key=lambda p: dp(p, tgt), default=None)
-    if src is None:
-        return False
-    need = world.ships_needed_to_capture(src, tgt, world.my_total_ships)
-    total_send = sum(s for _, s, _, _ in mission.planned_sources)
-    return need > 0 and total_send < need * MIN_WAVE_FRACTION
-
-
-# ── Early Target Intelligence ─────────────────────────────────────────────────
+# ── early target intelligence ─────────────────────────────────────────────────
 
 def _connects_good_neutral(world, tgt, radius=28.0, min_prod=2):
     return any(
@@ -3047,20 +2997,23 @@ def choose_best_opening_target(world):
 
 def should_retarget_opening(world, current_target_id):
     """
-    Return (True, new_tgt_id) if a significantly better opening target exists.
-    Only active before step 60.
+    Return (True, new_tgt_id) if a massively better opening target exists.
+    Gated to before step 40; never retargets when in-flight ships already cover the target.
     """
-    if world.step >= 60 or not world.neutral_planets or not world.my_planets:
+    if world.step >= 40 or not world.neutral_planets or not world.my_planets:
         return False, None
     current_tgt = world.planet_by_id.get(current_target_id)
     if current_tgt is None:
+        return False, None
+    # If ships already in flight are sufficient, never abandon this target.
+    if world.target_need_now(current_tgt) <= 0:
         return False, None
     src = min(world.my_planets, key=lambda p: dp(p, current_tgt), default=None)
     if src is None:
         return False, None
     current_score = early_target_score(world, src, current_tgt)
     best_alt = None
-    best_alt_score = current_score + 40.0
+    best_alt_score = current_score + 80.0   # was 40 — much harder to retarget now
     for tgt in world.neutral_planets:
         if tgt.id == current_target_id:
             continue
@@ -3184,6 +3137,56 @@ def early_nearest_expansion_360(world, moves):
                         f"EARLY_EXPANSION_360_GROUPED tgt={tgt.id} score={score:.1f} d={d:.1f} need={need} sent={sent}"
                     )
                     return True
+    return False
+
+
+def forced_opening_capture(world, moves):
+    """Stuck detector: force-capture nearest neutral when stuck on 1 planet past OPENING_STUCK_STEP."""
+    if len(world.my_planets) != 1 or world.step < OPENING_STUCK_STEP:
+        return False
+    if not world.neutral_planets:
+        return False
+    world.add_debug(f"OPENING_STUCK step={world.step} trying force-capture")
+    src = world.my_planets[0]
+    candidates = []
+    for tgt in world.neutral_planets:
+        if world.is_comet(tgt):
+            continue
+        d = dp(src, tgt)
+        enemy_nearest = min((dp(e, tgt) for e in world.enemy_planets), default=999.0)
+        if enemy_nearest < d - 5:
+            continue
+        need = world.target_need_now(tgt)
+        if need <= 0:
+            continue
+        available = max(0, int(src.ships) - world.committed.get(src.id, 0) - 1)
+        if available < need:
+            continue
+        eta = world.eta(src, tgt, need)
+        if eta > 55:
+            continue
+        angle, ok = world.aim(src, tgt, need)
+        if not ok:
+            continue
+        score = early_target_score(world, src, tgt)
+        candidates.append((score, d, need, tgt, angle, eta))
+    if not candidates:
+        world.add_debug(f"OPENING_STUCK step={world.step} no candidate found")
+        return False
+    candidates.sort(key=lambda x: (-x[0], x[1], x[2]))
+    score, d, need, tgt, angle, eta = candidates[0]
+    planned = [(src.id, need, angle, eta)]
+    mission_id = world.mission_ledger.create(
+        "CAPTURE_NEUTRAL", tgt.id, [src.id], need, [eta],
+        f"stuck_opening p{tgt.id} need={need}",
+    )
+    if world.commit(src, tgt, need, moves, mission_type="CAPTURE_NEUTRAL",
+                    mission_id=mission_id, planned_sources=planned):
+        world.wave_attempted = True
+        world.add_debug(
+            f"OPENING_STUCK_FORCED tgt=p{tgt.id} need={need} d={d:.1f} eta={eta:.1f} score={score:.1f}"
+        )
+        return True
     return False
 
 
@@ -3366,86 +3369,84 @@ def agent(obs, config=None):
     idle_turns = world.step - last_meaningful
     mode = choose_strategy_mode(world, idle_turns)
 
+    def _finish(mark_meaningful=True):
+        if mark_meaningful and (world.offensive_ships >= 15 or world.wave_attempted):
+            agent._last_meaningful[world.player] = world.step
+        if DEBUG:
+            for event in world.debug_events:
+                print(event)
+        update_ownership_memory(world)
+        return moves
+
     moves = []
+
+    # ── 1. Emergency defense ─────────────────────────────────────────────────
     emergency_defense(world, moves)
 
-    # Detect backyard threats (owned planets recently flipped by enemy inside my cluster)
+    # ── 2. Backyard threat detection and source locking ──────────────────────
     threat_planets = detect_backyard_threats(world)
     if threat_planets:
         world.backyard_locked_sources = lock_backyard_sources(world, threat_planets)
+    lock_sources_near_local_threats(world, local_threatened_planets(world))
 
-    threatened_owned = local_threatened_planets(world)
-    lock_sources_near_local_threats(world, threatened_owned)
-    early_fleet_ratio = compute_fleet_ratio(world)
-    ratio_blocks_normal = world.step >= EARLY_STEPS and early_fleet_ratio > FLEET_RATIO_SOFT
+    fleet_ratio = compute_fleet_ratio(world)
+    ratio_blocks_normal = world.step >= EARLY_STEPS and fleet_ratio > FLEET_RATIO_SOFT
+    in_forced_opening = len(world.my_planets) < FORCED_OPENING_PLANETS and world.step < FORCED_OPENING_STEP
 
-    # Opening retarget check: before step 60, block more ships to a bad in-flight target
-    if world.step < 60 and world.step > 0:
+    world.add_debug(f"fleet_ratio={fleet_ratio:.2f} mode={mode} idle={idle_turns}")
+
+    # Opening retarget: only before step 40, and only when in-flight ships are insufficient.
+    if 0 < world.step < 40:
         for tgt_id, incoming in list(world.incoming_to_targets.items()):
             if incoming > 0:
                 retarget, _ = should_retarget_opening(world, tgt_id)
                 if retarget:
                     world.incoming_to_targets[tgt_id] = max(incoming, 999)
 
-    # Phase 3+: Mission Coordinator
-    fleet_ratio = compute_fleet_ratio(world)
+    # ── 3. Urgent missions (defense / save / fall-recapture / evacuation) ────
     protect_lead = is_protect_lead_mode(world)
-    world.add_debug(f"fleet_ratio={fleet_ratio:.2f} mode={mode} idle={idle_turns}")
     if protect_lead:
-        world.add_debug("DEATH_BALL_PROTECT_LEAD active")
+        world.add_debug("PROTECT_LEAD active")
 
-    urgent_proposals: list = []
-    # Backyard recapture/containment — highest priority after emergency defense
+    urgent: list = []
     if threat_planets and time.perf_counter() < deadline:
-        urgent_proposals += generate_recapture_lost_missions(world, threat_planets)
-        urgent_proposals += generate_contain_backyard_missions(world, threat_planets)
+        urgent += generate_recapture_lost_missions(world, threat_planets)
+        urgent += generate_contain_backyard_missions(world, threat_planets)
     if time.perf_counter() < deadline:
-        urgent_proposals += generate_finish_capture_missions(world)
+        urgent += generate_finish_capture_missions(world)
     if time.perf_counter() < deadline:
-        urgent_proposals += generate_save_under_attack_missions(world)
+        urgent += generate_save_under_attack_missions(world)
     if time.perf_counter() < deadline:
-        urgent_proposals += generate_fall_turn_recapture_missions(world)
+        urgent += generate_fall_turn_recapture_missions(world)
     if time.perf_counter() < deadline:
-        urgent_proposals += generate_doomed_evacuation_missions(world)
+        urgent += generate_doomed_evacuation_missions(world)
     if time.perf_counter() < deadline:
-        urgent_proposals += generate_protect_lead_missions(world)
+        urgent += generate_protect_lead_missions(world)
+    if urgent and time.perf_counter() < deadline:
+        coordinate_missions(world, urgent, moves, fleet_ratio, deadline)
 
-    if urgent_proposals and time.perf_counter() < deadline:
-        coordinate_missions(world, urgent_proposals, moves, fleet_ratio, deadline)
-
-    if (
-        not moves
-        and not threat_planets
-        and fleet_ratio <= FLEET_RATIO_SOFT
-        and time.perf_counter() < deadline
-    ):
+    # ── 4. Missed-neutral force (before opening, while ratio is low) ─────────
+    if not moves and not threat_planets and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline:
         force_repeated_missed_neutral(world, moves)
 
-    # Phase 1: Strategic 360-degree opening capture (steps 0-70 or <2 planets)
-    # Local source locks handle nearby threats without freezing the whole map.
-    if not moves and not threat_planets and not ratio_blocks_normal and time.perf_counter() < deadline:
+    # ── 5. Forced opening tempo (first 2-3 planets) ──────────────────────────
+    # Bypasses ratio and backyard-threat gates — opening is a tempo race.
+    opening_ok = (not threat_planets and not ratio_blocks_normal) or in_forced_opening
+    if not moves and opening_ok and time.perf_counter() < deadline:
         if first_capture_360(world, moves):
             if world.step < 60 or len(world.my_planets) < 2:
-                if world.offensive_ships >= 15 or world.wave_attempted:
-                    agent._last_meaningful[world.player] = world.step
-                if DEBUG:
-                    for event in world.debug_events:
-                        print(event)
-                update_ownership_memory(world)
-                return moves
+                return _finish()
 
-    # Phase 2: Early nearest expansion (steps 0-140 or <4 planets)
-    if not moves and not threat_planets and not ratio_blocks_normal and time.perf_counter() < deadline:
+    if not moves and opening_ok and time.perf_counter() < deadline:
         if early_nearest_expansion_360(world, moves):
             if world.step < 100 or len(world.my_planets) < 3:
-                if world.offensive_ships >= 15 or world.wave_attempted:
-                    agent._last_meaningful[world.player] = world.step
-                if DEBUG:
-                    for event in world.debug_events:
-                        print(event)
-                update_ownership_memory(world)
-                return moves
+                return _finish()
 
+    if not moves and in_forced_opening and world.step >= OPENING_STUCK_STEP and time.perf_counter() < deadline:
+        if forced_opening_capture(world, moves):
+            return _finish()
+
+    # ── 6. Mission coordinator (breach-kill, snipe, expansion, attacks) ──────
     proposals: list = []
     if not protect_lead and time.perf_counter() < deadline:
         proposals += generate_breach_kill_missions(world)
@@ -3472,9 +3473,8 @@ def agent(obs, config=None):
         else:
             rsv_pool = sum(world.surplus(p) for p in world.my_planets
                           if p.id in set(_wave_reservation["source_ids"]))
-            rsv_need = _wave_reservation["required_ships"]
             force_launch = world.step >= _wave_reservation["launch_by_step"]
-            if rsv_pool >= rsv_need or force_launch:
+            if rsv_pool >= _wave_reservation["required_ships"] or force_launch:
                 wave_prop = generate_organized_wave_mission(world, rsv_tgt)
                 if wave_prop is not None:
                     proposals.insert(0, wave_prop)
@@ -3483,19 +3483,11 @@ def agent(obs, config=None):
     if not moves and proposals and time.perf_counter() < deadline:
         coordinate_missions(world, proposals, moves, fleet_ratio, deadline)
 
-    # Anti-stall fallback — only when coordinator produced nothing
+    # ── 7. Fallback (last resort) ─────────────────────────────────────────────
     if not moves and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline:
         force_action_if_stalling(world, moves, idle_turns, deadline)
-
     if not moves and fleet_ratio <= FLEET_RATIO_SOFT:
         fallback_tempo(world, moves)
 
     missed_opportunity_detector(world, moves)
-
-    if world.offensive_ships >= 15 or world.wave_attempted:
-        agent._last_meaningful[world.player] = world.step
-    if DEBUG:
-        for event in world.debug_events:
-            print(event)
-    update_ownership_memory(world)
-    return moves
+    return _finish()
