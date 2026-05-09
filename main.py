@@ -1878,6 +1878,11 @@ def build_grouped_wave(world, tgt, need, moves, max_sources=MAX_GROUP_SOURCES, a
         preview_sent += n
     if not planned:
         return 0
+    if not allow_partial:
+        ok_grp, grp_reason = validate_grouped_launch(world, tgt, planned)
+        if not ok_grp:
+            world.add_debug(f"GROUPED_WAVE_REJECT target=p{tgt.id} reason={grp_reason}")
+            return 0
     mission_id = world.mission_ledger.create(
         "FINAL_DRAIN" if allow_partial else ("CAPTURE_NEUTRAL" if tgt.owner == -1 else "SYNC_ATTACK"),
         tgt.id,
@@ -2592,6 +2597,10 @@ def generate_sync_attack_missions(world, mode, deadline):
         if max(eta_vals) - min(eta_vals) > 2.0:
             world.add_debug(f"SYNC_ATTACK_SKIP p{tgt.id} reason=eta spread {max(eta_vals)-min(eta_vals):.1f}")
             continue
+        ok_grp, grp_reason = validate_grouped_launch(world, tgt, planned)
+        if not ok_grp:
+            world.add_debug(f"SYNC_ATTACK_SKIP p{tgt.id} reason=validate_grouped_launch: {grp_reason}")
+            continue
         if not world.can_hold_after_capture(tgt, max(eta_vals), sum(s for _, s, _, _ in planned)):
             world.add_debug(f"SYNC_ATTACK_SKIP p{tgt.id} reason=cannot hold")
             continue
@@ -3162,6 +3171,12 @@ def generate_breach_kill_missions(world):
                 if anchor_eta - eta <= BREACH_ETA_SYNC
             ]
             if sum(s for _, _, s, _ in synced) < need:
+                continue
+
+            planned_check = [(src.id, send, angle, eta) for eta, src, send, angle in synced]
+            ok_grp, grp_reason = validate_grouped_launch(world, tgt, planned_check)
+            if not ok_grp:
+                world.add_debug(f"BREACH_KILL_SKIP p{tgt.id} reason=validate_grouped_launch: {grp_reason}")
                 continue
 
             score = (
@@ -4132,6 +4147,10 @@ def generate_high_value_neutral_missions(world, deadline):
                 _high_value_neutral_skip(world, tgt, primary, "aim invalid", eta=eta, need=single_need, enemy_eta=enemy_eta)
                 continue
             planned = [(primary.id, single_need, angle, eta)]
+            ok_grp, grp_reason = validate_grouped_launch(world, tgt, planned)
+            if not ok_grp:
+                _high_value_neutral_skip(world, tgt, primary, f"validate_grouped_launch: {grp_reason}", eta=eta, need=single_need, enemy_eta=enemy_eta)
+                continue
             proposals.append(MissionProposal(
                 kind=mission_type,
                 target_id=tgt.id,
@@ -4192,6 +4211,10 @@ def generate_high_value_neutral_missions(world, deadline):
             continue
         if not world.can_hold_after_capture(tgt, max(eta_vals), sent):
             _high_value_neutral_skip(world, tgt, primary, "group cannot hold", eta=max(eta_vals), need=group_need, enemy_eta=enemy_eta)
+            continue
+        ok_grp, grp_reason = validate_grouped_launch(world, tgt, selected)
+        if not ok_grp:
+            _high_value_neutral_skip(world, tgt, primary, f"validate_grouped_launch: {grp_reason}", eta=max(eta_vals), need=group_need, enemy_eta=enemy_eta)
             continue
         proposals.append(MissionProposal(
             kind=mission_type,
@@ -4665,6 +4688,11 @@ def generate_midgame_neutral_contest_missions(world, deadline):
 
         planned = [(s.id, send, angle, world.eta(s, tgt, send)) for s, send, angle in selected]
         eta_vals = [e for _, _, _, e in planned]
+
+        ok_grp, grp_reason = validate_grouped_launch(world, tgt, planned)
+        if not ok_grp:
+            world.add_debug(f"MG_CONTEST_SKIP p{tgt.id} reason=validate_grouped_launch: {grp_reason}")
+            continue
 
         priority = 78.0 + int(tgt.production) * 7.0
         if is_contested:
