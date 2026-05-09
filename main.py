@@ -136,6 +136,17 @@ WEAKNESS_DROP_THRESHOLD       = 12    # ship drop (vs expected) that marks an en
 PRIORITY_NEAREST_OCCUPIABLE   = 95.0  # capture nearest neutral / weak enemy
 PRIORITY_EXPAND_FROM_HUB      = 83.0  # hub → next nearby planet
 PRIORITY_OPPORTUNISTIC_STRIKE = 68.0  # attack recently weakened enemy planet
+PRIORITY_HUB_REINFORCE_BASE   = 92.0  # reinforce vulnerable rotational hub
+
+# ── MAIN19_TEMPO_ARBITER ───────────────────────────────────────────────────────
+ARBITER_NEAREST_MAX_DIST  = 32.0  # max source→target distance for arbiter nearest check
+ARBITER_NEAREST_MAX_ETA   = 18.0  # max ETA for arbiter nearest check
+ARBITER_HOLD_MARGIN       = 5     # extra ships above need required for hold check
+ARBITER_HV_PROD_OVERRIDE  = 4     # HV neutral must have this prod to override nearest
+
+# ── rotational hubs ────────────────────────────────────────────────────────────
+ROTATIONAL_HUB_TTL        = 30    # turns a newly captured planet stays marked as hub
+ROTATIONAL_HUB_REINFORCE_THRESH = 8  # min ships below reserve before hub reinforce fires
 
 # ── breach-kill ───────────────────────────────────────────────────────────────
 BREACH_KILL_DIST    = 45.0
@@ -198,6 +209,7 @@ _prev_ships: dict = {}            # planet_id -> ship count at start of previous
 _backyard_threats: dict = {}      # planet_id -> step when it was first detected as a threat
 _midgame_recent_losses: dict = {}     # player -> {planet_id -> step when lost}
 _midgame_infection_sources: dict = {} # player -> {planet_id -> step when local planet was lost}
+_rotational_hubs: dict = {}           # player -> {planet_id -> step when marked as hub}
 
 
 # ── geometry ──────────────────────────────────────────────────────────────────
@@ -4595,6 +4607,235 @@ def generate_nearest_occupiable_expansion_missions(world, deadline):
     return proposals[:3]
 
 
+# ── rotational hub tracking ───────────────────────────────────────────────────
+
+def update_rotational_hubs(world):
+    """Mark newly captured strategic planets as rotational hubs; expire stale ones."""
+    global _rotational_hubs
+    store = _rotational_hubs.setdefault(world.player, {})
+    if _prev_owners:
+        for p in world.my_planets:
+            if _prev_owners.get(p.id) != world.player and p.id not in store:
+                if (int(p.production) >= 2
+                        or world.nearest_enemy_distance(p) <= FRONTLINE_DIST + 15
+                        or world.cluster_distance(p) <= 30.0):
+                    store[p.id] = world.step
+                    world.add_debug(
+                        f"ROTATIONAL_HUB_MARK p{p.id} prod={int(p.production)} "
+                        f"step={world.step} enemy_d={world.nearest_enemy_distance(p):.1f}"
+                    )
+    for pid in list(store.keys()):
+        p = world.planet_by_id.get(pid)
+        if p is None or p.owner != world.player or world.step - store[pid] > ROTATIONAL_HUB_TTL:
+            del store[pid]
+
+
+def get_active_rotational_hubs(world):
+    return [
+        world.planet_by_id[pid]
+        for pid in _rotational_hubs.get(world.player, {})
+        if pid in world.planet_by_id and world.planet_by_id[pid].owner == world.player
+    ]
+
+
+def generate_rotational_hub_reinforce_missions(world):
+    """Reinforce vulnerable rotational hubs that are near the frontline."""
+    proposals = []
+    for hub in get_active_rotational_hubs(world):
+        if world.real_incoming_threat(hub)["deficit"] > 0:
+            continue  # emergency defense handles this
+        reserve = world.reserve_for(hub)
+        if int(hub.ships) >= reserve + ROTATIONAL_HUB_REINFORCE_THRESH:
+            continue
+        if world.nearest_enemy_distance(hub) > FRONTLINE_DIST + 22:
+            continue
+        need = reserve + ROTATIONAL_HUB_REINFORCE_THRESH - int(hub.ships)
+        sources = sorted(
+            [s for s in world.my_planets
+             if s.id != hub.id
+             and world.surplus(s) >= need
+             and world.real_incoming_threat(s)["deficit"] <= 0
+             and dp(s, hub) <= 42.0],
+            key=lambda s: dp(s, hub),
+        )
+        if not sources:
+            continue
+        src = sources[0]
+        send = min(world.surplus(src), need)
+        angle, ok = world.aim(src, hub, send)
+        if not ok:
+            continue
+        eta = world.eta(src, hub, send)
+        if eta > world.remaining - 2:
+            continue
+        world.add_debug(
+            f"ROTATIONAL_HUB_REINFORCE p{hub.id} src=p{src.id} send={send} "
+            f"ships={int(hub.ships)} reserve={reserve} eta={eta:.1f}"
+        )
+        proposals.append(MissionProposal(
+            kind="REINFORCE_CAPTURE",
+            target_id=hub.id,
+            priority=PRIORITY_HUB_REINFORCE_BASE + int(hub.production) * 3,
+            required_ships=send,
+            planned_sources=[(src.id, send, angle, eta)],
+            eta_min=eta,
+            eta_max=eta,
+            reason=f"hub_reinforce p{hub.id} ships={int(hub.ships)} reserve={reserve}",
+        ))
+    return proposals[:2]
+
+
+# ── MAIN19_TEMPO_ARBITER ───────────────────────────────────────────────────────
+
+def _find_best_nearest_for_arbiter(world):
+    """
+    Find the single best nearby planet for the MAIN19_TEMPO_ARBITER.
+    Returns (planet, source, need, score, race_status) or None.
+    Criteria: dist<=32, ETA<=18, holdable, not already covered.
+    """
+    best = None
+    best_score = -1e9
+    for tgt in world.normal_planets:
+        if tgt.owner == world.player or world.is_comet(tgt):
+            continue
+        src = min(world.my_planets, key=lambda p: dp(p, tgt), default=None)
+        if src is None:
+            continue
+        d = dp(src, tgt)
+        if d > ARBITER_NEAREST_MAX_DIST:
+            continue
+        pool = sum(world.surplus(p) for p in world.my_planets
+                   if dp(p, tgt) <= ARBITER_NEAREST_MAX_DIST + 8)
+        need = world.ships_needed_to_capture(src, tgt, pool)
+        if need <= 0 or pool < need:
+            continue
+        if world.incoming_to_targets.get(tgt.id, 0) >= need:
+            continue
+        eta = world.eta(src, tgt, max(1, need))
+        if eta > ARBITER_NEAREST_MAX_ETA:
+            continue
+        if not world.can_hold_after_capture(tgt, eta, need + ARBITER_HOLD_MARGIN):
+            continue
+        prod = int(tgt.production)
+        status, _, _ = neutral_race_status(world, tgt)
+        if status == "ENEMY_FAVORED" and prod < 3:
+            continue
+        score = (prod * 60.0
+                 + max(0.0, 32.0 - d) * 6.0
+                 - need * 1.5
+                 - eta * 5.0
+                 + (20.0 if tgt.owner == -1 else 0.0)
+                 + (30.0 if status == "SAFE" else -20.0 if status == "ENEMY_FAVORED" else 0.0))
+        if score > best_score:
+            best_score = score
+            best = (tgt, src, need, score, status)
+    return best
+
+
+def run_tempo_arbiter(world, deadline):
+    """
+    MAIN19_TEMPO_ARBITER: Run after urgent defense, before HV neutral / launchpad chain /
+    opportunistic strike. Ensures an obviously good nearby planet is never skipped.
+
+    Selection rules:
+    - Nearest occupiable (dist<=32, ETA<=18) wins by default.
+    - HV neutral (prod>=4) overrides only when nearest target is low-prod AND HV ETA is
+      comparable AND HV can be held.
+    - Returns empty list if HV neutral should take over (letting the HV layer handle it).
+    - Returns empty list when fleet_ratio > FLEET_RATIO_SOFT (no-panic gate).
+    """
+    if compute_fleet_ratio(world) > FLEET_RATIO_SOFT:
+        return []
+    if not world.my_planets:
+        return []
+
+    nearest = _find_best_nearest_for_arbiter(world)
+    if nearest is None:
+        return []
+
+    tgt, src, need, score, status = nearest
+    prod = int(tgt.production)
+    nearest_eta = world.eta(src, tgt, need)
+
+    # Check if a HV neutral is clearly better (only matters when nearest is low-prod)
+    if prod < 3:
+        hv_candidates = sorted(
+            [n for n in world.neutral_planets
+             if not world.is_comet(n)
+             and int(n.production) >= ARBITER_HV_PROD_OVERRIDE
+             and int(n.ships) <= LOCAL_PRODUCTION_MAX_SHIPS
+             and world.cluster_distance(n) <= MIDGAME_CONTEST_MAX_DIST],
+            key=lambda n: world.cluster_distance(n),
+        )
+        for hv in hv_candidates[:2]:
+            if time.perf_counter() > deadline:
+                break
+            hv_src = min(world.my_planets, key=lambda p: dp(p, hv), default=None)
+            if hv_src is None:
+                continue
+            hv_need = world.ships_needed_to_capture(hv_src, hv, world.surplus(hv_src))
+            if hv_need <= 0 or hv_need > world.surplus(hv_src):
+                continue
+            hv_eta = world.eta(hv_src, hv, hv_need)
+            if hv_eta > nearest_eta + 8.0:
+                continue
+            if not world.can_hold_after_capture(hv, hv_eta, hv_need):
+                continue
+            world.add_debug(
+                f"ARBITER_SELECT_HV_OVER_NEAREST hv=p{hv.id}(prod={int(hv.production)}) "
+                f"nearest=p{tgt.id}(prod={prod}) hv_eta={hv_eta:.1f} near_eta={nearest_eta:.1f}"
+            )
+            return []  # yield to HV neutral layer
+
+        world.add_debug(
+            f"ARBITER_SKIP_HV_FOR_NEAREST nearest=p{tgt.id}(prod={prod}) "
+            f"score={score:.1f} no_better_hv_found"
+        )
+
+    # Nearest wins — build grouped capture plan
+    mission_type = "CAPTURE_NEUTRAL" if tgt.owner == -1 else "SYNC_ATTACK"
+    candidate_sources = [
+        p for p in world.my_planets
+        if world.surplus(p) >= 3
+        and p.id not in world.backyard_locked_sources
+        and world.real_incoming_threat(p)["deficit"] <= 0
+        and dp(p, tgt) <= ARBITER_NEAREST_MAX_DIST + 8
+    ]
+    prop = build_capture_plan(
+        world, tgt, mission_type, candidate_sources,
+        max_sources=3,
+        eta_spread_limit=3.0 if tgt.owner == -1 else 6.0,
+    )
+    if prop is None:
+        # Fallback: single source
+        ok_safe, _ = world.source_is_safe_for(src, tgt, mission_type, need)
+        if not ok_safe:
+            return []
+        angle, ok = world.aim(src, tgt, need)
+        if not ok:
+            return []
+        eta = world.eta(src, tgt, need)
+        prop = MissionProposal(
+            kind=mission_type,
+            target_id=tgt.id,
+            priority=PRIORITY_NEAREST_OCCUPIABLE + score * 0.05,
+            required_ships=need,
+            planned_sources=[(src.id, need, angle, eta)],
+            eta_min=eta,
+            eta_max=eta,
+            reason=f"arbiter_nearest p{tgt.id} prod={prod} d={dp(src,tgt):.1f}",
+        )
+    else:
+        prop.priority = PRIORITY_NEAREST_OCCUPIABLE + score * 0.05
+        prop.reason = f"arbiter_nearest p{tgt.id} prod={prod} score={score:.1f}"
+
+    world.add_debug(
+        f"ARBITER_SELECT_NEAREST p{tgt.id} prod={prod} ships={int(tgt.ships)} "
+        f"src=p{src.id} need={need} eta={nearest_eta:.1f} score={score:.1f} status={status}"
+    )
+    return [prop]
+
+
 def generate_opportunistic_strike_missions(world, deadline):
     """
     STRIKE_ENEMY_LOW_SHIP_PLANET layer.
@@ -4602,10 +4843,26 @@ def generate_opportunistic_strike_missions(world, deadline):
     Only fires when: close enough, fleet_ratio safe, grouped attack flips ownership.
     """
     proposals = []
-    if compute_fleet_ratio(world) > FLEET_RATIO_SOFT:
+    fleet_ratio = compute_fleet_ratio(world)
+    if fleet_ratio > FLEET_RATIO_SOFT:
+        return proposals
+    # Stricter midgame no-panic gate: block opportunistic when fleet ratio is elevated
+    if MIDGAME_START_STEP <= world.step < MIDGAME_END_STEP and fleet_ratio > MIDGAME_FLEET_SOFT:
+        world.add_debug(f"NO_PANIC_BLOCK OPPORTUNISTIC_STRIKE fleet_ratio={fleet_ratio:.2f} midgame")
         return proposals
     if not world.enemy_planets or not world.my_planets:
         return proposals
+    # Don't launch enemy strikes when an easy nearby neutral exists (arbiter rule)
+    if world.step < MIDGAME_END_STEP:
+        nearby = _find_best_nearest_for_arbiter(world)
+        if nearby is not None:
+            near_tgt, _, _, near_score, _ = nearby
+            if near_tgt.owner == -1 and (int(near_tgt.production) >= 2 or near_score > 50):
+                world.add_debug(
+                    f"ARBITER_BLOCK_OPPORTUNISTIC_FOR_NEAREST p{near_tgt.id} "
+                    f"prod={int(near_tgt.production)} score={near_score:.1f}"
+                )
+                return proposals
 
     for tgt, w_score in detect_enemy_weakness(world)[:4]:
         if time.perf_counter() > deadline:
@@ -5258,6 +5515,7 @@ def agent(obs, config=None):
         _backyard_threats.clear()
         _midgame_recent_losses[world.player] = {}
         _midgame_infection_sources[world.player] = {}
+        _rotational_hubs[world.player] = {}
         _recently_reinforced[world.player] = {}
         _doomed_owned_targets[world.player] = {}
     last_meaningful = agent._last_meaningful.get(world.player, world.step)
@@ -5298,6 +5556,7 @@ def agent(obs, config=None):
         lock_midgame_infection_sources(world)
     elif world.step >= EARLY_STEPS:
         update_midgame_loss_tracker(world)  # keep loss tracker current
+    update_rotational_hubs(world)
 
     world.add_debug(f"fleet_ratio={fleet_ratio:.2f} mode={mode} idle={idle_turns}")
 
@@ -5328,13 +5587,23 @@ def agent(obs, config=None):
         urgent += generate_doomed_evacuation_missions(world)
     if time.perf_counter() < deadline:
         urgent += generate_protect_lead_missions(world)
+    if time.perf_counter() < deadline:
+        urgent += generate_rotational_hub_reinforce_missions(world)
     if urgent and time.perf_counter() < deadline:
         coordinate_missions(world, urgent, moves, fleet_ratio, deadline)
+
+    # ── 3b. MAIN19_TEMPO_ARBITER: prioritise nearest-occupiable over HV/chain/strike ──
+    arbiter_fired = False
+    if not threat_planets and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline:
+        arbiter_props = run_tempo_arbiter(world, deadline)
+        if arbiter_props:
+            coordinate_missions(world, arbiter_props, moves, fleet_ratio, deadline)
+            arbiter_fired = True
 
     # ── 4. Production tempo: high-value neutrals ─────────proposals → coordinate_missions
     high_value_neutral_block = False
     hv_props = []
-    if not threat_planets and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline:
+    if not threat_planets and not arbiter_fired and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline:
         hv_props = generate_high_value_neutral_missions(world, deadline)
         high_value_neutral_block = bool(hv_props)
         if hv_props:
