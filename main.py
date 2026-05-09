@@ -151,6 +151,16 @@ LAUNCHPAD_RECAPTURE_TTL  = 45
 CHAIN_PROD4_BONUS        = 90.0
 CHAIN_PROD5_BONUS        = 150.0
 
+# ── flg-style bridge/frontier pressure ───────────────────────────────────────
+BRIDGE_MAX_HOME_DIST       = 32.0
+BRIDGE_UNLOCK_RADIUS       = 42.0
+BRIDGE_REINFORCE_TTL       = 18
+FRONTIER_CONTEST_TTL       = 38
+FRONTIER_RADIUS            = 44.0
+PRESSURE_SATURATION_STEP   = 230
+PRESSURE_SATURATION_RATIO  = 1.50
+PRESSURE_WEAK_SHIP_AVG     = 12.0
+
 # ── contact recovery ──────────────────────────────────────────────────────────
 CONTACT_RECOVERY_DURATION = 20    # turns the mode stays active after trigger
 CONTACT_RECOVERY_EXTEND   = 8     # extend by this many turns on new pressure
@@ -178,6 +188,8 @@ _prev_ships: dict = {}            # planet_id -> ship count at start of previous
 _backyard_threats: dict = {}      # planet_id -> step when it was first detected as a threat
 _midgame_recent_losses: dict = {}     # player -> {planet_id -> step when lost}
 _midgame_infection_sources: dict = {} # player -> {planet_id -> step when local planet was lost}
+_bridge_hubs: dict = {}               # player -> {planet_id -> step when captured/selected as bridge}
+_contested_frontiers: dict = {}       # player -> {planet_id -> step when marked contested}
 _contact_recovery: dict = {}          # player -> {active_until, front_pid, enemy_owner, entered}
 _action_history: dict = {}            # player -> {step -> [ship_count, ...]}
 
@@ -284,6 +296,8 @@ class StrategyMode:
     BREACH_COLLAPSE = "BREACH_COLLAPSE"
     FINISH_ENEMY = "FINISH_ENEMY"
     RECOVER_AND_HOLD = "RECOVER_AND_HOLD"
+    CONTEST_FRONTIER = "CONTEST_FRONTIER"
+    PRESSURE_SATURATION = "PRESSURE_SATURATION"
     SAFE_EXPANSION = "SAFE_EXPANSION"
     CONTEST_NEUTRALS = "CONTEST_NEUTRALS"
     ANTI_LEADER = "ANTI_LEADER"
@@ -1424,8 +1438,12 @@ class StrategicDirector:
             for p in world.my_planets
         ):
             return StrategyMode.RECOVER_AND_HOLD
+        if pressure_saturation_ready(world):
+            return StrategyMode.PRESSURE_SATURATION
         if world.step < MIDGAME_START_STEP or len(world.my_planets) < 4:
             return StrategyMode.OPENING_TEMPO
+        if contested_frontier_planets(world):
+            return StrategyMode.CONTEST_FRONTIER
         if world.features["final"] or (len(world.enemy_planets) <= 2 and world.step > BREACH_KILL_STEP_MIN):
             return StrategyMode.FINISH_ENEMY
         if is_breach_kill_mode(world) and (
@@ -1448,6 +1466,9 @@ class StrategicDirector:
         infections = recent_infection_sources(self.world)
         if infections:
             return infections[0][0]
+        contested = contested_frontier_planets(self.world)
+        if contested:
+            return contested[0][0]
         high_neutral = min(
             (
                 n for n in self.world.neutral_planets
@@ -1489,9 +1510,9 @@ def launchpad_target_score(world, src, tgt, mode=None):
 
     production_value_bonus = prod * 62.0
     if prod >= 4:
-        production_value_bonus += CHAIN_PROD4_BONUS
+        production_value_bonus += CHAIN_PROD4_BONUS + 65.0
     if prod >= 5:
-        production_value_bonus += CHAIN_PROD5_BONUS
+        production_value_bonus += CHAIN_PROD5_BONUS + 110.0
 
     chain_bonus = 0.0
     nearby_next = [
@@ -1505,12 +1526,16 @@ def launchpad_target_score(world, src, tgt, mode=None):
         chain_bonus += min(90.0, sum(int(n.production) * 8.0 for n in nearby_next[:4]))
     if prod >= LAUNCHPAD_PROD_MIN or int(tgt.ships) + prod * 3 >= LAUNCHPAD_SURPLUS_MIN:
         chain_bonus += 35.0
+    if is_bridge_candidate(world, src, tgt):
+        chain_bonus += 135.0
 
     strategic_position_bonus = max(0.0, LAUNCHPAD_RADIUS - world.cluster_distance(tgt)) * 2.0
     if world.enemy_planets:
         nearest_enemy = min(dp(tgt, e) for e in world.enemy_planets)
         if 18.0 <= nearest_enemy <= 48.0:
             strategic_position_bonus += 35.0
+    if is_frontier_planet(world, tgt):
+        strategic_position_bonus += 95.0
 
     recapture_bonus = 0.0
     recent_losses = _midgame_recent_losses.get(world.player, {})
@@ -1522,7 +1547,7 @@ def launchpad_target_score(world, src, tgt, mode=None):
     enemy_core_bonus = 0.0
     if tgt.owner not in (-1, world.player):
         enemy_core_bonus += prod * 45.0
-        if mode in (StrategyMode.BREACH_COLLAPSE, StrategyMode.FINISH_ENEMY, StrategyMode.COLLAPSE):
+        if mode in (StrategyMode.BREACH_COLLAPSE, StrategyMode.FINISH_ENEMY, StrategyMode.COLLAPSE, StrategyMode.PRESSURE_SATURATION):
             enemy_core_bonus += 85.0
         if len(world.enemy_planets) <= 6:
             enemy_core_bonus += 45.0
@@ -1543,6 +1568,86 @@ def launchpad_target_score(world, src, tgt, mode=None):
         + recapture_bonus + enemy_core_bonus
         - travel_penalty - ship_cost_penalty - overextension_penalty
     )
+
+
+def pressure_saturation_ready(world):
+    if world.step < PRESSURE_SATURATION_STEP and not world.features["final"]:
+        return False
+    if world.my_prod >= max(1, world.enemy_prod) * PRESSURE_SATURATION_RATIO:
+        return True
+    if len(world.enemy_planets) <= 4 and world.my_prod >= max(1, world.enemy_prod) * 0.9:
+        return True
+    enemy_avg = world.enemy_total_ships / max(1, len(world.enemy_planets))
+    return len(world.my_planets) >= 8 and enemy_avg <= PRESSURE_WEAK_SHIP_AVG and world.my_prod > world.enemy_prod
+
+
+def is_bridge_candidate(world, src, tgt):
+    if tgt is None or world.is_comet(tgt) or tgt.owner != -1:
+        return False
+    if src is None:
+        return False
+    if dp(src, tgt) > BRIDGE_MAX_HOME_DIST and world.step < MIDGAME_START_STEP:
+        return False
+    if world.target_need_now(tgt) > max(1, world.surplus(src) + 4):
+        return False
+    unlocks = [
+        n for n in world.neutral_planets + world.enemy_planets
+        if n.id != tgt.id
+        and not world.is_comet(n)
+        and int(n.production) >= LAUNCHPAD_PROD_MIN
+        and dp(tgt, n) <= BRIDGE_UNLOCK_RADIUS
+    ]
+    return bool(unlocks)
+
+
+def is_frontier_planet(world, p):
+    if p is None or world.is_comet(p) or int(p.production) < 3:
+        return False
+    my_d = min((dp(p, m) for m in world.my_planets), default=999.0)
+    enemy_d = min((dp(p, e) for e in world.enemy_planets), default=999.0)
+    between_clusters = my_d <= FRONTIER_RADIUS and enemy_d <= FRONTIER_RADIUS + 8
+    recently_mine = _midgame_recent_losses.get(world.player, {}).get(p.id) is not None
+    opens_enemy = any(dp(p, e) <= FRONTIER_RADIUS for e in world.enemy_planets)
+    backyard_gate = p.owner not in (-1, world.player) and is_in_my_backyard(world, p)
+    return between_clusters or recently_mine or opens_enemy or backyard_gate
+
+
+def mark_contested_frontier(world, p, reason):
+    if p is None or world.is_comet(p):
+        return
+    _contested_frontiers.setdefault(world.player, {})[p.id] = world.step
+    world.add_debug(f"FRONTIER_CONTEST_MARK p{p.id} reason={reason}")
+
+
+def contested_frontier_planets(world):
+    store = _contested_frontiers.setdefault(world.player, {})
+    result = []
+    for pid in list(store.keys()):
+        p = world.planet_by_id.get(pid)
+        if p is None or world.is_comet(p) or world.step - store[pid] > FRONTIER_CONTEST_TTL:
+            del store[pid]
+            continue
+        if p.owner == world.player and int(p.ships) >= world.reserve_for(p) + 8:
+            del store[pid]
+            continue
+        result.append((p, world.step - store[pid]))
+    result.sort(key=lambda item: (item[1], -int(item[0].production), world.cluster_distance(item[0])))
+    return result
+
+
+def update_bridge_and_frontier_memory(world):
+    prev = _prev_owners if isinstance(_prev_owners, dict) else {}
+    if prev:
+        for p in world.my_planets:
+            if (
+                prev.get(p.id) != world.player
+                and (is_frontier_planet(world, p) or int(p.production) >= LAUNCHPAD_PROD_MIN)
+            ):
+                _bridge_hubs.setdefault(world.player, {})[p.id] = world.step
+                mark_contested_frontier(world, p, "recent_capture_hold")
+    for p in world.enemy_planets:
+        if is_frontier_planet(world, p):
+            mark_contested_frontier(world, p, "enemy_frontier")
 
 
 def score_target(world, src, tgt, mode):
@@ -2825,6 +2930,8 @@ def midgame_mission_quality_ok(world, prop, tgt, fleet_ratio, midgame_front):
 
     if prop.kind in ("SYNC_ATTACK", "BREACH_KILL", "COLLAPSE") and fleet_ratio > MIDGAME_FLEET_HARD:
         return False, f"blocked speculative attack fleet={fleet_ratio:.2f}"
+    if prop.kind in ("COLLAPSE", "FINAL_DRAIN") and not pressure_saturation_ready(world) and tgt.owner not in (-1, world.player):
+        return False, "collapse/saturation not ready"
 
     return True, ""
 
@@ -3397,6 +3504,8 @@ def opening_beam_search_plan(world, depth=None, beam_width=6):
                         continue
                     remaining_turns = max(1, world.remaining - eta - state["time"])
                     score = launchpad_target_score(world, src, tgt, StrategyMode.OPENING_TEMPO)
+                    if layer == 0 and is_bridge_candidate(world, src, tgt):
+                        score += 220.0
                     score += int(tgt.production) * remaining_turns * 0.18
                     score -= state["ships_spent"] * 0.08
                     # Newly captured high-production planets are treated as launchpads
@@ -3429,7 +3538,8 @@ def opening_beam_search_plan(world, depth=None, beam_width=6):
     src, tgt, need, angle, eta, first_score = best["moves"][0]
     world.add_debug(
         f"OPENING_BEAM_SELECT p{tgt.id} src=p{src.id} need={need} "
-        f"eta={eta:.1f} chain_score={best['score']:.1f} first={first_score:.1f}"
+        f"eta={eta:.1f} bridge={is_bridge_candidate(world, src, tgt)} "
+        f"chain_score={best['score']:.1f} first={first_score:.1f}"
     )
     return src, tgt, need, angle
 
@@ -4167,6 +4277,13 @@ def generate_launchpad_chain_missions(world, director, deadline):
     for hub in hubs:
         if time.perf_counter() > deadline:
             break
+        if hub.id in _bridge_hubs.get(world.player, {}):
+            desired = max(world.reserve_for(hub) + 10, int(hub.production) * 8, 22)
+            if int(hub.ships) < desired and world.step - _bridge_hubs[world.player][hub.id] <= BRIDGE_REINFORCE_TTL:
+                world.add_debug(
+                    f"BRIDGE_LAUNCH_BLOCK hub=p{hub.id} ships={int(hub.ships)} desired={desired}"
+                )
+                continue
         if world.real_incoming_threat(hub)["deficit"] > 0:
             continue
         candidates = []
@@ -4283,6 +4400,147 @@ def generate_frontier_hub_reinforce_missions(world):
                 reason=f"reinforce_frontier_hub p{hub.id} desired={desired}",
             ))
     return proposals[:2]
+
+
+def generate_bridge_reinforce_missions(world):
+    """Reinforce bridge/frontier hubs before using them as aggressive launchpads."""
+    proposals = []
+    bridge_store = _bridge_hubs.setdefault(world.player, {})
+    for pid in list(bridge_store.keys()):
+        hub = world.planet_by_id.get(pid)
+        if hub is None or hub.owner != world.player or world.step - bridge_store[pid] > BRIDGE_REINFORCE_TTL:
+            bridge_store.pop(pid, None)
+            continue
+        desired = max(world.reserve_for(hub) + 12, int(hub.production) * 8, 22)
+        need = max(0, desired - int(hub.ships))
+        if need <= 0:
+            continue
+        sources = sorted(
+            [
+                s for s in world.my_planets
+                if s.id != hub.id and world.surplus(s) >= 4 and world.real_incoming_threat(s)["deficit"] <= 0
+            ],
+            key=lambda s: dp(s, hub),
+        )[:3]
+        planned = []
+        remaining = need
+        for src in sources:
+            if remaining <= 0:
+                break
+            send = min(world.surplus(src), remaining)
+            angle, ok = world.aim(src, hub, send)
+            if not ok:
+                continue
+            planned.append((src.id, send, angle, world.eta(src, hub, send)))
+            remaining -= send
+        if not planned:
+            continue
+        eta_vals = [e for _, _, _, e in planned]
+        proposals.append(MissionProposal(
+            kind="REINFORCE_CAPTURE",
+            target_id=hub.id,
+            priority=118.0 + int(hub.production) * 4,
+            required_ships=sum(s for _, s, _, _ in planned),
+            planned_sources=planned,
+            eta_min=min(eta_vals),
+            eta_max=max(eta_vals),
+            reason=f"reinforce_bridge_hub p{hub.id} desired={desired}",
+        ))
+    return proposals
+
+
+def generate_contest_frontier_missions(world, director, deadline):
+    """Persistent frontier pressure: repeat grouped attempts until owned and reinforced."""
+    proposals = []
+    frontiers = contested_frontier_planets(world)
+    if director.active_front is not None and is_frontier_planet(world, director.active_front):
+        frontiers = [(director.active_front, 0)] + [f for f in frontiers if f[0].id != director.active_front.id]
+    for tgt, age in frontiers[:3]:
+        if time.perf_counter() > deadline:
+            break
+        if tgt.owner == world.player:
+            desired = max(world.reserve_for(tgt) + 10, int(tgt.production) * 7)
+            need = max(0, desired - int(tgt.ships))
+            if need <= 0:
+                continue
+            sources = sorted([s for s in world.my_planets if s.id != tgt.id and world.surplus(s) >= 4], key=lambda s: dp(s, tgt))[:3]
+            planned = []
+            remaining = need
+            for src in sources:
+                if remaining <= 0:
+                    break
+                send = min(world.surplus(src), remaining)
+                angle, ok = world.aim(src, tgt, send)
+                if ok:
+                    planned.append((src.id, send, angle, world.eta(src, tgt, send)))
+                    remaining -= send
+            if planned:
+                etas = [e for _, _, _, e in planned]
+                proposals.append(MissionProposal(
+                    kind="REINFORCE_CAPTURE",
+                    target_id=tgt.id,
+                    priority=112.0 - age + int(tgt.production) * 5,
+                    required_ships=sum(s for _, s, _, _ in planned),
+                    planned_sources=planned,
+                    eta_min=min(etas),
+                    eta_max=max(etas),
+                    reason=f"hold_contested_frontier p{tgt.id} age={age}",
+                ))
+            continue
+        mission_type = "RECAPTURE_LOST" if tgt.id in _midgame_recent_losses.get(world.player, {}) else "SYNC_ATTACK"
+        plan, reason = build_grouped_capture_plan(world, tgt, mission_type)
+        if plan is None:
+            world.add_debug(f"FRONTIER_CONTEST_SKIP p{tgt.id} age={age} reason={reason}")
+            continue
+        planned, need, eta_min, eta_max = plan
+        proposals.append(MissionProposal(
+            kind=mission_type,
+            target_id=tgt.id,
+            priority=124.0 - age + launchpad_target_score(world, world.my_planets[0], tgt, StrategyMode.CONTEST_FRONTIER) * 0.12,
+            required_ships=need,
+            planned_sources=planned,
+            eta_min=eta_min,
+            eta_max=eta_max,
+            reason=f"contest_frontier p{tgt.id} age={age}",
+        ))
+    return proposals
+
+
+def generate_pressure_saturation_missions(world, deadline):
+    """Cleanup saturation only when already winning hard."""
+    if not pressure_saturation_ready(world):
+        return []
+    proposals = []
+    weak_targets = sorted(
+        [t for t in world.enemy_planets + world.neutral_planets if not world.is_comet(t)],
+        key=lambda t: (0 if t.owner not in (-1, world.player) else 1, int(t.ships), -int(t.production)),
+    )
+    for tgt in weak_targets[:8]:
+        if time.perf_counter() > deadline:
+            break
+        src = min((s for s in world.my_planets if world.surplus(s) >= 3), key=lambda s: dp(s, tgt), default=None)
+        if src is None:
+            continue
+        need = world.ships_needed_to_capture(src, tgt, world.surplus(src))
+        if need <= 0 or need > world.surplus(src):
+            continue
+        if world.eta(src, tgt, need) > world.remaining - 2:
+            continue
+        angle, ok = world.aim(src, tgt, need)
+        if not ok:
+            continue
+        eta = world.eta(src, tgt, need)
+        proposals.append(MissionProposal(
+            kind="COLLAPSE" if tgt.owner not in (-1, world.player) else "CAPTURE_NEUTRAL",
+            target_id=tgt.id,
+            priority=72.0 + int(tgt.production) * 3 - int(tgt.ships),
+            required_ships=need,
+            planned_sources=[(src.id, need, angle, eta)],
+            eta_min=eta,
+            eta_max=eta,
+            reason=f"pressure_saturation p{tgt.id} src=p{src.id}",
+        ))
+    return proposals
 
 
 # ── midgame control ───────────────────────────────────────────────────────────
@@ -5072,6 +5330,8 @@ def agent(obs, config=None):
         _backyard_threats.clear()
         _midgame_recent_losses[world.player] = {}
         _midgame_infection_sources[world.player] = {}
+        _bridge_hubs[world.player] = {}
+        _contested_frontiers[world.player] = {}
         _recently_reinforced[world.player] = {}
         _doomed_owned_targets[world.player] = {}
     last_meaningful = agent._last_meaningful.get(world.player, world.step)
@@ -5115,6 +5375,7 @@ def agent(obs, config=None):
         if not mg_active:
             update_midgame_loss_tracker(world)  # keep loss tracker current
         update_contact_recovery(world, fleet_ratio, threat_planets)
+    update_bridge_and_frontier_memory(world)
     cr_active = is_contact_recovery_active(world)
     cr_front_planet, cr_enemy_owner = get_contact_front(world) if cr_active else (None, None)
     director = StrategicDirector(world, fleet_ratio, idle_turns)
@@ -5125,6 +5386,8 @@ def agent(obs, config=None):
         StrategyMode.BREACH_COLLAPSE,
         StrategyMode.FINISH_ENEMY,
         StrategyMode.RECOVER_AND_HOLD,
+        StrategyMode.CONTEST_FRONTIER,
+        StrategyMode.PRESSURE_SATURATION,
     ):
         mode = director.mode
     if cr_active:
@@ -5166,6 +5429,8 @@ def agent(obs, config=None):
         urgent += generate_protect_lead_missions(world)
     if time.perf_counter() < deadline:
         urgent += generate_frontier_hub_reinforce_missions(world)
+    if time.perf_counter() < deadline:
+        urgent += generate_bridge_reinforce_missions(world)
     if urgent and time.perf_counter() < deadline:
         coordinate_missions(world, urgent, moves, fleet_ratio, deadline)
 
@@ -5185,6 +5450,16 @@ def agent(obs, config=None):
                 world, chain_props, moves, fleet_ratio, deadline,
                 midgame_active=mg_active or cr_active,
                 midgame_front=director.active_front or cr_front_planet,
+            )
+
+    frontier_props = []
+    if time.perf_counter() < deadline and director.mode == StrategyMode.CONTEST_FRONTIER:
+        frontier_props = generate_contest_frontier_missions(world, director, deadline)
+        if frontier_props:
+            coordinate_missions(
+                world, frontier_props, moves, fleet_ratio, deadline,
+                midgame_active=True,
+                midgame_front=director.active_front,
             )
 
     # ── 4. Missed-neutral force (before opening, while ratio is low) ─────────
@@ -5261,7 +5536,12 @@ def agent(obs, config=None):
     proposals: list = []
     if high_value_neutral_block:
         world.add_debug("NORMAL_OFFENSE_BLOCKED reason=high-value neutral exists")
-    if not high_value_neutral_block and not protect_lead and time.perf_counter() < deadline:
+    if (
+        not high_value_neutral_block
+        and not protect_lead
+        and director.mode != StrategyMode.PRESSURE_SATURATION
+        and time.perf_counter() < deadline
+    ):
         proposals += generate_breach_kill_missions(world)
     if not high_value_neutral_block and time.perf_counter() < deadline:
         proposals += generate_snipe_missions(world)
@@ -5271,9 +5551,9 @@ def agent(obs, config=None):
         and time.perf_counter() < deadline
     ):
         proposals += generate_expansion_missions(world, deadline)
-    if not high_value_neutral_block and not protect_lead and time.perf_counter() < deadline:
+    if not high_value_neutral_block and not protect_lead and director.mode != StrategyMode.PRESSURE_SATURATION and time.perf_counter() < deadline:
         proposals += generate_local_strike_missions(world)
-    if not high_value_neutral_block and not protect_lead and time.perf_counter() < deadline:
+    if not high_value_neutral_block and not protect_lead and director.mode != StrategyMode.PRESSURE_SATURATION and time.perf_counter() < deadline:
         proposals += generate_sync_attack_missions(world, mode, deadline)
     if not high_value_neutral_block and not protect_lead and time.perf_counter() < deadline:
         proposals += generate_anti_leader_missions(world)
@@ -5281,6 +5561,8 @@ def agent(obs, config=None):
         proposals += generate_collapse_missions(world, mode)
     if time.perf_counter() < deadline:
         proposals += generate_final_drain_missions(world)
+    if director.mode == StrategyMode.PRESSURE_SATURATION and time.perf_counter() < deadline:
+        proposals += generate_pressure_saturation_missions(world, deadline)
 
     # Inject organized wave if reservation is ready or overdue
     if _wave_reservation["target_id"] is not None and time.perf_counter() < deadline:
