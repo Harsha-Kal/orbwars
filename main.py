@@ -265,6 +265,72 @@ def is_idle(p):
     """True when planet does not orbit the sun."""
     return dist(p.x, p.y, SUN_X, SUN_Y) + p.radius >= ROTATION_LIMIT
 
+
+# ── neutral race classifier ────────────────────────────────────────────────────
+
+def neutral_race_status(world, target):
+    """Classify a neutral as SAFE / CONTESTED / ENEMY_FAVORED based on ETA delta."""
+    my_eta, enemy_eta = world.reaction_times(target)
+    delta = my_eta - enemy_eta  # positive = we're slower
+    if delta <= -3.0:
+        return "SAFE", my_eta, enemy_eta
+    elif delta <= 4.0:
+        return "CONTESTED", my_eta, enemy_eta
+    else:
+        return "ENEMY_FAVORED", my_eta, enemy_eta
+
+def is_safe_neutral(world, target):
+    status, _, _ = neutral_race_status(world, target)
+    return status == "SAFE"
+
+def is_contested_neutral(world, target):
+    status, _, _ = neutral_race_status(world, target)
+    return status == "CONTESTED"
+
+def is_enemy_favored_neutral(world, target):
+    status, _, _ = neutral_race_status(world, target)
+    return status == "ENEMY_FAVORED"
+
+def enemy_earliest_capture_turn(world, target):
+    """Earliest turn an enemy fleet could realistically take this planet."""
+    inbound = [
+        eta for eta, owner, ships in world.arrivals_by_target.get(target.id, [])
+        if owner != world.player and ships > 0
+    ]
+    if inbound:
+        return min(inbound)
+    return min(
+        (world.eta(e, target, max(1, int(e.ships) // 2)) for e in world.enemy_planets),
+        default=999.0,
+    )
+
+def validate_grouped_launch(world, tgt, planned):
+    """
+    Verify a grouped attack will flip ownership.
+    ETA spread: <=3 for neutrals, <=6 for enemy planets.
+    Returns (ok, reason).
+    """
+    if not planned:
+        return False, "no sources"
+    total = sum(s for _, s, _, _ in planned)
+    eta_vals = [e for _, _, _, e in planned]
+    spread = max(eta_vals) - min(eta_vals) if len(eta_vals) >= 2 else 0.0
+    max_eta = max(eta_vals)
+    if tgt.owner == -1 and spread > 3.0:
+        return False, f"neutral spread={spread:.1f}>3"
+    if tgt.owner not in (-1, world.player) and spread > 6.0:
+        return False, f"enemy spread={spread:.1f}>6"
+    eval_turn = max(1, int(math.ceil(max_eta)))
+    extra = tuple(
+        (max(1, int(math.ceil(e))), world.player, int(s))
+        for _, s, _, e in planned if int(s) > 0
+    )
+    owner_after, _ = world.projected_state(tgt.id, eval_turn, extra_arrivals=extra)
+    if owner_after != world.player:
+        return False, f"won't flip at t={eval_turn}"
+    return True, ""
+
+
 class StrategyMode:
     OPENING_TEMPO = "OPENING_TEMPO"
     EXPAND_CHAIN = "EXPAND_CHAIN"
@@ -1700,11 +1766,10 @@ def plan_grouped_capture(world, tgt, moves, need=None, max_sources=NEAREST_LOCK_
             continue
         planned.append((src.id, n, _angle, world.eta(src, tgt, n)))
         preview_sent += n
-    if len(planned) >= 2:
-        eta_check = [e for _, _, _, e in planned]
-        if max(eta_check) - min(eta_check) > 3.0:
-            world.add_debug(f"grouped_capture ETA_SPREAD_REJECT p{tgt.id} spread={max(eta_check)-min(eta_check):.1f}")
-            return False
+    ok_grp, grp_reason = validate_grouped_launch(world, tgt, planned)
+    if not ok_grp:
+        world.add_debug(f"grouped_capture VALIDATE_REJECT p{tgt.id} reason={grp_reason}")
+        return False
     mission_id = world.mission_ledger.create(
         "CAPTURE_NEUTRAL",
         tgt.id,
@@ -1782,10 +1847,11 @@ def build_grouped_wave(world, tgt, need, moves, max_sources=MAX_GROUP_SOURCES, a
         return 0
     # For offensive (enemy-owned) targets: require full pool; reserve if close but not ready
     if tgt.owner not in (-1, world.player) and not allow_partial and pool < need:
-        if should_wait_for_better_wave(world, tgt):
-            reserve_wave(world, tgt, sources)
-        else:
-            world.add_debug(f"LOW_VALUE_NOW_SKIP target=p{tgt.id} reason=cant_reach_need pool={pool} need={need}")
+        if not wait_for_wave_if_better(world, tgt, sources, need):
+            if should_wait_for_better_wave(world, tgt):
+                reserve_wave(world, tgt, sources)
+            else:
+                world.add_debug(f"LOW_VALUE_NOW_SKIP target=p{tgt.id} reason=cant_reach_need pool={pool} need={need}")
         world.add_debug(f"TRICKLE_BLOCK target=p{tgt.id} ships={pool} need={need}")
         return 0
     goal = need if pool >= need else (int(pool * 0.32) if allow_partial else 0)
@@ -2694,6 +2760,77 @@ def generate_protect_lead_missions(world):
     return proposals
 
 
+ENDGAME_CONSOL_REMAINING  = 70   # steps remaining below which consolidation activates
+ENDGAME_CONSOL_MIN_XFER   = 8    # minimum ships to bother transferring
+
+
+def generate_endgame_consolidation_missions(world):
+    """
+    Pre-drain: consolidate surplus from weak backline planets into the best hub.
+    Active only when remaining < 70 and past LATE_GAME_STEPS.
+    """
+    proposals = []
+    if world.remaining >= ENDGAME_CONSOL_REMAINING:
+        return proposals
+    if world.step < LATE_GAME_STEPS:
+        return proposals
+    if len(world.my_planets) < 2:
+        return proposals
+
+    cx = sum(p.x for p in world.my_planets) / len(world.my_planets)
+    cy = sum(p.y for p in world.my_planets) / len(world.my_planets)
+
+    safe_hubs = [
+        p for p in world.my_planets
+        if world.real_incoming_threat(p)["deficit"] <= 0
+        and world.simulate_planet_timeline(p, min(30, world.remaining))["fall_turn"] is None
+        and world.nearest_enemy_distance(p) > FRONTLINE_DIST
+    ]
+    if not safe_hubs:
+        return proposals
+
+    def _hub_val(p):
+        centrality = 1.0 / max(1.0, dist(p.x, p.y, cx, cy))
+        return int(p.production) * 15.0 + int(p.ships) * 0.4 + centrality * 20.0
+
+    hub = max(safe_hubs, key=_hub_val)
+
+    for src in sorted(
+        world.my_planets,
+        key=lambda p: (world.nearest_enemy_distance(p), -world.surplus(p)),
+        reverse=True,
+    ):
+        if len(proposals) >= 3:
+            break
+        if src.id == hub.id:
+            continue
+        if world.nearest_enemy_distance(src) < FRONTLINE_DIST:
+            continue
+        if world.real_incoming_threat(src)["deficit"] > 0:
+            continue
+        spare = world.surplus(src)
+        send = int(spare * 0.75)
+        if send < ENDGAME_CONSOL_MIN_XFER:
+            continue
+        eta = world.eta(src, hub, send)
+        if eta > world.remaining - 1:
+            continue
+        angle, ok = world.aim(src, hub, send)
+        if not ok:
+            continue
+        proposals.append(MissionProposal(
+            kind="DEFEND_HOLD",
+            target_id=hub.id,
+            priority=44.0 + int(hub.production),
+            required_ships=send,
+            planned_sources=[(src.id, send, angle, eta)],
+            eta_min=eta,
+            eta_max=eta,
+            reason=f"endgame_consol src=p{src.id}->hub=p{hub.id} send={send}",
+        ))
+    return proposals
+
+
 def generate_final_drain_missions(world):
     proposals = []
     if world.step < FINAL_STEPS and world.remaining > 45:
@@ -3114,6 +3251,32 @@ def reserve_wave(world, target, sources):
     )
 
 
+def wait_for_wave_if_better(world, target, sources, required_ships):
+    """
+    Reserve sources and wait 1-3 turns if target is valuable and pool is close.
+    Returns True if we reserve and should skip launching now.
+    Never waits for prod < 4 neutrals or when already have enough ships.
+    """
+    prod = int(target.production)
+    is_valuable = prod >= 4 or target.owner not in (-1, world.player)
+    if not is_valuable:
+        return False
+    pool = sum(world.surplus(s) for s in sources)
+    if pool >= required_ships:
+        return False
+    gap = required_ships - pool
+    for wait in range(1, MAX_WAVE_WAIT + 1):
+        gain = sum(int(s.production) * wait for s in sources)
+        if gain >= gap:
+            reserve_wave(world, target, sources)
+            world.add_debug(
+                f"WAIT_FOR_WAVE target=p{target.id} prod={prod} pool={pool} "
+                f"need={required_ships} wait={wait}"
+            )
+            return True
+    return False
+
+
 def generate_organized_wave_mission(world, target):
     """Build a full-strength MissionProposal for a wave-reserved target."""
     src = min(world.my_planets, key=lambda p: dp(p, target), default=None)
@@ -3249,6 +3412,15 @@ def early_target_score(world, src, tgt):
         if has_better:
             score -= 250.0
 
+    # Race-status bonus/penalty
+    status, _, _ = neutral_race_status(world, tgt)
+    if status == "SAFE":
+        score += 35.0 + max(0.0, prod - 2) * 8.0
+    elif status == "CONTESTED":
+        score += 10.0 if prod >= 4 else 0.0
+    elif status == "ENEMY_FAVORED":
+        score -= 60.0 if prod < 4 else 20.0
+
     return score
 
 
@@ -3281,6 +3453,12 @@ def validate_initial_target_choice(world, src, tgt):
         )
         if better:
             world.add_debug(f"VALIDATE_REJECT p{tgt.id} reason=prod1_skip_prod3_available")
+            return False
+    # Skip enemy-favored low-production neutrals early game
+    if world.step < 100 and prod < 4:
+        status, _, _ = neutral_race_status(world, tgt)
+        if status == "ENEMY_FAVORED":
+            world.add_debug(f"VALIDATE_REJECT p{tgt.id} reason=enemy_favored_low_prod prod={prod}")
             return False
     return True
 
@@ -3406,6 +3584,118 @@ def should_retarget_opening(world, current_target_id):
         )
         return True, best_alt.id
     return False, None
+
+
+def opening_chain_plan(world, deadline):
+    """
+    Depth-2 beam search: source -> first_neutral -> second_neutral chains.
+    Only when step < 60 and <=3 planets owned and no urgent threat.
+    Returns best MissionProposal (targeting first_neutral) or None.
+    Uses if it beats best single-target score by >= 15%.
+    """
+    if world.step >= 60 or len(world.my_planets) > 3:
+        return None
+    if world.features.get("incoming_threat_count", 0) > 0:
+        return None
+    if not world.neutral_planets or not world.my_planets:
+        return None
+
+    remaining = max(1, TOTAL_STEPS - world.step)
+    best_chain_score = -1e9
+    best_chain = None
+    best_normal_score = -1e9
+
+    for src in world.my_planets:
+        av = early_surplus(world, src)
+        if av < 2:
+            continue
+        for first in world.neutral_planets:
+            if world.is_comet(first):
+                continue
+            if not validate_initial_target_choice(world, src, first):
+                continue
+            need1 = world.target_need_now(first)
+            if need1 <= 0 or need1 > av:
+                continue
+            eta1 = world.eta(src, first, need1)
+            if eta1 > 40:
+                continue
+            prod1 = int(first.production)
+            status1, _, _ = neutral_race_status(world, first)
+            if status1 == "ENEMY_FAVORED" and prod1 < 4:
+                continue
+            ns = early_target_score(world, src, first)
+            if ns > best_normal_score:
+                best_normal_score = ns
+
+            for second in world.neutral_planets:
+                if time.perf_counter() > deadline:
+                    break
+                if second.id == first.id or world.is_comet(second):
+                    continue
+                need2 = world.target_need_now(second)
+                if need2 <= 0:
+                    continue
+                eta2 = travel_turns(dp(first, second), max(1, need2))
+                if eta2 > 20:
+                    continue
+                prod2 = int(second.production)
+                status2, _, _ = neutral_race_status(world, second)
+                if status2 == "ENEMY_FAVORED" and prod2 < 3:
+                    continue
+                future1 = max(1, remaining - int(math.ceil(eta1)))
+                future2 = max(1, remaining - int(math.ceil(eta1 + eta2)))
+                chain_score = (
+                    prod1 * future1
+                    + prod2 * future2 * 0.75
+                    - need1 * 1.2
+                    - need2 * 0.9
+                    - (eta1 + eta2) * 3.5
+                )
+                if status1 == "SAFE":
+                    chain_score += 30.0
+                if status2 == "SAFE":
+                    chain_score += 20.0
+                if prod1 >= 3:
+                    chain_score += 25.0
+                if prod2 >= 3:
+                    chain_score += 20.0
+                if prod1 <= 1:
+                    chain_score -= 50.0
+                if chain_score > best_chain_score:
+                    best_chain_score = chain_score
+                    best_chain = (src, first, need1, second)
+            if time.perf_counter() > deadline:
+                break
+
+    if best_chain is None:
+        return None
+    src, first, need1, second = best_chain
+    threshold = best_normal_score * 1.15 if best_normal_score > 0 else best_normal_score + 20.0
+    if best_chain_score < threshold:
+        world.add_debug(
+            f"CHAIN_PLAN_SKIP chain={best_chain_score:.1f} normal={best_normal_score:.1f}"
+        )
+        return None
+    angle, ok = world.aim(src, first, need1)
+    if not ok:
+        return None
+    eta = world.eta(src, first, need1)
+    world.add_debug(
+        f"CHAIN_PLAN_SELECT src=p{src.id} first=p{first.id}(prod={int(first.production)}) "
+        f"second=p{second.id}(prod={int(second.production)}) "
+        f"chain={best_chain_score:.1f} normal={best_normal_score:.1f}"
+    )
+    return MissionProposal(
+        kind="CAPTURE_NEUTRAL",
+        target_id=first.id,
+        priority=88.0 + int(first.production) * 5,
+        required_ships=need1,
+        planned_sources=[(src.id, need1, angle, eta)],
+        eta_min=eta,
+        eta_max=eta,
+        reason=f"chain_plan first=p{first.id}->p{second.id} score={best_chain_score:.1f}",
+    )
 
 
 def first_capture_360(world, moves):
@@ -4016,8 +4306,9 @@ def build_grouped_capture_plan(world, target, mission_type, max_sources=MIDGAME_
     if sent < need * MIN_WAVE_FRACTION or not planned:
         return None, f"planned={sent} need={need}"
     eta_vals = [eta for _, _, _, eta in planned]
-    if target.owner not in (-1, world.player) and (len(planned) < 2 or max(eta_vals) - min(eta_vals) > ETA_SYNC_WINDOW):
-        return None, "unsynced enemy attack"
+    ok_grp, grp_reason = validate_grouped_launch(world, target, planned)
+    if not ok_grp:
+        return None, f"validate_grouped_launch: {grp_reason}"
     if not world.can_hold_after_capture(target, max(eta_vals), sent):
         return None, "cannot hold"
     return (planned, need, min(eta_vals), max(eta_vals)), ""
@@ -4353,6 +4644,11 @@ def generate_midgame_neutral_contest_missions(world, deadline):
         enemy_inbound = world.enemy_incoming_to_targets.get(tgt.id, 0)
         is_contested = enemy_inbound > 0
         can_race = my_eta <= enemy_eta + 3.0
+
+        # Skip enemy-favored low-prod neutrals during midgame
+        race_status, _, _ = neutral_race_status(world, tgt)
+        if race_status == "ENEMY_FAVORED" and int(tgt.production) < 4 and not is_contested:
+            continue
 
         if not can_race and not is_contested:
             continue
@@ -4742,6 +5038,19 @@ def agent(obs, config=None):
     ):
         force_repeated_missed_neutral(world, moves)
 
+    # ── 4b. Opening chain plan (depth-2, step < 60, <=3 planets) ────────────
+    if (
+        not moves
+        and not high_value_neutral_block
+        and not threat_planets
+        and world.step < 60
+        and len(world.my_planets) <= 3
+        and time.perf_counter() < deadline
+    ):
+        chain_prop = opening_chain_plan(world, deadline)
+        if chain_prop is not None:
+            coordinate_missions(world, [chain_prop], moves, fleet_ratio, deadline)
+
     # ── 5. Forced opening tempo (first 2-3 planets) ──────────────────────────
     # Bypasses ratio and backyard-threat gates — opening is a tempo race.
     opening_ok = (not threat_planets and not ratio_blocks_normal) or in_forced_opening
@@ -4808,6 +5117,8 @@ def agent(obs, config=None):
         proposals += generate_anti_leader_missions(world)
     if not high_value_neutral_block and not protect_lead and time.perf_counter() < deadline:
         proposals += generate_collapse_missions(world, mode)
+    if world.remaining < ENDGAME_CONSOL_REMAINING and time.perf_counter() < deadline:
+        proposals += generate_endgame_consolidation_missions(world)
     if time.perf_counter() < deadline:
         proposals += generate_final_drain_missions(world)
 
