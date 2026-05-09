@@ -3941,6 +3941,12 @@ def early_nearest_expansion_360(world, moves):
     if not world.neutral_planets:
         return False
 
+    # General early-prod force: step >= 30 with <3 planets (any start type)
+    if world.my_planets and world.step >= 30 and len(world.my_planets) < 3:
+        world.add_debug(f"EARLY_PROD_FORCE_CAPTURE step={world.step} planets={len(world.my_planets)}")
+        if _force_nearest_opening_capture(world, moves, label="EARLY_PROD_FORCE_CAPTURE"):
+            return True
+
     # LARGE_START anti-stall: if stuck with <3 planets past step 35, force local sweep
     if world.my_planets:
         st = get_start_type(world)
@@ -4997,6 +5003,94 @@ def run_tempo_arbiter(world, fleet_ratio, deadline):
     return [prop]
 
 
+def _early_prod_on_track(world):
+    """
+    Returns (on_track, urgency_high, prod_target, planet_target).
+    Compares current production/planet count to the early expansion target curve.
+    """
+    s = world.step
+    prod_target   = 15 if s <= 25 else 30 if s <= 40 else 55 if s <= 60 else 80 if s <= 75 else 100
+    planet_target = 2  if s <= 20 else 3  if s <= 30 else 5  if s <= 50 else 7
+    on_track     = world.my_prod >= prod_target or len(world.my_planets) >= planet_target
+    urgency_high = (world.my_prod < prod_target * 0.65) or (len(world.my_planets) < planet_target - 1)
+    return on_track, urgency_high, prod_target, planet_target
+
+
+def generate_early_production_rush_missions(world, deadline):
+    """
+    EARLY_PRODUCTION_RUSH_OPENING: runs steps 0–80.
+    Captures nearby neutrals aggressively to maximise production before midgame.
+    Generates grouped capture proposals; blocks enemy offense when behind target curve.
+    """
+    if world.step > 80 or world.features.get("final"):
+        return []
+    if not world.neutral_planets or not world.my_planets:
+        return []
+
+    fleet_ratio = compute_fleet_ratio(world)
+    if fleet_ratio > FLEET_RATIO_SOFT:
+        return []
+
+    on_track, urgency_high, prod_target, planet_target = _early_prod_on_track(world)
+    if on_track and not urgency_high:
+        world.add_debug(
+            f"EARLY_PROD_TARGET_ON_TRACK prod={world.my_prod}/{prod_target} "
+            f"planets={len(world.my_planets)}/{planet_target}"
+        )
+        return []
+
+    world.add_debug(
+        f"EARLY_PROD_TARGET_BEHIND prod={world.my_prod}/{prod_target} "
+        f"planets={len(world.my_planets)}/{planet_target} urgency={'high' if urgency_high else 'normal'}"
+    )
+
+    proposals = []
+    rush_dist = 42.0 if urgency_high else 35.0
+
+    targets = sorted(
+        world.neutral_planets,
+        key=lambda p: min(dp(m, p) for m in world.my_planets),
+    )
+
+    for tgt in targets:
+        if time.perf_counter() > deadline:
+            break
+        if world.is_comet(tgt):
+            continue
+        d = min(dp(m, tgt) for m in world.my_planets)
+        if d > rush_dist:
+            continue
+        if world.incoming_to_targets.get(tgt.id, 0) >= world.required_ships_to_capture(tgt):
+            continue
+        candidate_sources = [
+            p for p in world.my_planets
+            if world.surplus(p) >= 3
+            and p.id not in world.backyard_locked_sources
+            and world.real_incoming_threat(p)["deficit"] <= 0
+            and dp(p, tgt) <= rush_dist + 8
+        ]
+        if not candidate_sources:
+            continue
+        prop = build_capture_plan(
+            world, tgt, "CAPTURE_NEUTRAL", candidate_sources,
+            max_sources=3, eta_spread_limit=3.0,
+        )
+        if prop is None:
+            continue
+        prod_bonus = int(tgt.production) * 25.0
+        dist_bonus = max(0.0, 38.0 - d) * 3.0
+        prop.priority = 97.0 + prod_bonus + dist_bonus
+        label = "EARLY_PROD_GROUPED_CAPTURE" if len(prop.planned_sources) > 1 else "EARLY_PROD_LOCAL_SWEEP"
+        prop.reason = f"prod_rush p{tgt.id} prod={int(tgt.production)} d={d:.1f}"
+        world.add_debug(
+            f"{label} p{tgt.id} prod={int(tgt.production)} d={d:.1f} "
+            f"srcs={[s for s,_,_,_ in prop.planned_sources]} ships={prop.required_ships}"
+        )
+        proposals.append(prop)
+
+    return proposals[:4]
+
+
 def generate_opportunistic_strike_missions(world, fleet_ratio, deadline, arbiter_fired=False):
     """
     Attacks enemy planets that recently launched fleets and are now thin.
@@ -5011,6 +5105,12 @@ def generate_opportunistic_strike_missions(world, fleet_ratio, deadline, arbiter
         return proposals
     if not world.enemy_planets or not world.my_planets:
         return proposals
+    # During early production rush, block enemy attacks when behind target curve
+    if world.step <= 80:
+        _, urgency_high, _, _ = _early_prod_on_track(world)
+        if urgency_high and world.neutral_planets:
+            world.add_debug(f"EARLY_PROD_SKIP_ENEMY_ATTACK_FOR_NEUTRAL step={world.step}")
+            return proposals
     # Don't launch enemy strikes when an easy nearby neutral exists.
     # If arbiter already committed a nearby capture this turn, skip re-scanning.
     if world.step < MIDGAME_END_STEP and not arbiter_fired:
@@ -5686,6 +5786,12 @@ def agent(obs, config=None):
     def _finish(mark_meaningful=True):
         if mark_meaningful and (world.offensive_ships >= 15 or world.wave_attempted):
             agent._last_meaningful[world.player] = world.step
+        if world.step == 80:
+            world.add_debug(
+                f"EARLY_PROD_80_SUMMARY prod={world.my_prod} enemy_prod={world.enemy_prod} "
+                f"planets={len(world.my_planets)} ships={world.my_total_ships} "
+                f"fleet_ratio={compute_fleet_ratio(world):.2f}"
+            )
         if DEBUG:
             for event in world.debug_events:
                 print(event)
@@ -5752,6 +5858,13 @@ def agent(obs, config=None):
         urgent += generate_rotational_hub_reinforce_missions(world)
     if urgent and time.perf_counter() < deadline:
         coordinate_missions(world, urgent, moves, fleet_ratio, deadline)
+
+    # ── 3a. EARLY_PRODUCTION_RUSH_OPENING (step 0–80) ──── proposals → coordinate_missions
+    if world.step <= 80 and not threat_planets and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline:
+        rush_props = generate_early_production_rush_missions(world, deadline)
+        if rush_props:
+            world.add_debug(f"EARLY_PROD_RUSH_START step={world.step} missions={len(rush_props)}")
+            coordinate_missions(world, rush_props, moves, fleet_ratio, deadline)
 
     # ── 3b. MAIN19_TEMPO_ARBITER: prioritise nearest-occupiable over HV/chain/strike ──
     _moves_before_arbiter = len(moves)
