@@ -4629,6 +4629,14 @@ def update_rotational_hubs(world):
         if p is None or p.owner != world.player or world.step - store[pid] > ROTATIONAL_HUB_TTL:
             del store[pid]
 
+    # Lock thin hubs as offensive sources until they accumulate enough ships
+    for pid in store:
+        p = world.planet_by_id.get(pid)
+        if p is not None and p.owner == world.player:
+            if int(p.ships) < world.reserve_for(p) + ROTATIONAL_HUB_REINFORCE_THRESH:
+                world.backyard_locked_sources.add(pid)
+                world.add_debug(f"ROTATIONAL_HUB_SOURCE_LOCK p{pid} ships={int(p.ships)}")
+
 
 def get_active_rotational_hubs(world):
     return [
@@ -5588,6 +5596,9 @@ def agent(obs, config=None):
         if arbiter_props:
             coordinate_missions(world, arbiter_props, moves, fleet_ratio, deadline)
     arbiter_fired = len(moves) > _moves_before_arbiter
+    arbiter_turn_lock = arbiter_fired and world.offensive_ships >= 12
+    if arbiter_turn_lock:
+        world.add_debug(f"ARBITER_TURN_LOCK active offensive_ships={world.offensive_ships}")
 
     # ── 4. Production tempo: high-value neutrals ─────────proposals → coordinate_missions
     high_value_neutral_block = False
@@ -5598,20 +5609,23 @@ def agent(obs, config=None):
         if hv_props:
             coordinate_missions(world, hv_props, moves, fleet_ratio, deadline)
 
-    if not threat_planets and time.perf_counter() < deadline:
+    if not threat_planets and not arbiter_turn_lock and time.perf_counter() < deadline:
         chain_props = generate_launchpad_chain_missions(world, mode, deadline)
         if chain_props:
             coordinate_missions(
                 world, chain_props, moves, fleet_ratio, deadline,
                 midgame_active=mg_active, midgame_front=None,
             )
+    elif arbiter_turn_lock:
+        world.add_debug("SKIP_CHAIN_AFTER_ARBITER")
 
     # ── 4c. Nearest occupiable expansion (neutral + weak enemy near cluster) ──
-    # Respects fleet_ratio internally; anti-panic-mode gate built in.
-    if not threat_planets and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline:
+    if not threat_planets and not arbiter_turn_lock and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline:
         occ_props = generate_nearest_occupiable_expansion_missions(world, deadline)
         if occ_props:
             coordinate_missions(world, occ_props, moves, fleet_ratio, deadline)
+    elif arbiter_turn_lock:
+        world.add_debug("SKIP_OCCUPIABLE_AFTER_ARBITER")
 
     # ── 4. Missed-neutral force (before opening, while ratio is low) ─────────
     if (
@@ -5666,7 +5680,7 @@ def agent(obs, config=None):
         mg_blocked = fleet_ratio > MIDGAME_FLEET_HARD
         if mg_blocked:
             world.add_debug(f"MIDGAME_RATIO_GUARD fleet={fleet_ratio:.2f}")
-        if not high_value_neutral_block and cluster_stab >= MIDGAME_STABILITY_THRESHOLD and not mg_blocked:
+        if not high_value_neutral_block and not arbiter_turn_lock and cluster_stab >= MIDGAME_STABILITY_THRESHOLD and not mg_blocked:
             mg_props = generate_midgame_control_missions(
                 world, mg_state, active_front_planet, fleet_ratio, deadline
             )
@@ -5686,24 +5700,29 @@ def agent(obs, config=None):
 
     # ── 7. Mission coordinator ───────────────────────── proposals → coordinate_missions
     proposals: list = []
+    no_offense = high_value_neutral_block or arbiter_turn_lock
     if high_value_neutral_block:
         world.add_debug("NORMAL_OFFENSE_BLOCKED reason=high-value neutral exists")
-    if not high_value_neutral_block and not protect_lead and time.perf_counter() < deadline:
+    if arbiter_turn_lock:
+        world.add_debug(f"SKIP_COORDINATOR_AFTER_ARBITER offensive_ships={world.offensive_ships}")
+    if not no_offense and not protect_lead and time.perf_counter() < deadline:
         proposals += generate_breach_kill_missions(world)
-    if not high_value_neutral_block and time.perf_counter() < deadline:
+    if not no_offense and time.perf_counter() < deadline:
         proposals += generate_snipe_missions(world)
-    if not high_value_neutral_block and time.perf_counter() < deadline:
+    if not no_offense and time.perf_counter() < deadline:
         proposals += generate_expansion_missions(world, deadline)
-    if not high_value_neutral_block and not protect_lead and time.perf_counter() < deadline:
+    if not no_offense and not protect_lead and time.perf_counter() < deadline:
         proposals += generate_local_strike_missions(world)
-    if not high_value_neutral_block and not protect_lead and time.perf_counter() < deadline:
+    if not no_offense and not protect_lead and time.perf_counter() < deadline:
         proposals += generate_sync_attack_missions(world, mode, deadline)
-    if not high_value_neutral_block and not protect_lead and time.perf_counter() < deadline:
+    if not no_offense and not protect_lead and time.perf_counter() < deadline:
         proposals += generate_anti_leader_missions(world)
-    if not high_value_neutral_block and not protect_lead and time.perf_counter() < deadline:
+    if not no_offense and not protect_lead and time.perf_counter() < deadline:
         proposals += generate_collapse_missions(world, mode)
-    if not high_value_neutral_block and not protect_lead and time.perf_counter() < deadline:
+    if not no_offense and not protect_lead and time.perf_counter() < deadline:
         proposals += generate_opportunistic_strike_missions(world, fleet_ratio, deadline, arbiter_fired=arbiter_fired)
+    elif arbiter_turn_lock and not high_value_neutral_block:
+        world.add_debug(f"SKIP_STRIKE_AFTER_ARBITER offensive_ships={world.offensive_ships}")
     # ── 8. Endgame consolidation + final drain ────────── proposals → coordinate_missions
     if world.remaining < ENDGAME_CONSOL_REMAINING and time.perf_counter() < deadline:
         proposals += generate_endgame_consolidation_missions(world)
