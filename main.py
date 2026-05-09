@@ -4732,19 +4732,9 @@ def _find_best_nearest_for_arbiter(world):
     return best
 
 
-def run_tempo_arbiter(world, deadline):
-    """
-    MAIN19_TEMPO_ARBITER: Run after urgent defense, before HV neutral / launchpad chain /
-    opportunistic strike. Ensures an obviously good nearby planet is never skipped.
-
-    Selection rules:
-    - Nearest occupiable (dist<=32, ETA<=18) wins by default.
-    - HV neutral (prod>=4) overrides only when nearest target is low-prod AND HV ETA is
-      comparable AND HV can be held.
-    - Returns empty list if HV neutral should take over (letting the HV layer handle it).
-    - Returns empty list when fleet_ratio > FLEET_RATIO_SOFT (no-panic gate).
-    """
-    if compute_fleet_ratio(world) > FLEET_RATIO_SOFT:
+def run_tempo_arbiter(world, fleet_ratio, deadline):
+    """Prioritise nearest-occupiable capture; yield to HV neutral if clearly better."""
+    if fleet_ratio > FLEET_RATIO_SOFT:
         return []
     if not world.my_planets:
         return []
@@ -4836,14 +4826,12 @@ def run_tempo_arbiter(world, deadline):
     return [prop]
 
 
-def generate_opportunistic_strike_missions(world, deadline):
+def generate_opportunistic_strike_missions(world, fleet_ratio, deadline, arbiter_fired=False):
     """
-    STRIKE_ENEMY_LOW_SHIP_PLANET layer.
     Attacks enemy planets that recently launched fleets and are now thin.
     Only fires when: close enough, fleet_ratio safe, grouped attack flips ownership.
     """
     proposals = []
-    fleet_ratio = compute_fleet_ratio(world)
     if fleet_ratio > FLEET_RATIO_SOFT:
         return proposals
     # Stricter midgame no-panic gate: block opportunistic when fleet ratio is elevated
@@ -4852,8 +4840,9 @@ def generate_opportunistic_strike_missions(world, deadline):
         return proposals
     if not world.enemy_planets or not world.my_planets:
         return proposals
-    # Don't launch enemy strikes when an easy nearby neutral exists (arbiter rule)
-    if world.step < MIDGAME_END_STEP:
+    # Don't launch enemy strikes when an easy nearby neutral exists.
+    # If arbiter already committed a nearby capture this turn, skip re-scanning.
+    if world.step < MIDGAME_END_STEP and not arbiter_fired:
         nearby = _find_best_nearest_for_arbiter(world)
         if nearby is not None:
             near_tgt, _, _, near_score, _ = nearby
@@ -5593,12 +5582,12 @@ def agent(obs, config=None):
         coordinate_missions(world, urgent, moves, fleet_ratio, deadline)
 
     # ── 3b. MAIN19_TEMPO_ARBITER: prioritise nearest-occupiable over HV/chain/strike ──
-    arbiter_fired = False
+    _moves_before_arbiter = len(moves)
     if not threat_planets and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline:
-        arbiter_props = run_tempo_arbiter(world, deadline)
+        arbiter_props = run_tempo_arbiter(world, fleet_ratio, deadline)
         if arbiter_props:
             coordinate_missions(world, arbiter_props, moves, fleet_ratio, deadline)
-            arbiter_fired = True
+    arbiter_fired = len(moves) > _moves_before_arbiter
 
     # ── 4. Production tempo: high-value neutrals ─────────proposals → coordinate_missions
     high_value_neutral_block = False
@@ -5714,7 +5703,7 @@ def agent(obs, config=None):
     if not high_value_neutral_block and not protect_lead and time.perf_counter() < deadline:
         proposals += generate_collapse_missions(world, mode)
     if not high_value_neutral_block and not protect_lead and time.perf_counter() < deadline:
-        proposals += generate_opportunistic_strike_missions(world, deadline)
+        proposals += generate_opportunistic_strike_missions(world, fleet_ratio, deadline, arbiter_fired=arbiter_fired)
     # ── 8. Endgame consolidation + final drain ────────── proposals → coordinate_missions
     if world.remaining < ENDGAME_CONSOL_REMAINING and time.perf_counter() < deadline:
         proposals += generate_endgame_consolidation_missions(world)
