@@ -148,6 +148,15 @@ ARBITER_HV_PROD_OVERRIDE  = 4     # HV neutral must have this prod to override n
 ROTATIONAL_HUB_TTL        = 30    # turns a newly captured planet stays marked as hub
 ROTATIONAL_HUB_REINFORCE_THRESH = 8  # min ships below reserve before hub reinforce fires
 
+# ── start-type-aware opening ──────────────────────────────────────────────────
+LARGE_START_PROD_THRESH   = 4     # prod >= this → LARGE_START
+LARGE_START_RADIUS_THRESH = 6.0   # radius >= this → LARGE_START
+SMALL_START_PROD_THRESH   = 1     # prod <= this → SMALL_START
+SMALL_START_RADIUS_THRESH = 3.5   # radius <= this → SMALL_START
+LARGE_START_STALL_STEP_1  = 15    # LARGE_START: force capture if still 1 planet here
+LARGE_START_STALL_STEP_3  = 35    # LARGE_START: force sweep if < 3 planets here
+SMALL_START_STALL_STEP    = 20    # SMALL_START: force escape if still 1 planet here
+
 # ── breach-kill ───────────────────────────────────────────────────────────────
 BREACH_KILL_DIST    = 45.0
 BREACH_KILL_STEP_MIN = 70
@@ -210,6 +219,7 @@ _backyard_threats: dict = {}      # planet_id -> step when it was first detected
 _midgame_recent_losses: dict = {}     # player -> {planet_id -> step when lost}
 _midgame_infection_sources: dict = {} # player -> {planet_id -> step when local planet was lost}
 _rotational_hubs: dict = {}           # player -> {planet_id -> step when marked as hub}
+_start_type_cache: dict = {}          # player -> "LARGE" | "SMALL" | "MEDIUM"
 
 
 # ── geometry ──────────────────────────────────────────────────────────────────
@@ -3387,6 +3397,131 @@ def _support_source_count(world, tgt, radius=42.0):
     return sum(1 for m in world.my_planets if dp(m, tgt) <= radius and world.surplus(m) > 0)
 
 
+# ── start-type-aware opening ──────────────────────────────────────────────────
+
+def classify_start_type(world):
+    """Classify my starting planet as LARGE / SMALL / MEDIUM based on prod and radius."""
+    for p in world.initial_planets.values():
+        if p.owner == world.player:
+            prod = int(p.production)
+            if prod >= LARGE_START_PROD_THRESH or p.radius >= LARGE_START_RADIUS_THRESH:
+                return "LARGE"
+            if prod <= SMALL_START_PROD_THRESH or p.radius <= SMALL_START_RADIUS_THRESH:
+                return "SMALL"
+            return "MEDIUM"
+    return "MEDIUM"
+
+
+def get_start_type(world):
+    """Cached start-type. Logs classification once per game."""
+    if _start_type_cache.get(world.player) is None:
+        st = classify_start_type(world)
+        _start_type_cache[world.player] = st
+        world.add_debug(f"OPENING_CLASS_{st}_START prod={world.my_planets[0].production if world.my_planets else '?'} step={world.step}")
+    return _start_type_cache[world.player]
+
+
+def start_aware_opening_score_adjustment(world, src, tgt, start_type):
+    """Score delta applied on top of early_target_score during opening (step < 80)."""
+    d = dp(src, tgt)
+    prod = int(tgt.production)
+    need = world.target_need_now(tgt)
+    if need <= 0:
+        need = int(tgt.ships) + 1
+    eta = world.eta(src, tgt, max(1, need))
+
+    if start_type == "LARGE":
+        # Sweep ALL nearby planets quickly — undo prod-1 penalty, reward proximity/cheapness
+        delta = max(0.0, 30.0 - d) * 8.0 + max(0.0, 12.0 - need) * 3.5 + max(0.0, 14.0 - eta) * 4.0
+        if prod <= 1:
+            delta += 60.0  # cancel early_target_score's -50 for prod<=1 and boost further
+        delta += prod * 10.0
+        return delta
+
+    elif start_type == "SMALL":
+        # Escape to economy — strongly prefer high production
+        if prod >= 5:
+            return 200.0
+        if prod >= 4:
+            return 130.0
+        if prod >= 3:
+            return 70.0
+        if prod >= 2:
+            return 30.0
+        if d <= 20.0 and need <= 8:
+            return 25.0  # cheap close stepping stone is acceptable
+        return -40.0     # additional penalty for prod-1 far targets
+
+    else:  # MEDIUM
+        return 20.0 if prod >= 3 and d <= 28.0 else 0.0
+
+
+def _force_nearest_opening_capture(world, moves, label="LARGE_START_NEAREST_SELECTED"):
+    """Force-capture the nearest safe neutral, bypassing validate_initial_target_choice."""
+    if not world.my_planets or not world.neutral_planets:
+        return False
+    src = min(world.my_planets, key=lambda p: -world.surplus(p), default=None)
+    if src is None:
+        return False
+    available = int(src.ships) - world.committed.get(src.id, 0) - 1
+    candidates = sorted(
+        [t for t in world.neutral_planets if not world.is_comet(t)],
+        key=lambda t: dp(src, t),
+    )
+    for tgt in candidates[:8]:
+        d = dp(src, tgt)
+        enemy_d = min((dp(e, tgt) for e in world.enemy_planets), default=999.0)
+        if enemy_d < d - 5.0:
+            continue
+        need = world.target_need_now(tgt)
+        if need <= 0 or need > available:
+            continue
+        eta = world.eta(src, tgt, need)
+        if eta > 55:
+            continue
+        if world.commit(src, tgt, need, moves, mission_type="CAPTURE_NEUTRAL"):
+            world.add_debug(
+                f"{label} p{tgt.id} prod={int(tgt.production)} d={d:.1f} eta={eta:.1f} need={need}"
+            )
+            world.wave_attempted = True
+            return True
+    return False
+
+
+def _force_best_escape_capture(world, moves):
+    """SMALL_START: force-capture nearest high-prod planet or cheapest stepping stone."""
+    if not world.my_planets or not world.neutral_planets:
+        return False
+    src = world.my_planets[0]
+    available = int(src.ships) - world.committed.get(src.id, 0) - 1
+    candidates = []
+    for tgt in world.neutral_planets:
+        if world.is_comet(tgt):
+            continue
+        d = dp(src, tgt)
+        enemy_d = min((dp(e, tgt) for e in world.enemy_planets), default=999.0)
+        if enemy_d < d - 5.0:
+            continue
+        need = world.target_need_now(tgt)
+        if need <= 0 or need > available:
+            continue
+        eta = world.eta(src, tgt, need)
+        if eta > 55:
+            continue
+        score = int(tgt.production) * 100.0 - d * 1.5 - need * 2.0
+        candidates.append((score, tgt, need, eta, d))
+    if not candidates:
+        return False
+    candidates.sort(key=lambda x: -x[0])
+    _, tgt, need, eta, d = candidates[0]
+    label = "SMALL_START_ESCAPE_TARGET" if int(tgt.production) >= 2 else "SMALL_START_STEPPING_STONE"
+    if world.commit(src, tgt, need, moves, mission_type="CAPTURE_NEUTRAL"):
+        world.add_debug(f"{label} p{tgt.id} prod={int(tgt.production)} d={d:.1f} eta={eta:.1f}")
+        world.wave_attempted = True
+        return True
+    return False
+
+
 def early_target_score(world, src, tgt):
     """Composite early-game score for a (src→tgt) pair. Higher is better."""
     if tgt.id in world.comet_ids:
@@ -3467,6 +3602,10 @@ def early_target_score(world, src, tgt):
     elif status == "ENEMY_FAVORED":
         score -= 60.0 if prod < 4 else 20.0
 
+    # Start-type-aware adjustment (opening only)
+    if world.step < 80 and world.my_planets:
+        score += start_aware_opening_score_adjustment(world, src, tgt, get_start_type(world))
+
     return score
 
 
@@ -3500,6 +3639,10 @@ def validate_initial_target_choice(world, src, tgt):
         if better:
             world.add_debug(f"VALIDATE_REJECT p{tgt.id} reason=prod1_skip_prod3_available")
             return False
+    # LARGE_START: accept all nearby non-comet non-enemy-side planets (local sweep)
+    if world.step < 80 and d <= 35.0 and world.my_planets:
+        if get_start_type(world) == "LARGE":
+            return True  # bypass remaining prod/race filters
     # Skip enemy-favored low-production neutrals early game
     if world.step < 100 and prod < 4:
         status, _, _ = neutral_race_status(world, tgt)
@@ -3752,6 +3895,18 @@ def first_capture_360(world, moves):
     if not world.neutral_planets:
         return False
 
+    # Anti-stall: force a capture before normal scoring if start type demands it
+    if world.my_planets:
+        st = get_start_type(world)
+        if st == "LARGE" and world.step >= LARGE_START_STALL_STEP_1 and len(world.my_planets) == 1:
+            world.add_debug(f"OPENING_FORCE_LOCAL_SWEEP step={world.step} planets=1")
+            if _force_nearest_opening_capture(world, moves):
+                return True
+        elif st == "SMALL" and world.step >= SMALL_START_STALL_STEP and len(world.my_planets) == 1:
+            world.add_debug(f"OPENING_FORCE_BIG_PLANET_ESCAPE step={world.step} planets=1")
+            if _force_best_escape_capture(world, moves):
+                return True
+
     result = choose_best_opening_target(world)
     if result is None:
         return False
@@ -3785,6 +3940,14 @@ def early_nearest_expansion_360(world, moves):
         return False
     if not world.neutral_planets:
         return False
+
+    # LARGE_START anti-stall: if stuck with <3 planets past step 35, force local sweep
+    if world.my_planets:
+        st = get_start_type(world)
+        if st == "LARGE" and world.step >= LARGE_START_STALL_STEP_3 and len(world.my_planets) < 3:
+            world.add_debug(f"OPENING_FORCE_LOCAL_SWEEP step={world.step} planets={len(world.my_planets)}")
+            if _force_nearest_opening_capture(world, moves, label="LARGE_START_LOCAL_SWEEP"):
+                return True
 
     candidates = []
     for src in world.my_planets:
@@ -5513,6 +5676,7 @@ def agent(obs, config=None):
         _midgame_recent_losses[world.player] = {}
         _midgame_infection_sources[world.player] = {}
         _rotational_hubs[world.player] = {}
+        _start_type_cache[world.player] = None
         _recently_reinforced[world.player] = {}
         _doomed_owned_targets[world.player] = {}
     last_meaningful = agent._last_meaningful.get(world.player, world.step)
