@@ -200,6 +200,16 @@ ENEMY_GATE_MAX_MY_PCT      = 0.28  # max my_pct below which "neutrals remain" ru
 ENEMY_GATE_WEAK_SHIPS      = 12    # <= this ships → "very weak" enemy (neutrals-remain rule)
 ENEMY_GATE_WEAK_LOCAL      = 15    # <= this ships → "weak" for LOCAL_SWEEP phase rule
 
+# ── always-on capture opportunity engine ──────────────────────────────────────
+CAPTURE_OPP_MAX_DIST      = 55.0  # max cluster_distance to scan for opportunities
+CAPTURE_OPP_MAX_ETA       = 30.0  # max ETA for an opportunity candidate
+CAPTURE_OPP_MIN_SCORE     = -60.0 # discard opportunities below this score
+CAPTURE_OPP_MAX_PROPOSALS = 5     # max proposals returned per turn
+CAPTURE_OPP_DRAINED_DROP  = 10    # ship drop (vs expected) to count as recently drained
+# Soft-priority penalties (never hard-blocks); lower absolute value = gentler deduction
+CAPTURE_OPP_4P_EARLY_PEN  = 18.0  # 4-player + early + non-backyard enemy
+CAPTURE_OPP_NEUTRAL_PEN   = 15.0  # many neutrals remain + enemy + not urgent
+
 # ── 4-player ──────────────────────────────────────────────────────────────────
 FOUR_P_ATTACK_STEP = 80
 FOUR_P_EXPAND_STEP = 100
@@ -1395,13 +1405,11 @@ def should_allow_enemy_attack(world, target, mission_type, reason=""):
       1. Always block comets.
       2. Always allow: backyard, recently-mine, actively-threatening, RECAPTURE_LOST,
          FINISH_ZERO_CAPTURE, enemy has <= 3 planets (collapse possible).
-      3. 4-player: block if my_pct < ENEMY_GATE_4P_MIN_PCT and not under threat.
-      4. Many neutrals remain (neutral_pct > 0.35, my_pct < 0.28): allow only
-         very-weak adjacent guaranteed captures.
-      5. Easy nearby neutral exists: block unless enemy is clearly better and local.
-      6. LOCAL_SWEEP phase: block unless weak + frontier + guaranteed hold.
-      7. EXPANSION_CONTROL phase: require in-front + guaranteed hold + safe ratio.
-      8. CONTACT / COLLAPSE: require safe fleet ratio + holdable capture.
+      3. Hard cap: fleet ratio > FLEET_RATIO_HARD → block.
+      4. Not holdable AND far from cluster → block.
+
+    Phase, 4-player context, and neutral count are NO LONGER hard blocks here;
+    they act as soft score penalties in capture_opportunity_score() instead.
     """
     # Sanity: gate should only be called for enemy-owned targets
     if target.owner in (-1, world.player):
@@ -1410,7 +1418,7 @@ def should_allow_enemy_attack(world, target, mission_type, reason=""):
         world.add_debug(f"ENEMY_ATTACK_BLOCK comet p{target.id}")
         return False
 
-    # ── Rule 2: unconditional allows ─────────────────────────────────────────
+    # ── Always-allow shortcuts ────────────────────────────────────────────────
     if mission_type in ("RECAPTURE_LOST", "FINISH_ZERO_CAPTURE"):
         world.add_debug(f"ENEMY_ATTACK_ALLOWED reason={mission_type} target=p{target.id}")
         return True
@@ -1438,95 +1446,35 @@ def should_allow_enemy_attack(world, target, mission_type, reason=""):
         )
         return True
 
-    # ── Shared values ─────────────────────────────────────────────────────────
-    my_pct, _enemy_pct, neutral_pct = compute_control_pct(world)
-    ctrl_phase   = classify_strategic_phase(world)
-    fleet_ratio  = compute_fleet_ratio(world)
-    src          = min(world.my_planets, key=lambda p: dp(p, target), default=None)
-    cluster_d    = world.cluster_distance(target)
-    pool         = sum(world.surplus(p) for p in world.my_planets)
-    need         = world.ships_needed_to_capture(src, target, pool) if src else pool + 1
-    eta          = world.eta(src, target, max(1, need)) if src else 999.0
-    can_capture  = src is not None and 0 < need <= pool
-    can_hold     = world.can_hold_after_capture(target, eta, need) if can_capture else False
+    # ── True safety stops only (no phase/4p/neutral hard-blocks) ─────────────
+    # Phase, 4-player context, and neutral count are soft penalties in the
+    # scoring layer (capture_opportunity_score), NOT hard gates here.
+    fleet_ratio = compute_fleet_ratio(world)
+    src         = min(world.my_planets, key=lambda p: dp(p, target), default=None)
+    cluster_d   = world.cluster_distance(target)
+    pool        = sum(world.surplus(p) for p in world.my_planets)
+    need        = world.ships_needed_to_capture(src, target, pool) if src else pool + 1
+    eta         = world.eta(src, target, max(1, need)) if src else 999.0
+    can_capture = src is not None and 0 < need <= pool
+    can_hold    = world.can_hold_after_capture(target, eta, need) if can_capture else False
 
-    # ── Rule 3: 4-player low-control block ───────────────────────────────────
-    if world.is_four_player and my_pct < ENEMY_GATE_4P_MIN_PCT:
-        if not any(world.real_incoming_threat(p)["deficit"] > 0 for p in world.my_planets):
-            world.add_debug(
-                f"ENEMY_ATTACK_BLOCK_LOW_CONTROL target=p{target.id} "
-                f"my_pct={my_pct:.2f} threshold={ENEMY_GATE_4P_MIN_PCT}"
-            )
-            return False
-
-    # ── Rule 4: many neutrals remain ─────────────────────────────────────────
-    if neutral_pct > ENEMY_GATE_NEUTRAL_PCT and my_pct < ENEMY_GATE_MAX_MY_PCT:
-        is_very_weak = int(target.ships) <= ENEMY_GATE_WEAK_SHIPS
-        is_adjacent  = cluster_d <= MIDGAME_FRONT_RADIUS
-        if not (is_very_weak and is_adjacent and can_capture and can_hold):
-            world.add_debug(
-                f"ENEMY_ATTACK_BLOCK_NEUTRALS_REMAIN target=p{target.id} "
-                f"neutral_pct={neutral_pct:.2f} weak={is_very_weak} adj={is_adjacent} "
-                f"hold={can_hold}"
-            )
-            return False
-
-    # ── Rule 5: easy nearby neutral exists ───────────────────────────────────
-    nearby_result = _find_best_nearest_for_arbiter(world)
-    if nearby_result is not None:
-        near_tgt, _, _, near_score, _ = nearby_result
-        if near_tgt.owner == -1 and (int(near_tgt.production) >= 2 or near_score > 50):
-            near_cluster_d  = world.cluster_distance(near_tgt)
-            clearly_better  = (
-                int(target.production) > int(near_tgt.production) + 1
-                or (cluster_d < near_cluster_d and int(target.ships) <= ENEMY_GATE_WEAK_SHIPS)
-            )
-            locally_reachable = cluster_d <= MIDGAME_FRONT_RADIUS
-            if not (clearly_better and locally_reachable):
-                world.add_debug(
-                    f"ENEMY_ATTACK_BLOCK_EASY_NEUTRAL_EXISTS target=p{target.id} "
-                    f"near=p{near_tgt.id}(prod={int(near_tgt.production)}) "
-                    f"better={clearly_better} reachable={locally_reachable}"
-                )
-                return False
-
-    # ── Rule 6: LOCAL_SWEEP phase ─────────────────────────────────────────────
-    if ctrl_phase == ControlPhase.LOCAL_SWEEP:
-        is_weak     = int(target.ships) <= ENEMY_GATE_WEAK_LOCAL
-        is_frontier = cluster_d <= FRONTLINE_DIST + 10
-        guaranteed  = can_capture and can_hold
-        if not (is_weak and is_frontier and guaranteed):
-            world.add_debug(
-                f"ENEMY_ATTACK_BLOCK_PHASE phase={ctrl_phase} target=p{target.id} "
-                f"weak={is_weak} frontier={is_frontier} guaranteed={guaranteed}"
-            )
-            return False
-
-    # ── Rule 7: EXPANSION_CONTROL phase ──────────────────────────────────────
-    if ctrl_phase == ControlPhase.EXPANSION_CONTROL:
-        in_front   = cluster_d <= MIDGAME_FRONT_RADIUS
-        ratio_safe = fleet_ratio <= FLEET_RATIO_SOFT
-        if not (in_front and can_capture and can_hold and ratio_safe):
-            world.add_debug(
-                f"ENEMY_ATTACK_BLOCK_PHASE phase={ctrl_phase} target=p{target.id} "
-                f"in_front={in_front} can_hold={can_hold} ratio={fleet_ratio:.2f}"
-            )
-            return False
-
-    # ── Rule 8: CONTACT / COLLAPSE — fleet ratio + holdability ───────────────
-    if fleet_ratio > FLEET_RATIO_SOFT:
+    if fleet_ratio > FLEET_RATIO_HARD:
         world.add_debug(
             f"ENEMY_ATTACK_BLOCK_FLEET_RATIO target=p{target.id} ratio={fleet_ratio:.2f}"
         )
         return False
 
-    if can_capture and not can_hold:
-        world.add_debug(f"ENEMY_ATTACK_BLOCK_NOT_HOLDABLE target=p{target.id} eta={eta:.1f}")
+    # Only block "not holdable" when the target is far from cluster — nearby
+    # captures may still be worthwhile for backyard/territory even with thin hold.
+    if can_capture and not can_hold and cluster_d > MIDGAME_FRONT_RADIUS:
+        world.add_debug(
+            f"ENEMY_ATTACK_BLOCK_NOT_HOLDABLE target=p{target.id} "
+            f"eta={eta:.1f} cluster_d={cluster_d:.1f}"
+        )
         return False
 
     world.add_debug(
-        f"ENEMY_ATTACK_ALLOWED reason={reason or 'standard'} target=p{target.id} "
-        f"phase={ctrl_phase}"
+        f"ENEMY_ATTACK_ALLOWED reason={reason or 'standard'} target=p{target.id}"
     )
     return True
 
@@ -6062,6 +6010,288 @@ def generate_midgame_control_missions(world, mg_state, front_planet, fleet_ratio
     return proposals
 
 
+# ── always-on capture opportunity engine ─────────────────────────────────────
+
+def should_allow_capture_opportunity(world, target, mission_type):
+    """
+    Permissive capture gate for the always-on opportunity engine.
+
+    Hard-blocks ONLY when a capture is genuinely impossible or unsafe:
+      - comet target
+      - fleet ratio at hard cap
+      - no safe surplus anywhere
+      - cannot capture with available pool
+      - absurdly far from cluster
+      - not holdable AND far from cluster AND no urgent reason
+
+    Phase, step count, 4-player context, and neutral-planet count are
+    NEVER hard blocks here — they become score penalties in
+    capture_opportunity_score() so the ranker demotes but does not veto.
+
+    Returns (allowed: bool, reason: str).
+    """
+    if world.is_comet(target):
+        world.add_debug(f"CAPTURE_REJECT_COMET p{target.id}")
+        return False, "comet"
+    if target.owner == world.player:
+        return False, "already_mine"
+
+    fleet_ratio = compute_fleet_ratio(world)
+    if fleet_ratio > FLEET_RATIO_HARD:
+        world.add_debug(f"CAPTURE_REJECT_FLEET_RATIO target=p{target.id} ratio={fleet_ratio:.2f}")
+        return False, f"fleet_ratio={fleet_ratio:.2f}"
+
+    src = min(world.my_planets, key=lambda p: dp(p, target), default=None)
+    if src is None:
+        return False, "no_source"
+
+    safe_pool = sum(
+        world.surplus(p) for p in world.my_planets
+        if world.real_incoming_threat(p)["deficit"] <= 0
+    )
+    if safe_pool < MIN_SEND_SHIPS:
+        world.add_debug(f"CAPTURE_REJECT_NO_SAFE_SOURCE target=p{target.id} pool={safe_pool}")
+        return False, "no_safe_surplus"
+
+    pool = sum(world.surplus(p) for p in world.my_planets)
+    need = world.ships_needed_to_capture(src, target, pool)
+    if need <= 0 or pool < need:
+        return False, f"uncapturable pool={pool} need={need}"
+
+    cluster_d = world.cluster_distance(target)
+    if cluster_d > CAPTURE_OPP_MAX_DIST:
+        world.add_debug(f"CAPTURE_REJECT_TOO_FAR target=p{target.id} cluster_d={cluster_d:.1f}")
+        return False, f"too_far cluster_d={cluster_d:.1f}"
+
+    eta = world.eta(src, target, need)
+    if target.owner not in (-1, world.player):
+        can_hold = world.can_hold_after_capture(target, eta, need)
+        if not can_hold and cluster_d > MIDGAME_FRONT_RADIUS:
+            world.add_debug(
+                f"CAPTURE_REJECT_NOT_HOLDABLE target=p{target.id} "
+                f"cluster_d={cluster_d:.1f} eta={eta:.1f}"
+            )
+            return False, "not_holdable_far"
+
+    return True, "ok"
+
+
+def capture_opportunity_score(world, target, src, need, eta, fleet_ratio):
+    """
+    Score a capture opportunity. Higher = more attractive.
+
+    Phase, 4-player, and neutral count act as soft deductions, never vetoes.
+    Enemy planets receive bonuses for weakness, drain, proximity, and strategic value.
+    """
+    prod      = int(target.production)
+    ships     = int(target.ships)
+    cluster_d = world.cluster_distance(target)
+    is_enemy  = target.owner not in (-1, world.player)
+    arrival   = max(1, int(math.ceil(eta)))
+    future    = max(1, world.remaining - arrival)
+
+    s = 0.0
+
+    # ── Core value ────────────────────────────────────────────────────────────
+    s += prod * 22.0                          # production gain
+    s += prod * future * 0.35                 # future production value
+    s -= need * 1.4                           # ship investment cost
+    s -= eta  * 6.0                           # time cost
+    s -= cluster_d * 0.5                      # distance from cluster
+
+    # ── Enemy-specific bonuses ────────────────────────────────────────────────
+    if is_enemy:
+        s += prod * 18.0                      # weakens opponent production
+
+        if ships <= ENEMY_GATE_WEAK_LOCAL:    # nearby weak target
+            s += 28.0
+            world.add_debug(f"ENEMY_CAPTURE_NEAR_WEAK target=p{target.id} ships={ships}")
+
+        prev = _prev_ships.get(target.id)     # recently drained
+        if prev is not None:
+            drop = (prev + prod) - ships
+            if drop >= CAPTURE_OPP_DRAINED_DROP:
+                s += 35.0
+                world.add_debug(f"ENEMY_CAPTURE_RECENTLY_DRAINED target=p{target.id} drop={drop}")
+
+        if is_in_my_backyard(world, target):  # inside my territory
+            s += 50.0
+            world.add_debug(f"ENEMY_CAPTURE_BACKYARD target=p{target.id}")
+        elif cluster_d <= MIDGAME_FRONT_RADIUS:
+            s += 22.0
+            world.add_debug(f"ENEMY_CAPTURE_FRONTIER target=p{target.id} d={cluster_d:.1f}")
+
+        if any(                               # actively threatening my cluster
+            dp(m, target) <= BACKYARD_THREAT_DIST
+            and world.real_incoming_threat(m)["deficit"] > 0
+            for m in world.my_planets
+        ):
+            s += 40.0
+
+        if len(world.enemy_planets) <= 5:     # collapsing opponent
+            s += 25.0 + max(0, 5 - len(world.enemy_planets)) * 8.0
+
+        if target.owner == world.leader:      # leader planet
+            s += 15.0
+
+    # ── Holdability ───────────────────────────────────────────────────────────
+    can_hold = world.can_hold_after_capture(target, eta, need)
+    s += 18.0 if can_hold else -30.0
+
+    # ── Bridge / route-fill ───────────────────────────────────────────────────
+    if is_bridge_planet(world, target):
+        s += 22.0
+
+    # ── Anti-waiting: bonus when bot owns few planets ─────────────────────────
+    if len(world.my_planets) < 4:
+        s += 20.0                             # aggressively expand with few planets
+
+    # ── Soft deductions (priority reduction, never veto) ─────────────────────
+    my_pct, _, neutral_pct = compute_control_pct(world)
+
+    # 4-player early game: slight de-priority for non-urgent enemy attacks
+    if (world.is_four_player and world.step < FOUR_P_ATTACK_STEP
+            and is_enemy and not is_in_my_backyard(world, target)):
+        s -= CAPTURE_OPP_4P_EARLY_PEN
+
+    # Many neutrals remain: slight de-priority for enemy vs neutral preference
+    if (neutral_pct > ENEMY_GATE_NEUTRAL_PCT
+            and my_pct < ENEMY_GATE_MAX_MY_PCT
+            and is_enemy):
+        s -= CAPTURE_OPP_NEUTRAL_PEN
+
+    # Fleet ratio approaching soft cap
+    ratio_over = max(0.0, fleet_ratio - FLEET_RATIO_SOFT * 0.75)
+    s -= ratio_over * 55.0
+
+    return s
+
+
+def find_capture_opportunities(world, fleet_ratio, deadline):
+    """
+    Always-on capture opportunity engine.  Runs every turn after urgent actions.
+    Evaluates BOTH neutral and enemy planets as capture targets with no blanket
+    phase/step/4-player/neutral-count hard-blocks.
+
+    Returns a list of MissionProposal objects sorted by capture_opportunity_score.
+    Uses should_allow_capture_opportunity() for gating (permissive, safety-only).
+    """
+    proposals = []
+    if not world.my_planets:
+        return proposals
+    if fleet_ratio > FLEET_RATIO_SOFT:
+        return proposals
+
+    world.add_debug(
+        f"CAPTURE_OPPORTUNITY_SCAN step={world.step} "
+        f"neutrals={len(world.neutral_planets)} enemies={len(world.enemy_planets)} "
+        f"my_planets={len(world.my_planets)} fleet_ratio={fleet_ratio:.2f}"
+    )
+
+    pool = sum(world.surplus(p) for p in world.my_planets)
+    all_targets = [
+        t for t in world.normal_planets
+        if t.owner != world.player and not world.is_comet(t)
+    ]
+
+    scored: list = []
+    for target in all_targets:
+        if time.perf_counter() > deadline:
+            break
+
+        # Skip if already sufficiently covered by incoming fleets
+        src = min(world.my_planets, key=lambda p: dp(p, target), default=None)
+        if src is None:
+            continue
+        if world.incoming_to_targets.get(target.id, 0) >= world.required_ships_to_capture(target, src):
+            continue
+
+        allowed, gate_reason = should_allow_capture_opportunity(
+            world, target,
+            "CAPTURE_NEUTRAL" if target.owner == -1 else "SYNC_ATTACK",
+        )
+        if not allowed:
+            continue
+
+        need = world.ships_needed_to_capture(src, target, pool)
+        if need <= 0 or pool < need:
+            continue
+        eta = world.eta(src, target, need)
+        if eta > CAPTURE_OPP_MAX_ETA:
+            continue
+
+        score = capture_opportunity_score(world, target, src, need, eta, fleet_ratio)
+        if score < CAPTURE_OPP_MIN_SCORE:
+            world.add_debug(
+                f"CAPTURE_OPPORTUNITY_DEFER target=p{target.id} score={score:.1f}"
+            )
+            continue
+
+        scored.append((score, target, src, need, eta))
+
+    scored.sort(key=lambda x: -x[0])
+
+    seen: set = set()
+    for score, target, primary_src, need, eta in scored:
+        if time.perf_counter() > deadline:
+            break
+        if target.id in seen or len(proposals) >= CAPTURE_OPP_MAX_PROPOSALS:
+            break
+
+        is_enemy  = target.owner not in (-1, world.player)
+        mtype     = "CAPTURE_NEUTRAL" if target.owner == -1 else "SYNC_ATTACK"
+
+        candidate_srcs = sorted(
+            [p for p in world.my_planets
+             if world.surplus(p) >= MIN_SEND_SHIPS
+             and world.real_incoming_threat(p)["deficit"] <= 0
+             and p.id not in world.backyard_locked_sources
+             and dp(p, target) <= CAPTURE_OPP_MAX_DIST + 8],
+            key=lambda p: (dp(p, target), -world.surplus(p)),
+        )[:MAX_GROUP_SOURCES]
+
+        if not candidate_srcs:
+            world.add_debug(f"CAPTURE_REJECT_NO_SAFE_SOURCE target=p{target.id}")
+            continue
+
+        prop = build_capture_plan(
+            world, target, mtype, candidate_srcs,
+            max_sources=min(4, len(candidate_srcs)),
+            eta_spread_limit=3.0 if target.owner == -1 else 6.0,
+        )
+        if prop is None:
+            continue
+
+        prop.priority = 78.0 + score * 0.28
+
+        # Emit context-specific debug markers for enemy captures
+        if is_enemy:
+            neutral_pct = len(world.neutral_planets) / max(1, len(world.normal_planets))
+            if world.is_four_player and world.step < FOUR_P_ATTACK_STEP:
+                world.add_debug(
+                    f"ENEMY_CAPTURE_ALLOWED_EARLY target=p{target.id} "
+                    f"score={score:.1f} ships={int(target.ships)}"
+                )
+            if neutral_pct > ENEMY_GATE_NEUTRAL_PCT:
+                world.add_debug(
+                    f"ENEMY_CAPTURE_OVERRIDE_NEUTRAL_BLOCK target=p{target.id} "
+                    f"neutral_pct={neutral_pct:.2f} score={score:.1f}"
+                )
+
+        world.add_debug(
+            f"CAPTURE_OPPORTUNITY_ALLOWED target=p{target.id} "
+            f"{'enemy' if is_enemy else 'neutral'} score={score:.1f} "
+            f"need={prop.required_ships} eta={prop.eta_max:.1f} "
+            f"d={world.cluster_distance(target):.1f}"
+        )
+        world.add_debug(f"CAPTURE_SELECTED target=p{target.id} score={score:.1f} pri={prop.priority:.1f}")
+
+        proposals.append(prop)
+        seen.add(target.id)
+
+    return proposals
+
+
 # ── bridge planet helpers ─────────────────────────────────────────────────────
 
 def is_bridge_planet(world, planet):
@@ -6557,6 +6787,15 @@ def agent(obs, config=None):
     if arbiter_turn_lock:
         world.add_debug(f"ARBITER_TURN_LOCK active offensive_ships={world.offensive_ships}")
 
+    # ── 3.5. Always-on capture opportunity engine (pre-search path only) ──────
+    # In midgame (search_active=True) the engine feeds into the search pool below.
+    # Here it runs unconditionally during opening / 4-player / any early step so
+    # the bot never sits idle while capturable planets exist.
+    if not search_active and not threat_planets and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline:
+        opp_props = find_capture_opportunities(world, fleet_ratio, deadline)
+        if opp_props and time.perf_counter() < deadline:
+            coordinate_missions(world, opp_props, moves, fleet_ratio, deadline)
+
     # ── 4. Production tempo: high-value neutrals ─────────proposals → coordinate_missions
     high_value_neutral_block = False
     hv_props = []
@@ -6681,6 +6920,12 @@ def agent(obs, config=None):
 
         # ── Collect offensive proposals for beam-search ───────────────────────
         search_pool: list = []
+
+        # Always-on capture opportunity engine feeds into the search pool.
+        # This ensures the engine runs at all steps >= 55, with the search planner
+        # ranking its candidates alongside the existing generators.
+        if not no_offense and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline:
+            search_pool += find_capture_opportunities(world, fleet_ratio, deadline)
 
         if not mg_blocked and cluster_stab >= MIDGAME_STABILITY_THRESHOLD:
             if (mg_active and mg_state is not None
