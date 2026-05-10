@@ -7,7 +7,7 @@ Fleet:   Fleet(id, owner, x, y, angle, from_planet_id, ships)
 
 Decision order each turn (agent()):
   1. Emergency defense (immediate threat response)
-  2. Backyard recapture / containment
+  2. Cheap recent-loss recapture / counterattack
   3. Finish-zero / save-under-attack / fall-recapture / doomed evacuation
   4. Local high-production neutral capture / neutral races
   5. Missed-neutral force (stuck detector)
@@ -148,6 +148,10 @@ ARBITER_HV_PROD_OVERRIDE  = 4     # HV neutral must have this prod to override n
 ROTATIONAL_HUB_TTL        = 30    # turns a newly captured planet stays marked as hub
 ROTATIONAL_HUB_REINFORCE_THRESH = 8  # min ships below reserve before hub reinforce fires
 
+# ── planet radius roles ───────────────────────────────────────────────────────
+SMALL_RADIUS  = 1.2
+LARGE_RADIUS  = 2.3
+
 # ── start-type-aware opening ──────────────────────────────────────────────────
 LARGE_START_PROD_THRESH   = 4     # prod >= this → LARGE_START (primary)
 LARGE_START_RADIUS_THRESH = 2.4   # radius >= this → LARGE_START (tie-breaker; was 6.0)
@@ -201,11 +205,10 @@ PHASE_EXPAND_PCT   = 0.45   # my control below this → EXPANSION_CONTROL
 BRIDGE_RELAY_DIST   = 50.0  # max distance from bridge to next useful capture target
 BRIDGE_MIN_SHORTCUT = 0.15  # bridge must shorten direct route by at least this fraction
 
-# ── enemy-attack gate ─────────────────────────────────────────────────────────
-ENEMY_GATE_4P_MIN_PCT      = 0.20  # 4-player: block enemy attacks until my_pct >= this
-ENEMY_GATE_NEUTRAL_PCT     = 0.35  # neutral_pct above which neutrals take priority
-ENEMY_GATE_MAX_MY_PCT      = 0.28  # max my_pct below which "neutrals remain" rule fires
-ENEMY_GATE_WEAK_SHIPS      = 12    # <= this ships → "very weak" enemy (neutrals-remain rule)
+# ── enemy-attack scoring nudges ──────────────────────────────────────────────
+ENEMY_GATE_NEUTRAL_PCT     = 0.35  # neutral density where enemy attacks get a soft score penalty
+ENEMY_GATE_MAX_MY_PCT      = 0.28  # my control below which neutrals are softly preferred
+ENEMY_GATE_WEAK_SHIPS      = 12    # <= this ships → very weak enemy
 ENEMY_GATE_WEAK_LOCAL      = 15    # <= this ships → "weak" for LOCAL_SWEEP phase rule
 
 # ── always-on capture opportunity engine ──────────────────────────────────────
@@ -214,13 +217,16 @@ CAPTURE_OPP_MAX_ETA       = 30.0  # max ETA for an opportunity candidate
 CAPTURE_OPP_MIN_SCORE     = -60.0 # discard opportunities below this score
 CAPTURE_OPP_MAX_PROPOSALS = 5     # max proposals returned per turn
 CAPTURE_OPP_DRAINED_DROP  = 10    # ship drop (vs expected) to count as recently drained
-# Soft-priority penalties (never hard-blocks); lower absolute value = gentler deduction
-CAPTURE_OPP_4P_EARLY_PEN  = 18.0  # 4-player + early + non-backyard enemy
+# Soft-priority penalties; lower absolute value = gentler deduction
+CAPTURE_OPP_4P_EARLY_PEN  = 18.0  # 4-player + early + non-local enemy
 CAPTURE_OPP_NEUTRAL_PEN   = 15.0  # many neutrals remain + enemy + not urgent
 
 # ── 4-player ──────────────────────────────────────────────────────────────────
 FOUR_P_ATTACK_STEP = 80
 FOUR_P_EXPAND_STEP = 100
+FOUR_P_CORNER_STRATEGY_STEP_MAX = 220
+FOUR_P_CORNER_LOCAL_DIST = 48.0
+FOUR_P_ADJACENT_BRIDGE_DIST = 58.0
 
 # ── midgame control ───────────────────────────────────────────────────────────
 MIDGAME_START_STEP          = 55     # first step where MIDGAME_CONTROL is active
@@ -290,6 +296,7 @@ _wave_reservation = {
 _prev_owners: dict = {}           # planet_id -> owner at start of previous turn
 _prev_ships: dict = {}            # planet_id -> ship count at start of previous turn
 _rotational_hubs: dict = {}           # player -> {planet_id -> step when marked as hub}
+_primary_launchpads: dict = {}        # player -> {planet_id -> step when marked as launchpad}
 _start_type_cache: dict = {}          # player -> "LARGE" | "SMALL" | "MEDIUM"
 
 
@@ -387,6 +394,82 @@ def fleet_target(fl, targets, ang_vel):
 def is_idle(p):
     """True when planet does not orbit the sun."""
     return dist(p.x, p.y, SUN_X, SUN_Y) + p.radius >= ROTATION_LIMIT
+
+
+def radius_class(p):
+    if p.radius <= SMALL_RADIUS:
+        return "SMALL"
+    if p.radius >= LARGE_RADIUS:
+        return "LARGE"
+    return "MEDIUM"
+
+
+def is_static_planet(p):
+    return is_idle(p)
+
+
+def is_storage_planet(p):
+    return radius_class(p) == "SMALL"
+
+
+def _corner_index_for_planet(p):
+    """Return a stable 0..3 corner index using the sun/map center as origin."""
+    right = p.x >= SUN_X
+    lower = p.y >= SUN_Y
+    if right and lower:
+        return 0
+    if not right and lower:
+        return 1
+    if not right and not lower:
+        return 2
+    return 3
+
+
+def _my_start_corner_index(world):
+    start = next((p for p in world.initial_planets.values() if p.owner == world.player), None)
+    if start is None:
+        start = world.my_planets[0] if world.my_planets else None
+    return _corner_index_for_planet(start) if start is not None else 0
+
+
+def classify_corner_zone(world, planet):
+    start_idx = _my_start_corner_index(world)
+    idx = _corner_index_for_planet(planet)
+    diff = (idx - start_idx) % 4
+    if diff == 0:
+        zone = "my_start_corner"
+    elif diff == 1:
+        zone = "clockwise_adjacent_corner"
+    elif diff == 3:
+        zone = "counterclockwise_adjacent_corner"
+    else:
+        zone = "opposite_corner"
+    seen = getattr(world, "_corner_debug_seen", set())
+    key = (planet.id, zone)
+    if key not in seen:
+        world.add_debug(f"CORNER_ZONE_CLASSIFIED p{planet.id} zone={zone}")
+        seen.add(key)
+        world._corner_debug_seen = seen
+    return zone
+
+
+def _is_corner_control_target(world, target):
+    if target is None or not world.is_four_player or world.is_comet(target):
+        return False
+    zone = classify_corner_zone(world, target)
+    if zone == "my_start_corner" and radius_class(target) in ("MEDIUM", "LARGE"):
+        return True
+    if zone in ("clockwise_adjacent_corner", "counterclockwise_adjacent_corner"):
+        return radius_class(target) in ("MEDIUM", "LARGE")
+    if zone == "opposite_corner":
+        return (
+            radius_class(target) in ("MEDIUM", "LARGE")
+            and (
+                _adjacent_corner_secured(world, "clockwise_adjacent_corner")
+                and _adjacent_corner_secured(world, "counterclockwise_adjacent_corner")
+            )
+        )
+    return False
 
 
 # ── neutral race classifier ────────────────────────────────────────────────────
@@ -1056,7 +1139,12 @@ class WorldModel:
     def reserve_for(self, p):
         if hasattr(self, "keep_needed_map") and p.id in self.keep_needed_map:
             cap = max(20, int(p.ships * 0.55))
-            return min(int(self.keep_needed_map[p.id]), cap)
+            keep = int(self.keep_needed_map[p.id])
+            if is_storage_planet(p):
+                keep = max(keep, int(p.ships * 0.65), 6 + int(p.production) * 2)
+                self.add_debug(f"SMALL_STORAGE_RESERVE_HELD p{p.id} reserve={keep}")
+                return keep
+            return min(keep, cap)
         if self.step < EARLY_STEPS:
             base = min(3, 1 + int(p.production))
         elif self.step < LATE_GAME_STEPS:
@@ -1069,7 +1157,13 @@ class WorldModel:
             raw += threat["deficit"] + 3
         elif self.nearest_enemy_distance(p) < FRONTLINE_DIST:
             raw += max(2, int(p.production))
+        if is_storage_planet(p):
+            raw += max(4, int(p.production) * 2)
+            raw = max(raw, int(p.ships * 0.60))
+            self.add_debug(f"SMALL_STORAGE_RESERVE_HELD p{p.id} reserve={raw}")
         cap = max(20, int(p.ships * (0.45 if self.step < EARLY_STEPS else 0.55)))
+        if is_storage_planet(p):
+            cap = max(cap, int(p.ships * 0.80))
         return min(int(raw), cap)
 
     def surplus(self, p):
@@ -1199,6 +1293,15 @@ class WorldModel:
         )
         critical = mission_type in CRITICAL_MISSIONS
         threat = self.real_incoming_threat(src)
+        if is_storage_planet(src) and mission_type in ("DEFEND_HOLD", "SAVE_UNDER_ATTACK"):
+            self.add_debug(f"SMALL_STORAGE_RELEASE_DEFENSE src=p{src.id} target=p{getattr(tgt, 'id', '?')}")
+        if (
+            is_storage_planet(src)
+            and mission_type == "REINFORCE_CAPTURE"
+            and tgt is not None
+            and radius_class(tgt) == "LARGE"
+        ):
+            self.add_debug(f"SMALL_STORAGE_RELEASE_HOLD_LAUNCHPAD src=p{src.id} target=p{tgt.id}")
         if threat["deficit"] > 0 and mission_type not in ("DEFEND_HOLD", "SAVE_UNDER_ATTACK") and not evacuating:
             return False, "source unsafe: under attack"
         remaining = int(src.ships) - self.committed.get(src.id, 0) - int(ships)
@@ -1207,6 +1310,40 @@ class WorldModel:
             return False, f"source unsafe: below reserve {remaining}<{reserve}"
         if self.is_recently_reinforced(src) and mission_type in OFFENSIVE_MISSIONS and not evacuating:
             return False, "source unsafe: recently reinforced cooldown"
+        if is_storage_planet(src) and mission_type in OFFENSIVE_MISSIONS and not evacuating:
+            allowed_storage_release = mission_type in (
+                "RECAPTURE_LOST", "FINISH_ZERO_CAPTURE", "FINAL_DRAIN"
+            )
+            target_role = radius_class(tgt) if tgt is not None else "SMALL"
+            launchpad_escape = (
+                mission_type in ("CAPTURE_NEUTRAL", "LOCAL_PRODUCTION_CAPTURE", "HIGH_VALUE_NEUTRAL_RACE")
+                and tgt is not None
+                and target_role in ("MEDIUM", "LARGE")
+                and dp(src, tgt) <= CAPTURE_OPP_MAX_DIST
+            )
+            local_support = tgt is not None and dp(src, tgt) <= CHEAP_RECAPTURE_LOCAL_DIST
+            if allowed_storage_release:
+                if mission_type == "RECAPTURE_LOST":
+                    self.add_debug(f"SMALL_STORAGE_RELEASE_RECAPTURE src=p{src.id} target=p{getattr(tgt, 'id', '?')}")
+            elif launchpad_escape:
+                pass
+            elif local_support and mission_type in ("CAPTURE_NEUTRAL", "LOCAL_PRODUCTION_CAPTURE"):
+                pass
+            else:
+                self.add_debug(
+                    f"SMALL_STORAGE_SKIP_FAR_ATTACK src=p{src.id} target=p{getattr(tgt, 'id', '?')} mission={mission_type}"
+                )
+                return False, "source unsafe: small storage reserve"
+        if (
+            self.is_four_player
+            and is_static_planet(src)
+            and radius_class(src) == "LARGE"
+            and mission_type in ("SYNC_ATTACK", "BREACH_KILL", "COLLAPSE")
+            and tgt is not None
+            and not _is_corner_control_target(self, tgt)
+            and remaining < reserve + max(12, int(src.production) * 4)
+        ):
+            return False, "source unsafe: static launchpad reserve"
         prev_owner = _prev_owners.get(src.id)
         prev_ships = _prev_ships.get(src.id)
         if prev_owner == self.player and prev_ships is not None and not critical and not evacuating:
@@ -1454,27 +1591,22 @@ class WorldModel:
         return True
 
 
-def is_in_my_backyard(world, p):
-    """Backyard mode is disabled; locality is scored by capture planners instead."""
-    return False
-
-
-def should_block_early_enemy_attack_4p(world, target):
-    """Return True when a 4-player early-game enemy attack should be deferred for expansion."""
-    if not world.is_four_player:
+def is_local_enemy_opportunity(world, target):
+    """True for close/frontier/weak enemy planets worth considering despite expansion pressure."""
+    if target is None or target.owner in (-1, world.player) or world.is_comet(target):
         return False
-    if world.step >= FOUR_P_ATTACK_STEP:
-        return False
-    if target.owner in (-1, world.player):
-        return False
-    if is_in_my_backyard(world, target):
-        return False
-    if any(world.real_incoming_threat(p)["deficit"] > 0 for p in world.my_planets):
-        return False
-    if not world.neutral_planets:
-        return False
-    world.add_debug(f"FOUR_PLAYER_ATTACK_BLOCK target=p{target.id} reason=expand_neutrals_first")
-    return True
+    cluster_d = world.cluster_distance(target)
+    prev = _prev_ships.get(target.id)
+    recently_drained = (
+        prev is not None
+        and (int(prev) + int(target.production) - int(target.ships)) >= CAPTURE_OPP_DRAINED_DROP
+    )
+    return (
+        cluster_d <= MIDGAME_FRONT_RADIUS
+        or int(target.ships) <= ENEMY_GATE_WEAK_LOCAL
+        or recently_drained
+        or int(target.production) >= LOCAL_PRODUCTION_MIN_PROD and cluster_d <= CAPTURE_OPP_MAX_DIST * 0.75
+    )
 
 
 def should_allow_enemy_attack(world, target, mission_type, reason=""):
@@ -1492,8 +1624,8 @@ def should_allow_enemy_attack(world, target, mission_type, reason=""):
       3. Hard cap: fleet ratio > FLEET_RATIO_HARD → block.
       4. Not holdable AND far from cluster → block.
 
-    Phase, 4-player context, and neutral count are NO LONGER hard blocks here;
-    they act as soft score penalties in capture_opportunity_score() instead.
+    Phase, 4-player context, and neutral density are scoring inputs, not
+    standalone vetoes.
     """
     # Sanity: gate should only be called for enemy-owned targets
     if target.owner in (-1, world.player):
@@ -1526,9 +1658,8 @@ def should_allow_enemy_attack(world, target, mission_type, reason=""):
         )
         return True
 
-    # ── True safety stops only (no phase/4p/neutral hard-blocks) ─────────────
-    # Phase, 4-player context, and neutral count are soft penalties in the
-    # scoring layer (capture_opportunity_score), NOT hard gates here.
+    # ── True safety stops only ────────────────────────────────────────────────
+    # Phase, 4-player context, and neutral density are handled by scoring.
     fleet_ratio = compute_fleet_ratio(world)
     src         = min(world.my_planets, key=lambda p: dp(p, target), default=None)
     cluster_d   = world.cluster_distance(target)
@@ -1544,8 +1675,8 @@ def should_allow_enemy_attack(world, target, mission_type, reason=""):
         )
         return False
 
-    # Only block "not holdable" when the target is far from cluster — nearby
-    # captures may still be worthwhile for backyard/territory even with thin hold.
+    # Only block "not holdable" when the target is far from cluster; nearby
+    # captures can still be useful frontier/control conversions.
     if can_capture and not can_hold and cluster_d > MIDGAME_FRONT_RADIUS:
         world.add_debug(
             f"ENEMY_ATTACK_BLOCK_NOT_HOLDABLE target=p{target.id} "
@@ -2320,7 +2451,12 @@ def force_action_if_stalling(world, moves, idle_turns, deadline):
         return True
     if idle_turns < 8 or world.my_total_ships <= 230:
         return False
-    if world.is_four_player and world.step < FOUR_P_ATTACK_STEP and world.neutral_planets:
+    if (
+        world.is_four_player
+        and world.step < FOUR_P_ATTACK_STEP
+        and world.neutral_planets
+        and not any(is_local_enemy_opportunity(world, e) or _is_corner_control_target(world, e) for e in world.enemy_planets)
+    ):
         return False
     targets = sorted(
         world.enemy_planets,
@@ -3544,7 +3680,12 @@ def is_breach_kill_mode(world):
     """True when we have a forward planet inside enemy territory and can press the kill."""
     if not world.enemy_planets or not world.my_planets:
         return False
-    if world.is_four_player and world.step < FOUR_P_ATTACK_STEP and world.neutral_planets:
+    if (
+        world.is_four_player
+        and world.step < FOUR_P_ATTACK_STEP
+        and world.neutral_planets
+        and not any(is_local_enemy_opportunity(world, e) or _is_corner_control_target(world, e) for e in world.enemy_planets)
+    ):
         return False
     has_forward = any(
         min(dp(mp, ep) for ep in world.enemy_planets) <= BREACH_KILL_DIST
@@ -3817,15 +3958,10 @@ def _support_source_count(world, tgt, radius=42.0):
 # ── start-type-aware opening ──────────────────────────────────────────────────
 
 def classify_start_type(world):
-    """Classify my starting planet as LARGE / SMALL / MEDIUM based on prod and radius."""
+    """Classify my starting planet as LARGE / SMALL / MEDIUM based on radius role."""
     for p in world.initial_planets.values():
         if p.owner == world.player:
-            prod = int(p.production)
-            if prod >= LARGE_START_PROD_THRESH or p.radius >= LARGE_START_RADIUS_THRESH:
-                return "LARGE"
-            if prod <= SMALL_START_PROD_THRESH or p.radius <= SMALL_START_RADIUS_THRESH:
-                return "SMALL"
-            return "MEDIUM"
+            return radius_class(p)
     return "MEDIUM"
 
 
@@ -3834,8 +3970,440 @@ def get_start_type(world):
     if _start_type_cache.get(world.player) is None:
         st = classify_start_type(world)
         _start_type_cache[world.player] = st
+        world.add_debug(f"START_RADIUS_CLASSIFIED_{st}")
         world.add_debug(f"OPENING_CLASS_{st}_START prod={world.my_planets[0].production if world.my_planets else '?'} step={world.step}")
+        start_planet = next((p for p in world.initial_planets.values() if p.owner == world.player), None)
+        current = world.planet_by_id.get(start_planet.id) if start_planet is not None else None
+        if current is not None and current.owner == world.player:
+            if st == "LARGE":
+                _primary_launchpads.setdefault(world.player, {})[current.id] = world.step
+                world.add_debug(f"PRIMARY_LAUNCHPAD_MARKED p{current.id} radius={current.radius:.1f}")
+                if not is_static_planet(current):
+                    world.add_debug(f"ROTATING_LAUNCHPAD_MARKED p{current.id}")
+            elif st == "MEDIUM":
+                world.add_debug(f"MEDIUM_OPERATOR_MARKED p{current.id} radius={current.radius:.1f}")
+            else:
+                world.add_debug(f"SMALL_STORAGE_MARKED p{current.id} radius={current.radius:.1f}")
     return _start_type_cache[world.player]
+
+
+def mark_launchpad_after_capture(world, p):
+    store = _primary_launchpads.setdefault(world.player, {})
+    role = radius_class(p)
+    if role == "LARGE":
+        if p.id not in store:
+            store[p.id] = world.step
+            world.add_debug(f"PRIMARY_LAUNCHPAD_MARKED p{p.id} radius={p.radius:.1f}")
+            if not is_static_planet(p):
+                world.add_debug(f"ROTATING_LAUNCHPAD_MARKED p{p.id}")
+        return True
+    if role == "MEDIUM":
+        world.add_debug(f"MEDIUM_OPERATOR_MARKED p{p.id} radius={p.radius:.1f}")
+        start_type = _start_type_cache.get(world.player)
+        large_owned = any(radius_class(m) == "LARGE" for m in world.my_planets)
+        if start_type == "SMALL" and not large_owned and p.id not in store:
+            store[p.id] = world.step
+            world.add_debug(f"PRIMARY_LAUNCHPAD_MARKED p{p.id} radius={p.radius:.1f}")
+        return True
+    world.add_debug(f"SMALL_STORAGE_MARKED p{p.id} radius={p.radius:.1f}")
+    return False
+
+
+def owned_launchpads(world):
+    store = _primary_launchpads.setdefault(world.player, {})
+    pads = []
+    for p in world.my_planets:
+        if radius_class(p) == "LARGE" or p.id in store:
+            pads.append(p)
+    return pads
+
+
+def is_launchpad_candidate(world, p, start_type):
+    if p is None or p.owner == world.player or world.is_comet(p):
+        return False
+    role = radius_class(p)
+    if start_type == "SMALL":
+        return role in ("MEDIUM", "LARGE")
+    if start_type == "MEDIUM":
+        return role == "LARGE"
+    return role in ("MEDIUM", "LARGE")
+
+
+def launchpad_role_score(world, p, start_type):
+    role = radius_class(p)
+    d = world.cluster_distance(p)
+    src = min(world.my_planets, key=lambda m: dp(m, p), default=None)
+    need = world.ships_needed_to_capture(src, p, world.my_total_ships) if src else int(p.ships) + 1
+    score = -d * 3.0 - need * 1.4 + int(p.production) * 18.0
+    if role == "LARGE":
+        score += 260.0
+    elif role == "MEDIUM":
+        score += 130.0
+    else:
+        score -= 140.0
+    if is_static_planet(p):
+        score += 120.0
+        world.add_debug(f"STATIC_LAUNCHPAD_BONUS p{p.id} role={role}")
+    if start_type == "SMALL" and role == "LARGE":
+        score += 70.0
+    if start_type == "MEDIUM" and role == "LARGE":
+        score += 100.0
+    if start_type == "LARGE" and role == "LARGE":
+        score += 90.0
+    return score
+
+
+def find_nearest_launchpad_target(world, start_type):
+    world.add_debug(f"LAUNCHPAD_TARGET_SCAN start={start_type}")
+    candidates = []
+    if not world.my_planets:
+        return None
+    for tgt in world.neutral_planets:
+        if not is_launchpad_candidate(world, tgt, start_type):
+            continue
+        src = min(world.my_planets, key=lambda m: dp(m, tgt), default=None)
+        if src is None:
+            continue
+        pool = sum(world.surplus(p) for p in world.my_planets if world.real_incoming_threat(p)["deficit"] <= 0)
+        need = world.ships_needed_to_capture(src, tgt, pool)
+        if need <= 0 or pool < normalize_send_amount(need):
+            continue
+        eta = world.eta(src, tgt, max(1, need))
+        if eta > 60:
+            continue
+        role = radius_class(tgt)
+        score = launchpad_role_score(world, tgt, start_type)
+        candidates.append((score, dp(src, tgt), eta, need, tgt))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+    return candidates[0]
+
+
+def _corner_control_planets(world, owner=None, zones=None):
+    zones = set(zones or (
+        "my_start_corner",
+        "clockwise_adjacent_corner",
+        "counterclockwise_adjacent_corner",
+        "opposite_corner",
+    ))
+    planets = world.normal_planets
+    if owner is not None:
+        planets = [p for p in planets if p.owner == owner]
+    return [
+        p for p in planets
+        if classify_corner_zone(world, p) in zones
+        and radius_class(p) in ("MEDIUM", "LARGE")
+        and not world.is_comet(p)
+    ]
+
+
+def _owned_stable_corner_launchpads(world, zones):
+    return [
+        p for p in _corner_control_planets(world, owner=world.player, zones=zones)
+        if is_static_planet(p)
+    ]
+
+
+def _my_corner_secured(world):
+    stable = _owned_stable_corner_launchpads(world, ("my_start_corner",))
+    if stable:
+        return True
+    owned_medium_large = _corner_control_planets(world, owner=world.player, zones=("my_start_corner",))
+    return len(owned_medium_large) >= 2 and any(radius_class(p) == "LARGE" for p in owned_medium_large)
+
+
+def _adjacent_corner_secured(world, zone):
+    stable = _owned_stable_corner_launchpads(world, (zone,))
+    return bool(stable) or sum(1 for p in _corner_control_planets(world, owner=world.player, zones=(zone,))) >= 2
+
+
+def _has_useful_rotating_bridge(world):
+    if not world.my_planets:
+        return False
+    adjacent_zones = ("clockwise_adjacent_corner", "counterclockwise_adjacent_corner")
+    launchpads = owned_launchpads(world) or [
+        p for p in world.my_planets if radius_class(p) in ("MEDIUM", "LARGE")
+    ]
+    for p in world.my_planets:
+        if is_static_planet(p) or radius_class(p) not in ("MEDIUM", "LARGE"):
+            continue
+        zone = classify_corner_zone(world, p)
+        near_pad = min((dp(p, hub) for hub in launchpads if hub.id != p.id), default=0.0)
+        if zone == "my_start_corner" and near_pad <= FOUR_P_CORNER_LOCAL_DIST:
+            return True
+        if zone in adjacent_zones and near_pad <= FOUR_P_ADJACENT_BRIDGE_DIST:
+            return True
+    return False
+
+
+def _corner_bridge_score(world, target):
+    role = radius_class(target)
+    if role == "SMALL":
+        return -40.0
+    launchpads = owned_launchpads(world) or [
+        p for p in world.my_planets if radius_class(p) in ("MEDIUM", "LARGE")
+    ]
+    nearest_pad_d = min((dp(target, hub) for hub in launchpads), default=999.0)
+    adjacent_static = [
+        p for p in world.normal_planets
+        if p.id != target.id
+        and classify_corner_zone(world, p) in ("clockwise_adjacent_corner", "counterclockwise_adjacent_corner")
+        and radius_class(p) in ("MEDIUM", "LARGE")
+        and is_static_planet(p)
+        and p.owner != world.player
+        and not world.is_comet(p)
+    ]
+    shortcut_value = 0.0
+    for hub in launchpads:
+        for anchor in adjacent_static:
+            shortcut_value = max(shortcut_value, dp(hub, anchor) - dp(target, anchor))
+    adjacency_value = 45.0 if classify_corner_zone(world, target) in (
+        "clockwise_adjacent_corner", "counterclockwise_adjacent_corner"
+    ) else 18.0
+    launchpad_connection_value = max(0.0, FOUR_P_ADJACENT_BRIDGE_DIST - nearest_pad_d) * 1.3
+    bridge_score = max(0.0, shortcut_value) * 2.2 + adjacency_value + launchpad_connection_value
+    if role == "MEDIUM":
+        bridge_score += 55.0
+    return bridge_score
+
+
+def static_corner_value(world, target):
+    if target is None or world.is_comet(target):
+        return -1e9
+    zone = classify_corner_zone(world, target)
+    role = radius_class(target)
+    src = min(world.my_planets, key=lambda p: dp(p, target), default=None)
+    if src is None:
+        return -1e9
+    d = dp(src, target)
+    pool = sum(
+        world.surplus(p) for p in world.my_planets
+        if world.real_incoming_threat(p)["deficit"] <= 0 and dp(p, target) <= FOUR_P_ADJACENT_BRIDGE_DIST + 12
+    )
+    need = world.ships_needed_to_capture(src, target, max(pool, 1))
+    eta = world.eta(src, target, max(1, need))
+    score = int(target.production) * 42.0 - d * 2.3 - eta * 4.0 - need * 1.1
+
+    if is_static_planet(target):
+        score += 360.0
+        if role == "LARGE":
+            score += 280.0
+            world.add_debug(f"STATIC_HIGH_RADIUS_PRIORITY p{target.id} zone={zone}")
+        elif role == "MEDIUM":
+            score += 150.0
+    elif role == "LARGE":
+        score += 120.0
+    elif role == "MEDIUM":
+        score += 75.0
+    else:
+        score -= 140.0
+
+    if zone == "my_start_corner":
+        score += 170.0 if not _my_corner_secured(world) else 45.0
+    elif zone in ("clockwise_adjacent_corner", "counterclockwise_adjacent_corner"):
+        score += 120.0 if _my_corner_secured(world) else -45.0
+    else:
+        score += 90.0 if (
+            _adjacent_corner_secured(world, "clockwise_adjacent_corner")
+            and _adjacent_corner_secured(world, "counterclockwise_adjacent_corner")
+        ) else -180.0
+
+    score += _corner_bridge_score(world, target)
+    enemy_t = min((world.eta(e, target, max(1, int(e.ships))) for e in world.enemy_planets), default=999.0)
+    if enemy_t < eta + 5:
+        score += 90.0
+    if pool < round_up_to_granularity(max(need, MIN_SEND_SHIPS)):
+        score -= 220.0
+    if target.owner not in (-1, world.player):
+        if world.step < FOUR_P_ATTACK_STEP and not is_local_enemy_opportunity(world, target):
+            score -= 240.0
+        if int(target.ships) <= ENEMY_GATE_WEAK_LOCAL:
+            score += 85.0
+    return score
+
+
+def _corner_candidate_sources(world, target):
+    return [
+        p for p in world.my_planets
+        if world.real_incoming_threat(p)["deficit"] <= 0
+        and world.surplus(p) >= MIN_SEND_SHIPS
+        and (
+            dp(p, target) <= FOUR_P_ADJACENT_BRIDGE_DIST + 12
+            or radius_class(p) == "LARGE"
+            or p.id in _primary_launchpads.get(world.player, {})
+        )
+    ]
+
+
+def _corner_target_allowed(world, target):
+    if target.owner == world.player or world.is_comet(target):
+        return False
+    if radius_class(target) == "SMALL":
+        return False
+    if target.owner == -1:
+        return True
+    if world.step >= FOUR_P_ATTACK_STEP:
+        return should_allow_enemy_attack(world, target, "SYNC_ATTACK", "4p_corner")
+    close = world.cluster_distance(target) <= MIDGAME_FRONT_RADIUS
+    weak = int(target.ships) <= ENEMY_GATE_WEAK_LOCAL
+    blocks_corner = (
+        classify_corner_zone(world, target) in ("my_start_corner", "clockwise_adjacent_corner", "counterclockwise_adjacent_corner")
+        and is_static_planet(target)
+    )
+    return (close and weak) or blocks_corner
+
+
+def _make_4p_corner_proposal(world, candidates, stage):
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: (-static_corner_value(world, p), world.cluster_distance(p), int(p.ships)))
+    for target in candidates[:6]:
+        sources = _corner_candidate_sources(world, target)
+        if not sources:
+            continue
+        mission_type = "LOCAL_PRODUCTION_CAPTURE" if target.owner == -1 else "SYNC_ATTACK"
+        prop = build_capture_plan(
+            world,
+            target,
+            mission_type,
+            sources,
+            max_sources=4,
+            eta_spread_limit=4.0 if target.owner == -1 else 6.0,
+        )
+        if prop is None:
+            if not world.can_hold_after_capture(target, 20, max(MIN_SEND_SHIPS, int(target.ships) + 1)):
+                world.add_debug(f"STATIC_CORNER_CAPTURE_REJECT_NOT_HOLDABLE p{target.id}")
+            continue
+        value = static_corner_value(world, target)
+        prop.priority = 132.0 + value * 0.12
+        prop.reason = (
+            f"4p_corner stage={stage} zone={classify_corner_zone(world, target)} "
+            f"role={radius_class(target)} static={is_static_planet(target)} value={value:.1f}"
+        )
+        if len(prop.planned_sources) > 1:
+            world.add_debug(f"STATIC_CORNER_GROUPED_FUNDING_USED p{target.id} sources={prop.sources}")
+        if stage in ("my_corner_static", "my_corner_bridge"):
+            world.add_debug(f"MY_CORNER_LAUNCHPAD_SELECTED p{target.id} stage={stage}")
+        elif stage == "rotating_bridge":
+            world.add_debug(f"ROTATING_BRIDGE_SELECTED p{target.id}")
+        elif stage == "adjacent_bridge":
+            world.add_debug(f"MEDIUM_BRIDGE_TO_ADJACENT_CORNER p{target.id}")
+        elif stage == "adjacent_static":
+            world.add_debug(f"ADJACENT_CORNER_LAUNCHPAD_SELECTED p{target.id}")
+        return prop
+    return None
+
+
+def find_4p_corner_expansion_target(world):
+    if not world.is_four_player or world.step > FOUR_P_CORNER_STRATEGY_STEP_MAX:
+        return None
+    if not world.my_planets:
+        return None
+    world.add_debug("FOUR_PLAYER_CORNER_STRATEGY_ACTIVE")
+
+    cw_secured = _adjacent_corner_secured(world, "clockwise_adjacent_corner")
+    ccw_secured = _adjacent_corner_secured(world, "counterclockwise_adjacent_corner")
+    my_secured = _my_corner_secured(world)
+    rotating_bridge = _has_useful_rotating_bridge(world)
+
+    if cw_secured and ccw_secured:
+        world.add_debug("BOTH_ADJACENT_CORNERS_SECURED")
+        world.add_debug("FINAL_CORNER_CONTEST_MODE")
+
+    stage = "my_corner_static"
+    candidates = []
+    if not my_secured:
+        world.add_debug("MY_CORNER_STATIC_TARGET_SCAN")
+        candidates = [
+            p for p in world.neutral_planets + world.enemy_planets
+            if _corner_target_allowed(world, p)
+            and classify_corner_zone(world, p) == "my_start_corner"
+            and is_static_planet(p)
+            and radius_class(p) in ("MEDIUM", "LARGE")
+        ]
+        if not candidates:
+            stage = "my_corner_bridge"
+            candidates = [
+                p for p in world.neutral_planets
+                if _corner_target_allowed(world, p)
+                and classify_corner_zone(world, p) == "my_start_corner"
+                and radius_class(p) in ("MEDIUM", "LARGE")
+            ]
+    elif not rotating_bridge:
+        stage = "rotating_bridge"
+        candidates = [
+            p for p in world.neutral_planets
+            if _corner_target_allowed(world, p)
+            and not is_static_planet(p)
+            and radius_class(p) in ("MEDIUM", "LARGE")
+            and classify_corner_zone(world, p) in ("my_start_corner", "clockwise_adjacent_corner", "counterclockwise_adjacent_corner")
+            and world.cluster_distance(p) <= FOUR_P_ADJACENT_BRIDGE_DIST
+        ]
+    elif not (cw_secured and ccw_secured):
+        stage = "adjacent_static"
+        world.add_debug("ADJACENT_CORNER_STATIC_SCAN")
+        wanted_zones = []
+        if not cw_secured:
+            wanted_zones.append("clockwise_adjacent_corner")
+        if not ccw_secured:
+            wanted_zones.append("counterclockwise_adjacent_corner")
+        candidates = [
+            p for p in world.neutral_planets + world.enemy_planets
+            if _corner_target_allowed(world, p)
+            and classify_corner_zone(world, p) in wanted_zones
+            and is_static_planet(p)
+            and radius_class(p) in ("MEDIUM", "LARGE")
+        ]
+        if not candidates:
+            stage = "adjacent_bridge"
+            candidates = [
+                p for p in world.neutral_planets
+                if _corner_target_allowed(world, p)
+                and classify_corner_zone(world, p) in wanted_zones
+                and radius_class(p) == "MEDIUM"
+                and world.cluster_distance(p) <= FOUR_P_ADJACENT_BRIDGE_DIST + 8
+            ]
+    else:
+        stage = "final_corner"
+        candidates = [
+            p for p in world.neutral_planets + world.enemy_planets
+            if _corner_target_allowed(world, p)
+            and classify_corner_zone(world, p) == "opposite_corner"
+            and radius_class(p) in ("MEDIUM", "LARGE")
+        ]
+
+    prop = _make_4p_corner_proposal(world, candidates, stage)
+    if prop is not None:
+        return prop
+
+    if stage == "my_corner_static":
+        fallback = [
+            p for p in world.neutral_planets
+            if _corner_target_allowed(world, p)
+            and classify_corner_zone(world, p) == "my_start_corner"
+            and radius_class(p) in ("MEDIUM", "LARGE")
+        ]
+        return _make_4p_corner_proposal(world, fallback, "my_corner_bridge")
+
+    if stage == "adjacent_static":
+        wanted_zones = [
+            zone for zone, secured in (
+                ("clockwise_adjacent_corner", cw_secured),
+                ("counterclockwise_adjacent_corner", ccw_secured),
+            )
+            if not secured
+        ]
+        fallback = [
+            p for p in world.neutral_planets
+            if _corner_target_allowed(world, p)
+            and classify_corner_zone(world, p) in wanted_zones
+            and radius_class(p) == "MEDIUM"
+            and world.cluster_distance(p) <= FOUR_P_ADJACENT_BRIDGE_DIST + 8
+        ]
+        return _make_4p_corner_proposal(world, fallback, "adjacent_bridge")
+
+    return None
 
 
 def start_aware_opening_score_adjustment(world, src, tgt, start_type):
@@ -3846,31 +4414,38 @@ def start_aware_opening_score_adjustment(world, src, tgt, start_type):
     if need <= 0:
         need = int(tgt.ships) + 1
     eta = world.eta(src, tgt, max(1, need))
+    role = radius_class(tgt)
 
     if start_type == "LARGE":
-        # Sweep ALL nearby planets quickly — undo prod-1 penalty, reward proximity/cheapness
+        # Build a launchpad network: large first, medium second, small as filler.
         delta = max(0.0, 30.0 - d) * 8.0 + max(0.0, 12.0 - need) * 3.5 + max(0.0, 14.0 - eta) * 4.0
+        if role == "LARGE":
+            delta += 180.0
+        elif role == "MEDIUM":
+            delta += 90.0
+        else:
+            delta -= 45.0
         if prod <= 1:
-            delta += 60.0  # cancel early_target_score's -50 for prod<=1 and boost further
+            delta += 20.0
         delta += prod * 10.0
         return delta
 
     elif start_type == "SMALL":
-        # Escape to economy — strongly prefer high production
-        if prod >= 5:
-            return 200.0
-        if prod >= 4:
-            return 130.0
-        if prod >= 3:
-            return 70.0
-        if prod >= 2:
-            return 30.0
+        # Escape to medium/large launchpad; avoid small unless it is a cheap stepping stone.
+        if role == "LARGE":
+            return 260.0 + prod * 18.0
+        if role == "MEDIUM":
+            return 150.0 + prod * 14.0
         if d <= 20.0 and need <= 8:
-            return 25.0  # cheap close stepping stone is acceptable
+            return 10.0  # cheap close stepping stone is acceptable
         return -40.0     # additional penalty for prod-1 far targets
 
     else:  # MEDIUM
-        return 20.0 if prod >= 3 and d <= 28.0 else 0.0
+        if role == "LARGE":
+            return 220.0 + (120.0 if is_static_planet(tgt) else 0.0)
+        if role == "MEDIUM" and d <= 32.0:
+            return 45.0
+        return 0.0
 
 
 def _force_nearest_opening_capture(world, moves, label="LARGE_START_NEAREST_SELECTED"):
@@ -3944,6 +4519,79 @@ def _force_best_escape_capture(world, moves):
     return False
 
 
+def run_planet_role_opening(world, moves):
+    """Radius-role opening: secure the right launchpad before generic expansion."""
+    if world.step > 90 or not world.my_planets or not world.neutral_planets:
+        return False
+    start_type = get_start_type(world)
+    large_owned = any(radius_class(p) == "LARGE" for p in world.my_planets)
+    launchpad_owned = bool(owned_launchpads(world))
+
+    if start_type == "SMALL" and not launchpad_owned:
+        marker = "SMALL_START_ESCAPE_TO_LAUNCHPAD"
+    elif start_type == "MEDIUM" and not large_owned:
+        marker = "MEDIUM_START_FIND_LARGE_LAUNCHPAD"
+    elif start_type == "LARGE":
+        marker = "LARGE_START_SWEEP_LARGE_MEDIUM"
+    else:
+        return False
+
+    found = find_nearest_launchpad_target(world, start_type)
+    if found is None:
+        return False
+    score, _d, _eta, need, tgt = found
+    candidate_sources = sorted(
+        [
+            p for p in world.my_planets
+            if world.real_incoming_threat(p)["deficit"] <= 0
+            and world.surplus(p) > 0
+        ],
+        key=lambda p: (
+            0 if radius_class(p) == "LARGE" else 1 if radius_class(p) == "MEDIUM" else 4,
+            dp(p, tgt),
+            -world.surplus(p),
+        ),
+    )
+    plan, reason = build_grouped_funding_plan(
+        world,
+        tgt,
+        need,
+        candidate_sources,
+        "CAPTURE_NEUTRAL",
+        max_sources=4,
+        eta_spread_limit=3.0,
+        require_hold=True,
+    )
+    if plan is None:
+        world.add_debug(f"LAUNCHPAD_CAPTURE_SKIP p{tgt.id} reason={reason}")
+        return False
+    planned, total, eta_min, eta_max = plan
+    mission_id = world.mission_ledger.create(
+        "CAPTURE_NEUTRAL",
+        tgt.id,
+        [src_id for src_id, _, _, _ in planned],
+        total,
+        [eta for _, _, _, eta in planned],
+        f"planet_role_launchpad p{tgt.id} role={radius_class(tgt)} score={score:.1f}",
+    )
+    sent = 0
+    for src_id, ships, _angle, _eta in planned:
+        src = world.planet_by_id.get(src_id)
+        if src is None:
+            continue
+        if world.commit(src, tgt, ships, moves, mission_type="CAPTURE_NEUTRAL", mission_id=mission_id, planned_sources=planned):
+            sent += ships
+    if sent >= total:
+        world.wave_attempted = True
+        world.add_debug(
+            f"{marker} p{tgt.id} role={radius_class(tgt)} sent={sent} "
+            f"eta={eta_min:.1f}-{eta_max:.1f}"
+        )
+        world.add_debug(f"LAUNCHPAD_CAPTURE_SELECTED p{tgt.id} score={score:.1f} role={radius_class(tgt)}")
+        return True
+    return False
+
+
 def early_target_score(world, src, tgt):
     """Composite early-game score for a (src→tgt) pair. Higher is better."""
     if tgt.id in world.comet_ids:
@@ -3955,11 +4603,20 @@ def early_target_score(world, src, tgt):
         need = int(tgt.ships) + 1
     eta = world.eta(src, tgt, max(1, need))
     prod = int(tgt.production)
+    role = radius_class(tgt)
 
     my_nearest = d
     enemy_nearest = min((dp(e, tgt) for e in world.enemy_planets), default=999.0)
 
     score = prod * 85.0
+    if role == "LARGE":
+        score += 95.0
+    elif role == "MEDIUM":
+        score += 45.0
+    else:
+        score -= 25.0
+        if d <= 18.0 and need <= 10:
+            score += 20.0
     if prod >= 5:
         score += 70.0
     elif prod >= 4:
@@ -4886,6 +5543,15 @@ def recently_captured_hub_ids(world, ttl=LAUNCHPAD_RECENT_TTL):
 
 def command_hub_score(world, p, recent_ids):
     score = int(p.production) * 24.0 + world.surplus(p) * 0.7
+    role = radius_class(p)
+    if role == "LARGE":
+        score += 120.0
+    elif role == "MEDIUM":
+        score += 35.0
+    else:
+        score -= 80.0
+    if is_static_planet(p) and role in ("LARGE", "MEDIUM"):
+        score += 80.0
     if int(p.production) >= LAUNCHPAD_PROD_MIN:
         score += 60.0
     if world.surplus(p) >= LAUNCHPAD_SURPLUS_MIN:
@@ -4902,8 +5568,11 @@ def command_hubs(world):
     recent_ids = recently_captured_hub_ids(world)
     hubs = []
     for p in world.my_planets:
+        role = radius_class(p)
         if (
-            int(p.production) >= LAUNCHPAD_PROD_MIN
+            role == "LARGE"
+            or (role == "MEDIUM" and world.surplus(p) >= MIN_SEND_SHIPS)
+            or int(p.production) >= LAUNCHPAD_PROD_MIN
             or world.surplus(p) >= LAUNCHPAD_SURPLUS_MIN
             or world.nearest_enemy_distance(p) <= FRONTLINE_DIST + 18
             or p.id in recent_ids
@@ -4968,15 +5637,28 @@ def build_grouped_funding_plan(
         safe_avail = max(0, min(world.surplus(src), int(src.ships) - world.committed.get(src.id, 0)))
         if safe_avail <= 0:
             continue
+        role = radius_class(src)
+        local_support = dp(src, target) <= CHEAP_RECAPTURE_LOCAL_DIST
+        critical_support = mission_type in (
+            "DEFEND_HOLD", "SAVE_UNDER_ATTACK", "RECAPTURE_LOST", "REINFORCE_CAPTURE"
+        )
+        if role == "LARGE":
+            role_priority = 0
+        elif role == "MEDIUM":
+            role_priority = 1
+        elif critical_support and local_support:
+            role_priority = 0
+        else:
+            role_priority = 5
         local_bonus = 0 if dp(src, target) <= LOCAL_HUB_RADIUS else 1
         eta_guess = world.eta(src, target, max(1, min(safe_avail, target_total)))
-        sources.append((eta_guess, local_bonus, dp(src, target), -safe_avail, src, safe_avail))
+        sources.append((role_priority, eta_guess, local_bonus, dp(src, target), -safe_avail, src, safe_avail))
     sources.sort()
     sources = sources[:max_sources]
 
     planned = []
     total = 0
-    for _eta_guess, _local_bonus, _dist, _neg_avail, src, safe_avail in sources:
+    for _role_priority, _eta_guess, _local_bonus, _dist, _neg_avail, src, safe_avail in sources:
         if total >= target_total:
             break
         remaining = max(0, target_total - total)
@@ -5087,13 +5769,18 @@ def build_grouped_funding_plan(
 
 
 def build_grouped_capture_plan(world, target, mission_type, max_sources=MIDGAME_ATTACK_SOURCE_MAX):
+    def _source_role_key(s):
+        role = radius_class(s)
+        role_rank = 0 if role == "LARGE" else 1 if role == "MEDIUM" else 4
+        return (role_rank, dp(s, target), -world.surplus(s))
+
     sources = sorted(
         [
             s for s in world.my_planets
             if world.surplus(s) > 0
             and world.real_incoming_threat(s)["deficit"] <= 0
         ],
-        key=lambda s: (dp(s, target), -world.surplus(s)),
+        key=_source_role_key,
     )[:max_sources]
     if not sources:
         return None, "no safe sources"
@@ -5121,7 +5808,14 @@ def build_capture_plan(world, target, mission_type, candidate_sources, max_sourc
     """
     if not candidate_sources or world.is_comet(target):
         return None
-    sources = sorted(candidate_sources, key=lambda s: (dp(s, target), -world.surplus(s)))[:max_sources]
+    sources = sorted(
+        candidate_sources,
+        key=lambda s: (
+            0 if radius_class(s) == "LARGE" else 1 if radius_class(s) == "MEDIUM" else 4,
+            dp(s, target),
+            -world.surplus(s),
+        ),
+    )[:max_sources]
     if not sources:
         return None
     pool = sum(world.surplus(s) for s in sources)
@@ -5320,10 +6014,13 @@ def generate_nearest_occupiable_expansion_missions(world, deadline):
 
 def update_rotational_hubs(world):
     """Mark newly captured strategic planets as rotational hubs; expire stale ones."""
-    global _rotational_hubs
+    global _rotational_hubs, _primary_launchpads
     store = _rotational_hubs.setdefault(world.player, {})
+    launchpads = _primary_launchpads.setdefault(world.player, {})
     if _prev_owners:
         for p in world.my_planets:
+            if _prev_owners.get(p.id) != world.player:
+                mark_launchpad_after_capture(world, p)
             if _prev_owners.get(p.id) != world.player and p.id not in store:
                 if (int(p.production) >= 2
                         or world.nearest_enemy_distance(p) <= FRONTLINE_DIST + 15
@@ -5337,6 +6034,10 @@ def update_rotational_hubs(world):
         p = world.planet_by_id.get(pid)
         if p is None or p.owner != world.player or world.step - store[pid] > ROTATIONAL_HUB_TTL:
             del store[pid]
+    for pid in list(launchpads.keys()):
+        p = world.planet_by_id.get(pid)
+        if p is None or p.owner != world.player:
+            del launchpads[pid]
 
     # Thin hubs are noted for reinforcement scoring, but never lock sources.
     for pid in store:
@@ -6106,9 +6807,8 @@ def should_allow_capture_opportunity(world, target, mission_type):
       - absurdly far from cluster
       - not holdable AND far from cluster AND no urgent reason
 
-    Phase, step count, 4-player context, and neutral-planet count are
-    NEVER hard blocks here — they become score penalties in
-    capture_opportunity_score() so the ranker demotes but does not veto.
+    Phase, step count, 4-player context, and neutral density are soft scoring
+    inputs handled by capture_opportunity_score().
 
     Returns (allowed: bool, reason: str).
     """
@@ -6162,7 +6862,7 @@ def capture_opportunity_score(world, target, src, need, eta, fleet_ratio):
     """
     Score a capture opportunity. Higher = more attractive.
 
-    Phase, 4-player, and neutral count act as soft deductions, never vetoes.
+    Phase, 4-player context, and neutral density act as soft deductions.
     Enemy planets receive bonuses for weakness, drain, proximity, and strategic value.
     """
     prod      = int(target.production)
@@ -6233,9 +6933,9 @@ def capture_opportunity_score(world, target, src, need, eta, fleet_ratio):
     # ── Soft deductions (priority reduction, never veto) ─────────────────────
     my_pct, _, neutral_pct = compute_control_pct(world)
 
-    # 4-player early game: slight de-priority for non-urgent enemy attacks
+    # 4-player early game: slight de-priority for non-local enemy attacks
     if (world.is_four_player and world.step < FOUR_P_ATTACK_STEP
-            and is_enemy and not is_in_my_backyard(world, target)):
+            and is_enemy and not is_local_enemy_opportunity(world, target)):
         s -= CAPTURE_OPP_4P_EARLY_PEN
 
     # Many neutrals remain: slight de-priority for enemy vs neutral preference
@@ -6264,16 +6964,14 @@ def capture_opportunity_score(world, target, src, need, eta, fleet_ratio):
 def find_capture_opportunities(world, fleet_ratio, deadline):
     """
     Always-on capture opportunity engine.  Runs every turn after urgent actions.
-    Evaluates BOTH neutral and enemy planets as capture targets with no blanket
-    phase/step/4-player/neutral-count hard-blocks.
+    Evaluates BOTH neutral and enemy planets as capture targets. Fleet ratio
+    pressure filters speculative options but still permits immediate conversion.
 
     Returns a list of MissionProposal objects sorted by capture_opportunity_score.
     Uses should_allow_capture_opportunity() for gating (permissive, safety-only).
     """
     proposals = []
     if not world.my_planets:
-        return proposals
-    if fleet_ratio > FLEET_RATIO_SOFT:
         return proposals
 
     world.add_debug(
@@ -6313,6 +7011,34 @@ def find_capture_opportunities(world, fleet_ratio, deadline):
         eta = world.eta(src, target, need)
         if eta > CAPTURE_OPP_MAX_ETA:
             continue
+        if fleet_ratio > FLEET_RATIO_SOFT:
+            cluster_d = world.cluster_distance(target)
+            can_hold = world.can_hold_after_capture(target, eta, need)
+            quick_flip = eta <= min(CAPTURE_OPP_MAX_ETA, 18.0)
+            high_value_neutral = (
+                target.owner == -1
+                and int(target.production) >= LOCAL_PRODUCTION_MIN_PROD
+                and quick_flip
+                and can_hold
+            )
+            weak_near_enemy = (
+                target.owner not in (-1, world.player)
+                and is_local_enemy_opportunity(world, target)
+                and quick_flip
+                and can_hold
+            )
+            local_neutral_fill = (
+                target.owner == -1
+                and cluster_d <= MIDGAME_FRONT_RADIUS
+                and quick_flip
+                and can_hold
+            )
+            if not (high_value_neutral or weak_near_enemy or local_neutral_fill):
+                world.add_debug(
+                    f"CAPTURE_OPPORTUNITY_RATIO_FILTER target=p{target.id} "
+                    f"ratio={fleet_ratio:.2f} eta={eta:.1f} d={cluster_d:.1f}"
+                )
+                continue
 
         score = capture_opportunity_score(world, target, src, need, eta, fleet_ratio)
         if score < CAPTURE_OPP_MIN_SCORE:
@@ -6565,7 +7291,7 @@ def _score_search_proposal(world, prop, sim):
 
     Penalties: fleet overextension, hollow sources, isolated far captures,
     failed captures, fragile near-enemy planets, rapid enemy retake, scattered
-    tiny attacks, backyard-locked drain, reinforcing non-bridge low-prod planets,
+    tiny attacks, draining useful sources, reinforcing non-bridge low-prod planets,
     fleets that do not convert to capture/defense/bridge value.
     """
     if sim is None:
@@ -6796,6 +7522,7 @@ def agent(obs, config=None):
         _prev_owners.clear()
         _prev_ships.clear()
         _rotational_hubs[world.player] = {}
+        _primary_launchpads[world.player] = {}
         _start_type_cache[world.player] = None
         _recently_reinforced[world.player] = {}
         _doomed_owned_targets[world.player] = {}
@@ -6856,6 +7583,16 @@ def agent(obs, config=None):
     # ── 2. Cheap recent-loss response / counterattack ─── proposals → coordinate_missions
     if time.perf_counter() < deadline:
         try_cheap_recapture_or_counterattack(world, moves, fleet_ratio, deadline)
+
+    # ── 2a. 4-player stable-corner launchpad strategy ─── proposals → coordinate_missions
+    if not moves and time.perf_counter() < deadline:
+        corner_prop = find_4p_corner_expansion_target(world)
+        if corner_prop is not None:
+            coordinate_missions(world, [corner_prop], moves, fleet_ratio, deadline)
+
+    # ── 2b. Planet-size role opening ───────────────────── commits grouped launchpad waves
+    if not moves and time.perf_counter() < deadline:
+        run_planet_role_opening(world, moves)
 
     # ── 3. Urgent: save / fall-recapture / evacuation ─── proposals → coordinate_missions
     protect_lead = is_protect_lead_mode(world)
@@ -6958,7 +7695,7 @@ def agent(obs, config=None):
             coordinate_missions(world, [chain_prop], moves, fleet_ratio, deadline)
 
     # ── 5. Forced opening tempo ───────────────────────── commits directly or via coordinator
-    # Bypasses ratio and backyard-threat gates — opening is a tempo race.
+    # Bypasses normal ratio gates when opening tempo is still recoverable.
     opening_ok = (not ratio_blocks_normal) or in_forced_opening
     if not moves and not high_value_neutral_block and opening_ok and time.perf_counter() < deadline:
         if first_capture_360(world, moves):
