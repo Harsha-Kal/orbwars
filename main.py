@@ -193,6 +193,13 @@ PHASE_EXPAND_PCT   = 0.45   # my control below this → EXPANSION_CONTROL
 BRIDGE_RELAY_DIST   = 50.0  # max distance from bridge to next useful capture target
 BRIDGE_MIN_SHORTCUT = 0.15  # bridge must shorten direct route by at least this fraction
 
+# ── enemy-attack gate ─────────────────────────────────────────────────────────
+ENEMY_GATE_4P_MIN_PCT      = 0.20  # 4-player: block enemy attacks until my_pct >= this
+ENEMY_GATE_NEUTRAL_PCT     = 0.35  # neutral_pct above which neutrals take priority
+ENEMY_GATE_MAX_MY_PCT      = 0.28  # max my_pct below which "neutrals remain" rule fires
+ENEMY_GATE_WEAK_SHIPS      = 12    # <= this ships → "very weak" enemy (neutrals-remain rule)
+ENEMY_GATE_WEAK_LOCAL      = 15    # <= this ships → "weak" for LOCAL_SWEEP phase rule
+
 # ── 4-player ──────────────────────────────────────────────────────────────────
 FOUR_P_ATTACK_STEP = 80
 FOUR_P_EXPAND_STEP = 100
@@ -1373,6 +1380,154 @@ def should_block_early_enemy_attack_4p(world, target):
     if not world.neutral_planets:
         return False
     world.add_debug(f"FOUR_PLAYER_ATTACK_BLOCK target=p{target.id} reason=expand_neutrals_first")
+    return True
+
+
+def should_allow_enemy_attack(world, target, mission_type, reason=""):
+    """
+    Central enemy-attack policy gate.  Returns True when attacking target (which
+    must be enemy-owned) is strategically appropriate this turn.
+
+    Call this for every enemy-planet attack before generating or committing a
+    proposal.  No enemy attack should bypass it.
+
+    Rules applied in order:
+      1. Always block comets.
+      2. Always allow: backyard, recently-mine, actively-threatening, RECAPTURE_LOST,
+         FINISH_ZERO_CAPTURE, enemy has <= 3 planets (collapse possible).
+      3. 4-player: block if my_pct < ENEMY_GATE_4P_MIN_PCT and not under threat.
+      4. Many neutrals remain (neutral_pct > 0.35, my_pct < 0.28): allow only
+         very-weak adjacent guaranteed captures.
+      5. Easy nearby neutral exists: block unless enemy is clearly better and local.
+      6. LOCAL_SWEEP phase: block unless weak + frontier + guaranteed hold.
+      7. EXPANSION_CONTROL phase: require in-front + guaranteed hold + safe ratio.
+      8. CONTACT / COLLAPSE: require safe fleet ratio + holdable capture.
+    """
+    # Sanity: gate should only be called for enemy-owned targets
+    if target.owner in (-1, world.player):
+        return True
+    if world.is_comet(target):
+        world.add_debug(f"ENEMY_ATTACK_BLOCK comet p{target.id}")
+        return False
+
+    # ── Rule 2: unconditional allows ─────────────────────────────────────────
+    if mission_type in ("RECAPTURE_LOST", "FINISH_ZERO_CAPTURE"):
+        world.add_debug(f"ENEMY_ATTACK_ALLOWED reason={mission_type} target=p{target.id}")
+        return True
+
+    if is_in_my_backyard(world, target):
+        world.add_debug(f"ENEMY_ATTACK_ALLOWED reason=backyard target=p{target.id}")
+        return True
+
+    if _prev_owners.get(target.id) == world.player:
+        world.add_debug(f"ENEMY_ATTACK_ALLOWED reason=recently_mine target=p{target.id}")
+        return True
+
+    if any(
+        dp(my_p, target) <= BACKYARD_THREAT_DIST
+        and world.real_incoming_threat(my_p)["deficit"] > 0
+        for my_p in world.my_planets
+    ):
+        world.add_debug(f"ENEMY_ATTACK_ALLOWED reason=threatening_mine target=p{target.id}")
+        return True
+
+    if len(world.enemy_planets) <= 3:
+        world.add_debug(
+            f"ENEMY_ATTACK_ALLOWED reason=collapse_possible enemies={len(world.enemy_planets)} "
+            f"target=p{target.id}"
+        )
+        return True
+
+    # ── Shared values ─────────────────────────────────────────────────────────
+    my_pct, _enemy_pct, neutral_pct = compute_control_pct(world)
+    ctrl_phase   = classify_strategic_phase(world)
+    fleet_ratio  = compute_fleet_ratio(world)
+    src          = min(world.my_planets, key=lambda p: dp(p, target), default=None)
+    cluster_d    = world.cluster_distance(target)
+    pool         = sum(world.surplus(p) for p in world.my_planets)
+    need         = world.ships_needed_to_capture(src, target, pool) if src else pool + 1
+    eta          = world.eta(src, target, max(1, need)) if src else 999.0
+    can_capture  = src is not None and 0 < need <= pool
+    can_hold     = world.can_hold_after_capture(target, eta, need) if can_capture else False
+
+    # ── Rule 3: 4-player low-control block ───────────────────────────────────
+    if world.is_four_player and my_pct < ENEMY_GATE_4P_MIN_PCT:
+        if not any(world.real_incoming_threat(p)["deficit"] > 0 for p in world.my_planets):
+            world.add_debug(
+                f"ENEMY_ATTACK_BLOCK_LOW_CONTROL target=p{target.id} "
+                f"my_pct={my_pct:.2f} threshold={ENEMY_GATE_4P_MIN_PCT}"
+            )
+            return False
+
+    # ── Rule 4: many neutrals remain ─────────────────────────────────────────
+    if neutral_pct > ENEMY_GATE_NEUTRAL_PCT and my_pct < ENEMY_GATE_MAX_MY_PCT:
+        is_very_weak = int(target.ships) <= ENEMY_GATE_WEAK_SHIPS
+        is_adjacent  = cluster_d <= MIDGAME_FRONT_RADIUS
+        if not (is_very_weak and is_adjacent and can_capture and can_hold):
+            world.add_debug(
+                f"ENEMY_ATTACK_BLOCK_NEUTRALS_REMAIN target=p{target.id} "
+                f"neutral_pct={neutral_pct:.2f} weak={is_very_weak} adj={is_adjacent} "
+                f"hold={can_hold}"
+            )
+            return False
+
+    # ── Rule 5: easy nearby neutral exists ───────────────────────────────────
+    nearby_result = _find_best_nearest_for_arbiter(world)
+    if nearby_result is not None:
+        near_tgt, _, _, near_score, _ = nearby_result
+        if near_tgt.owner == -1 and (int(near_tgt.production) >= 2 or near_score > 50):
+            near_cluster_d  = world.cluster_distance(near_tgt)
+            clearly_better  = (
+                int(target.production) > int(near_tgt.production) + 1
+                or (cluster_d < near_cluster_d and int(target.ships) <= ENEMY_GATE_WEAK_SHIPS)
+            )
+            locally_reachable = cluster_d <= MIDGAME_FRONT_RADIUS
+            if not (clearly_better and locally_reachable):
+                world.add_debug(
+                    f"ENEMY_ATTACK_BLOCK_EASY_NEUTRAL_EXISTS target=p{target.id} "
+                    f"near=p{near_tgt.id}(prod={int(near_tgt.production)}) "
+                    f"better={clearly_better} reachable={locally_reachable}"
+                )
+                return False
+
+    # ── Rule 6: LOCAL_SWEEP phase ─────────────────────────────────────────────
+    if ctrl_phase == ControlPhase.LOCAL_SWEEP:
+        is_weak     = int(target.ships) <= ENEMY_GATE_WEAK_LOCAL
+        is_frontier = cluster_d <= FRONTLINE_DIST + 10
+        guaranteed  = can_capture and can_hold
+        if not (is_weak and is_frontier and guaranteed):
+            world.add_debug(
+                f"ENEMY_ATTACK_BLOCK_PHASE phase={ctrl_phase} target=p{target.id} "
+                f"weak={is_weak} frontier={is_frontier} guaranteed={guaranteed}"
+            )
+            return False
+
+    # ── Rule 7: EXPANSION_CONTROL phase ──────────────────────────────────────
+    if ctrl_phase == ControlPhase.EXPANSION_CONTROL:
+        in_front   = cluster_d <= MIDGAME_FRONT_RADIUS
+        ratio_safe = fleet_ratio <= FLEET_RATIO_SOFT
+        if not (in_front and can_capture and can_hold and ratio_safe):
+            world.add_debug(
+                f"ENEMY_ATTACK_BLOCK_PHASE phase={ctrl_phase} target=p{target.id} "
+                f"in_front={in_front} can_hold={can_hold} ratio={fleet_ratio:.2f}"
+            )
+            return False
+
+    # ── Rule 8: CONTACT / COLLAPSE — fleet ratio + holdability ───────────────
+    if fleet_ratio > FLEET_RATIO_SOFT:
+        world.add_debug(
+            f"ENEMY_ATTACK_BLOCK_FLEET_RATIO target=p{target.id} ratio={fleet_ratio:.2f}"
+        )
+        return False
+
+    if can_capture and not can_hold:
+        world.add_debug(f"ENEMY_ATTACK_BLOCK_NOT_HOLDABLE target=p{target.id} eta={eta:.1f}")
+        return False
+
+    world.add_debug(
+        f"ENEMY_ATTACK_ALLOWED reason={reason or 'standard'} target=p{target.id} "
+        f"phase={ctrl_phase}"
+    )
     return True
 
 
@@ -2646,7 +2801,9 @@ def generate_local_strike_missions(world):
             d = dp(src, tgt)
             if d > LOCAL_HUB_RADIUS:
                 continue
-            if should_block_early_enemy_attack_4p(world, tgt):
+            if tgt.owner not in (-1, world.player) and not should_allow_enemy_attack(
+                world, tgt, "SYNC_ATTACK", "local_strike"
+            ):
                 continue
             need = world.ships_needed_to_capture(src, tgt)
             if need <= 0 or need > surplus:
@@ -2697,7 +2854,7 @@ def generate_sync_attack_missions(world, mode, deadline):
     for tgt in targets:
         if time.perf_counter() > deadline:
             break
-        if should_block_early_enemy_attack_4p(world, tgt):
+        if not should_allow_enemy_attack(world, tgt, "SYNC_ATTACK", "sync_attack"):
             continue
         pool_srcs = sorted(
             [
@@ -2787,8 +2944,6 @@ def generate_sync_attack_missions(world, mode, deadline):
 
 def generate_anti_leader_missions(world):
     proposals = []
-    if world.is_four_player and world.step < FOUR_P_ATTACK_STEP and world.neutral_planets:
-        return proposals
     if world.leader is None or world.leader_score <= world.my_score * 1.22:
         return proposals
     pool = sum(world.surplus(p) for p in world.my_planets)
@@ -2799,6 +2954,8 @@ def generate_anti_leader_missions(world):
         return proposals
     tgt = max(targets, key=lambda p: p.production * 12 + max(0, 45 - p.ships)
               - min(dp(m, p) for m in world.my_planets))
+    if not should_allow_enemy_attack(world, tgt, "SYNC_ATTACK", "anti_leader"):
+        return proposals
     candidate_sources = [
         p for p in world.my_planets
         if world.surplus(p) > 0
@@ -2827,6 +2984,10 @@ def generate_collapse_missions(world, mode):
         and world.real_incoming_threat(p)["deficit"] <= 0
     ]
     for tgt in sorted(targets, key=lambda t: -(t.production * 10 - t.ships))[:4]:
+        if tgt.owner not in (-1, world.player) and not should_allow_enemy_attack(
+            world, tgt, "COLLAPSE", "collapse"
+        ):
+            continue
         prop = build_capture_plan(world, tgt, "COLLAPSE", candidate_sources)
         if prop is None:
             continue
@@ -3323,6 +3484,8 @@ def generate_breach_kill_missions(world):
         )
         for d_to_enemy, tgt in nearby_enemies:
             if tgt.id in seen_targets:
+                continue
+            if not should_allow_enemy_attack(world, tgt, "BREACH_KILL", "breach_kill"):
                 continue
             pool_srcs = sorted(
                 [s for s in all_sources if dp(s, tgt) <= BREACH_KILL_DIST + 10],
@@ -4873,6 +5036,11 @@ def generate_nearest_occupiable_expansion_missions(world, deadline):
         # Weak enemy filter: skip heavily fortified low-prod enemy planets
         if tgt.owner not in (-1, world.player) and int(tgt.ships) > 25 and int(tgt.production) < 3:
             continue
+        # Central enemy-attack gate: applies to all enemy targets in this layer
+        if tgt.owner not in (-1, world.player) and not should_allow_enemy_attack(
+            world, tgt, "SYNC_ATTACK", "nearest_occupiable"
+        ):
+            continue
         eta = world.eta(src, tgt, max(1, need))
         if not world.can_hold_after_capture(tgt, eta, need + OCCUPIABLE_HOLD_MARGIN):
             continue
@@ -5248,39 +5416,21 @@ def generate_opportunistic_strike_missions(world, fleet_ratio, deadline, arbiter
     """
     Attacks enemy planets that recently launched fleets and are now thin.
     Only fires when: close enough, fleet_ratio safe, grouped attack flips ownership.
+    All targets routed through should_allow_enemy_attack().
     """
     proposals = []
     if fleet_ratio > FLEET_RATIO_SOFT:
         return proposals
-    # Stricter midgame no-panic gate: block opportunistic when fleet ratio is elevated
     if MIDGAME_START_STEP <= world.step < MIDGAME_END_STEP and fleet_ratio > MIDGAME_FLEET_SOFT:
         world.add_debug(f"NO_PANIC_BLOCK OPPORTUNISTIC_STRIKE fleet_ratio={fleet_ratio:.2f} midgame")
         return proposals
     if not world.enemy_planets or not world.my_planets:
         return proposals
-    # During early production rush, block enemy attacks when behind target curve
-    if world.step <= 80:
-        _, urgency_high, _, _ = _early_prod_on_track(world)
-        if urgency_high and world.neutral_planets:
-            world.add_debug(f"EARLY_PROD_SKIP_ENEMY_ATTACK_FOR_NEUTRAL step={world.step}")
-            return proposals
-    # Don't launch enemy strikes when an easy nearby neutral exists.
-    # If arbiter already committed a nearby capture this turn, skip re-scanning.
-    if world.step < MIDGAME_END_STEP and not arbiter_fired:
-        nearby = _find_best_nearest_for_arbiter(world)
-        if nearby is not None:
-            near_tgt, _, _, near_score, _ = nearby
-            if near_tgt.owner == -1 and (int(near_tgt.production) >= 2 or near_score > 50):
-                world.add_debug(
-                    f"ARBITER_BLOCK_OPPORTUNISTIC_FOR_NEAREST p{near_tgt.id} "
-                    f"prod={int(near_tgt.production)} score={near_score:.1f}"
-                )
-                return proposals
 
     for tgt, w_score in detect_enemy_weakness(world)[:4]:
         if time.perf_counter() > deadline:
             break
-        if should_block_early_enemy_attack_4p(world, tgt):
+        if not should_allow_enemy_attack(world, tgt, "SYNC_ATTACK", "opportunistic"):
             continue
         nearest_src = min(world.my_planets, key=lambda p: dp(p, tgt), default=None)
         if nearest_src is None or dp(nearest_src, tgt) > BREACH_KILL_DIST + 8:
@@ -5352,10 +5502,13 @@ def generate_launchpad_chain_missions(world, mode, deadline):
                 continue
             if dp(hub, tgt) > LAUNCHPAD_RADIUS and tgt.id not in recent_loss_ids:
                 continue
-            if should_block_early_enemy_attack_4p(world, tgt):
+            if tgt.owner not in (-1, world.player) and not should_allow_enemy_attack(
+                world, tgt, "SYNC_ATTACK", "launchpad_chain"
+            ):
                 continue
             if tgt.owner not in (-1, world.player) and mode not in (
-                StrategyMode.CONTEST_HUBS, StrategyMode.RECOVER_AND_HOLD
+                StrategyMode.CONTEST_HUBS, StrategyMode.RECOVER_AND_HOLD,
+                StrategyMode.COLLAPSE, StrategyMode.FORCE_WAVE, StrategyMode.ANTI_LEADER,
             ):
                 continue
             score = launchpad_target_score(world, hub, tgt, mode)
@@ -5852,7 +6005,7 @@ def generate_midgame_focused_breach_missions(world, front_planet, deadline):
         return proposals
     if front_planet.owner in (-1, world.player):
         return proposals
-    if should_block_early_enemy_attack_4p(world, front_planet):
+    if not should_allow_enemy_attack(world, front_planet, "SYNC_ATTACK", "midgame_breach"):
         return proposals
 
     tgt = front_planet
@@ -6584,6 +6737,25 @@ def agent(obs, config=None):
                         search_pool.insert(0, wave_prop)
                     _wave_reservation["target_id"] = None
 
+        # ── Central enemy-attack gate applied to entire search pool ───────────
+        # Any proposal targeting an enemy planet that wasn't already filtered by
+        # its generator is caught here as a final backstop.
+        filtered_pool = []
+        for prop in search_pool:
+            tgt_p = world.planet_by_id.get(prop.target_id)
+            if (tgt_p is not None
+                    and tgt_p.owner not in (-1, world.player)
+                    and not world.is_comet(tgt_p)
+                    and not should_allow_enemy_attack(
+                        world, tgt_p, prop.kind, "search_pool_backstop"
+                    )):
+                world.add_debug(
+                    f"SEARCH_ENEMY_GATE_BLOCK {prop.kind} p{prop.target_id}"
+                )
+            else:
+                filtered_pool.append(prop)
+        search_pool = filtered_pool
+
         # ── Run beam-search planner ───────────────────────────────────────────
         if search_pool and time.perf_counter() < deadline:
             selected_offensive, search_blocked = search_attack_planner(
@@ -6718,6 +6890,18 @@ def agent(obs, config=None):
                     if wave_prop is not None:
                         proposals.insert(0, wave_prop)
                     _wave_reservation["target_id"] = None
+
+        # Central enemy-attack gate backstop (non-search coordinator path)
+        proposals = [
+            p for p in proposals
+            if (world.planet_by_id.get(p.target_id) is None
+                or world.planet_by_id[p.target_id].owner in (-1, world.player)
+                or world.is_comet(world.planet_by_id[p.target_id])
+                or should_allow_enemy_attack(
+                    world, world.planet_by_id[p.target_id], p.kind,
+                    "coordinator_backstop"
+                ))
+        ]
 
         filter_front = active_front_planet
         if mg_active:
