@@ -149,10 +149,10 @@ ROTATIONAL_HUB_TTL        = 30    # turns a newly captured planet stays marked a
 ROTATIONAL_HUB_REINFORCE_THRESH = 8  # min ships below reserve before hub reinforce fires
 
 # ── start-type-aware opening ──────────────────────────────────────────────────
-LARGE_START_PROD_THRESH   = 4     # prod >= this → LARGE_START
-LARGE_START_RADIUS_THRESH = 6.0   # radius >= this → LARGE_START
-SMALL_START_PROD_THRESH   = 1     # prod <= this → SMALL_START
-SMALL_START_RADIUS_THRESH = 3.5   # radius <= this → SMALL_START
+LARGE_START_PROD_THRESH   = 4     # prod >= this → LARGE_START (primary)
+LARGE_START_RADIUS_THRESH = 2.4   # radius >= this → LARGE_START (tie-breaker; was 6.0)
+SMALL_START_PROD_THRESH   = 1     # prod <= this → SMALL_START (primary)
+SMALL_START_RADIUS_THRESH = 1.1   # radius <= this → SMALL_START (tie-breaker; was 3.5)
 LARGE_START_STALL_STEP_1  = 15    # LARGE_START: force capture if still 1 planet here
 LARGE_START_STALL_STEP_3  = 35    # LARGE_START: force sweep if < 3 planets here
 SMALL_START_STALL_STEP    = 20    # SMALL_START: force escape if still 1 planet here
@@ -1288,23 +1288,22 @@ class WorldModel:
         if ships <= 0:
             return False
 
-        # ── Fleet packet discipline ───────────────────────────────────────────
-        # All non-critical missions must launch normalized fleet packets:
-        #   >= MIN_SEND_SHIPS and a multiple of SEND_GRANULARITY.
-        # Critical missions (DEFEND_HOLD, SAVE_UNDER_ATTACK, etc.) are exempt so
-        # emergency defense never silently fails due to rounding constraints.
-        _mt_check = canonical_mission_type(mission_type)
-        if _mt_check not in CRITICAL_MISSIONS:
-            normalized = normalize_send_amount(ships)
-            if normalized != ships:
-                if normalized > available:
-                    self.add_debug(
-                        f"BLOCK_INVALID_SEND_SIZE mission={_mt_check} src=p{src.id} "
-                        f"ships={ships} normalized={normalized} available={available}"
-                    )
-                    return False
-                self.add_debug(f"SEND_NORMALIZED need={ships} send={normalized}")
-                ships = normalized
+        # ── Fleet packet discipline (universal) ──────────────────────────────
+        # Every fleet, including DEFEND_HOLD, SAVE_UNDER_ATTACK, RECAPTURE_LOST,
+        # and FINISH_ZERO_CAPTURE, must be >= MIN_SEND_SHIPS (10) and a multiple
+        # of SEND_GRANULARITY (5).  If the source cannot afford the normalized
+        # amount, this commit returns False — the caller should try another source.
+        normalized = normalize_send_amount(ships)
+        if normalized != ships:
+            if normalized > available:
+                _mt_check = canonical_mission_type(mission_type)
+                self.add_debug(
+                    f"BLOCK_INVALID_SEND_SIZE mission={_mt_check} src=p{src.id} "
+                    f"ships={ships} normalized={normalized} available={available}"
+                )
+                return False
+            self.add_debug(f"SEND_NORMALIZED need={ships} send={normalized}")
+            ships = normalized
 
         if mission_type is None:
             if tgt.owner == self.player:
@@ -3055,6 +3054,42 @@ def midgame_mission_quality_ok(world, prop, tgt, fleet_ratio, midgame_front):
     return True, ""
 
 
+def normalize_proposal(world, prop):
+    """
+    Rebuild prop.planned_sources so every contribution is a valid fleet packet
+    (>= MIN_SEND_SHIPS, multiple of SEND_GRANULARITY).  Drops sources that cannot
+    afford the normalized amount.  Recomputes required_ships, eta_min, and eta_max
+    from the normalized plan so MissionLedger and valid_fleet_launch receive
+    correct data.  Returns True if the proposal is still viable after normalization.
+    """
+    tgt = world.planet_by_id.get(prop.target_id)
+    if tgt is None:
+        return False
+    new_sources = []
+    for src_id, ships, angle, _eta in prop.planned_sources:
+        src = world.planet_by_id.get(src_id)
+        if src is None:
+            continue
+        norm = normalize_send_amount(ships)
+        available = int(src.ships) - world.committed.get(src_id, 0)
+        if norm > available:
+            world.add_debug(
+                f"NORMALIZE_PROPOSAL_DROP src=p{src_id} need={ships} "
+                f"normalized={norm} available={available}"
+            )
+            continue
+        new_eta = world.eta(src, tgt, norm)
+        new_sources.append((src_id, norm, angle, new_eta))
+    if not new_sources:
+        return False
+    prop.planned_sources = new_sources
+    prop.required_ships  = sum(s for _, s, _, _ in new_sources)
+    etas = [e for _, _, _, e in new_sources]
+    prop.eta_min = min(etas)
+    prop.eta_max = max(etas)
+    return True
+
+
 def coordinate_missions(world, proposals, moves, fleet_ratio, deadline, midgame_active=False, midgame_front=None):
     """Select best non-conflicting missions. Enforce fleet ratio cap. Prevent scatter."""
     proposals.sort(key=lambda p: -p.priority)
@@ -3079,6 +3114,15 @@ def coordinate_missions(world, proposals, moves, fleet_ratio, deadline, midgame_
         if time.perf_counter() > deadline:
             break
         if prop.target_id in used_targets:
+            continue
+
+        # Normalize planned_sources before ledger / validation so the ledger,
+        # valid_fleet_launch, and commit all see the same normalized packet sizes.
+        if not normalize_proposal(world, prop):
+            world.add_debug(
+                f"NORMALIZE_PROPOSAL_REJECT {prop.kind} p{prop.target_id} "
+                f"reason=no valid normalized sources"
+            )
             continue
 
         tgt = world.planet_by_id.get(prop.target_id)
