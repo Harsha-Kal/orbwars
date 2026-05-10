@@ -1331,7 +1331,7 @@ class WorldModel:
                 mission_type == "CAPTURE_NEUTRAL"
                 and tgt is not None
                 and target_role == "SMALL"
-                and small_bridge_score(world, tgt) >= SMALL_BRIDGE_THRESHOLD
+                and small_bridge_score(self, tgt) >= SMALL_BRIDGE_THRESHOLD
                 and dp(src, tgt) <= SMALL_BRIDGE_CAPTURE_DIST
             )
             local_support = tgt is not None and dp(src, tgt) <= CHEAP_RECAPTURE_LOCAL_DIST
