@@ -3981,7 +3981,7 @@ def get_start_type(world):
                 if not is_static_planet(current):
                     world.add_debug(f"ROTATING_LAUNCHPAD_MARKED p{current.id}")
             elif st == "MEDIUM":
-                world.add_debug(f"MEDIUM_OPERATOR_MARKED p{current.id} radius={current.radius:.1f}")
+                world.add_debug(f"MEDIUM_BRIDGE_MARKED p{current.id} radius={current.radius:.1f}")
             else:
                 world.add_debug(f"SMALL_STORAGE_MARKED p{current.id} radius={current.radius:.1f}")
     return _start_type_cache[world.player]
@@ -3998,7 +3998,7 @@ def mark_launchpad_after_capture(world, p):
                 world.add_debug(f"ROTATING_LAUNCHPAD_MARKED p{p.id}")
         return True
     if role == "MEDIUM":
-        world.add_debug(f"MEDIUM_OPERATOR_MARKED p{p.id} radius={p.radius:.1f}")
+        world.add_debug(f"MEDIUM_BRIDGE_MARKED p{p.id} radius={p.radius:.1f}")
         start_type = _start_type_cache.get(world.player)
         large_owned = any(radius_class(m) == "LARGE" for m in world.my_planets)
         if start_type == "SMALL" and not large_owned and p.id not in store:
@@ -4404,6 +4404,200 @@ def find_4p_corner_expansion_target(world):
         return _make_4p_corner_proposal(world, fallback, "adjacent_bridge")
 
     return None
+
+
+def find_best_launchpad_target(world):
+    """Single-result wrapper: return the best capturable launchpad for the current start type."""
+    st = get_start_type(world) if world.my_planets else "MEDIUM"
+    return find_nearest_launchpad_target(world, st)
+
+
+def find_2p_pressure_route_target(world):
+    """
+    2-player game launchpad-then-pressure strategy.
+
+    Priority ladder:
+      1. Unowned static LARGE launchpads in my half of the map.
+      2. Unowned LARGE or static MEDIUM planets anywhere reachable.
+      3. Weak nearby enemy planets once a launchpad is secured.
+      4. Medium bridge neutrals that shorten route to enemy territory.
+
+    Returns a MissionProposal or None.
+    """
+    if not world.my_planets:
+        return None
+    world.add_debug("TWO_PLAYER_LAUNCHPAD_PRESSURE_ACTIVE")
+
+    pool = sum(world.surplus(p) for p in world.my_planets
+               if world.real_incoming_threat(p)["deficit"] <= 0)
+    if pool < MIN_SEND_SHIPS:
+        return None
+
+    large_owned = any(radius_class(p) == "LARGE" for p in world.my_planets)
+    launchpad_secured = bool(owned_launchpads(world))
+
+    candidates = []
+    for tgt in world.normal_planets:
+        if tgt.owner == world.player or world.is_comet(tgt):
+            continue
+        rc = radius_class(tgt)
+        src = min(world.my_planets, key=lambda p: dp(p, tgt), default=None)
+        if src is None:
+            continue
+        need = world.ships_needed_to_capture(src, tgt, pool)
+        if need <= 0 or pool < need:
+            continue
+        cluster_d = world.cluster_distance(tgt)
+        if cluster_d > CAPTURE_OPP_MAX_DIST:
+            continue
+        eta = world.eta(src, tgt, need)
+        if eta > CAPTURE_OPP_MAX_ETA:
+            continue
+        can_hold = world.can_hold_after_capture(tgt, eta, need)
+
+        # Score using launchpad_role_score as the base
+        start_type = get_start_type(world)
+        score = launchpad_role_score(world, tgt, start_type)
+
+        is_enemy = tgt.owner not in (-1, world.player)
+
+        # 2P-specific adjustments
+        if not launchpad_secured:
+            # Before we have a launchpad, heavily discount enemy attacks
+            if is_enemy:
+                score -= 80.0
+        else:
+            # After launchpad is secured, add pressure bonus for weak enemies
+            if is_enemy and int(tgt.ships) <= ENEMY_GATE_WEAK_LOCAL:
+                score += 55.0
+                world.add_debug(f"TWO_PLAYER_PRESSURE_ROUTE_SELECTED p{tgt.id} ships={int(tgt.ships)}")
+            # Medium bridge toward enemy territory
+            if rc == "MEDIUM" and not is_enemy and world.enemy_planets:
+                nearest_enemy_d = min(dp(tgt, e) for e in world.enemy_planets)
+                if nearest_enemy_d < 30.0 and cluster_d < 38.0:
+                    score += 30.0
+
+        if not can_hold and cluster_d > MIDGAME_FRONT_RADIUS:
+            score -= 60.0
+
+        score -= eta * 4.0 - need * 1.0
+
+        if score < CAPTURE_OPP_MIN_SCORE:
+            continue
+        candidates.append((score, tgt, src, need, eta))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: -x[0])
+
+    for score, target, primary_src, need, eta in candidates[:5]:
+        if world.is_comet(target):
+            continue
+        mtype = "CAPTURE_NEUTRAL" if target.owner == -1 else "SYNC_ATTACK"
+        srcs = sorted(
+            [p for p in world.my_planets
+             if world.surplus(p) >= MIN_SEND_SHIPS
+             and world.real_incoming_threat(p)["deficit"] <= 0
+             and p.id not in world.backyard_locked_sources
+             and dp(p, target) <= CAPTURE_OPP_MAX_DIST + 8],
+            key=lambda p: (dp(p, target), -world.surplus(p)),
+        )[:MAX_GROUP_SOURCES]
+        if not srcs:
+            continue
+        prop = build_capture_plan(
+            world, target, mtype, srcs,
+            max_sources=min(4, len(srcs)),
+            eta_spread_limit=3.0 if target.owner == -1 else 6.0,
+        )
+        if prop is None:
+            continue
+        lp_score = launchpad_role_score(world, target, get_start_type(world))
+        prop.priority = 133.0 + lp_score * 0.12 + score * 0.08
+        prop.reason = (
+            f"2p_launchpad_pressure p{target.id} "
+            f"rc={radius_class(target)} static={is_static_planet(target)} "
+            f"secured={launchpad_secured} score={score:.1f}"
+        )
+        if is_static_planet(target) and radius_class(target) == "LARGE":
+            world.add_debug(f"STATIC_HIGH_RADIUS_PRIORITY p{target.id} 2p")
+            world.add_debug(f"PRIMARY_LAUNCHPAD_MARKED p{target.id} radius={target.radius:.1f}")
+        elif radius_class(target) == "LARGE":
+            world.add_debug(f"ROTATING_LAUNCHPAD_MARKED p{target.id}")
+        elif radius_class(target) == "MEDIUM":
+            world.add_debug(f"MEDIUM_BRIDGE_MARKED p{target.id}")
+        if len(prop.planned_sources) > 1:
+            world.add_debug(
+                f"STATIC_LAUNCHPAD_GROUPED_FUNDING_USED p{target.id} "
+                f"sources={len(prop.planned_sources)} ships={prop.required_ships}"
+            )
+        return prop
+    return None
+
+
+def generate_launchpad_strategy_missions(world, fleet_ratio, deadline):
+    """
+    Unified stable-launchpad strategy proposal generator.
+
+    In 4-player games  → wraps find_4p_corner_expansion_target.
+    In 2-player games  → wraps find_2p_pressure_route_target.
+
+    Returns 0–2 high-priority MissionProposals for the search pool and the
+    direct coordinator (runs in BOTH the pre-search and search-active paths).
+
+    Debug markers:
+        STABLE_LAUNCHPAD_STRATEGY_ACTIVE
+        TWO_PLAYER_LAUNCHPAD_PRESSURE_ACTIVE  (via find_2p_pressure_route_target)
+        FOUR_PLAYER_CORNER_STRATEGY_ACTIVE    (via find_4p_corner_expansion_target)
+        LAUNCHPAD_CAPTURE_REJECT_NOT_HOLDABLE
+    """
+    proposals = []
+    if not world.my_planets or fleet_ratio > FLEET_RATIO_SOFT:
+        return proposals
+
+    world.add_debug(
+        f"STABLE_LAUNCHPAD_STRATEGY_ACTIVE step={world.step} "
+        f"is_4p={world.is_four_player} fleet={fleet_ratio:.2f}"
+    )
+
+    if world.is_four_player:
+        prop = find_4p_corner_expansion_target(world)
+        if prop is not None:
+            proposals.append(prop)
+    else:
+        prop = find_2p_pressure_route_target(world)
+        if prop is not None:
+            proposals.append(prop)
+
+    # Regardless of game type, also try a radius-role launchpad capture if no
+    # proposal was generated yet (covers edge cases where the specialised path
+    # found nothing).
+    if not proposals and time.perf_counter() < deadline:
+        found = find_best_launchpad_target(world)
+        if found is not None:
+            score, _d, _eta, need, tgt = found
+            mtype = "CAPTURE_NEUTRAL" if tgt.owner == -1 else "SYNC_ATTACK"
+            srcs = sorted(
+                [p for p in world.my_planets
+                 if world.surplus(p) >= MIN_SEND_SHIPS
+                 and world.real_incoming_threat(p)["deficit"] <= 0
+                 and p.id not in world.backyard_locked_sources],
+                key=lambda p: (dp(p, tgt), -world.surplus(p)),
+            )[:MAX_GROUP_SOURCES]
+            if srcs:
+                prop = build_capture_plan(world, tgt, mtype, srcs, max_sources=4,
+                                         eta_spread_limit=3.0 if tgt.owner == -1 else 6.0)
+                if prop is None:
+                    if not world.can_hold_after_capture(tgt, 20, max(MIN_SEND_SHIPS, int(tgt.ships) + 1)):
+                        world.add_debug(f"LAUNCHPAD_CAPTURE_REJECT_NOT_HOLDABLE p{tgt.id}")
+                else:
+                    prop.priority = 130.0 + score * 0.10
+                    prop.reason = (
+                        f"launchpad_fallback p{tgt.id} rc={radius_class(tgt)} "
+                        f"static={is_static_planet(tgt)} score={score:.1f}"
+                    )
+                    proposals.append(prop)
+
+    return proposals
 
 
 def start_aware_opening_score_adjustment(world, src, tgt, start_type):
@@ -7631,6 +7825,15 @@ def agent(obs, config=None):
     if arbiter_turn_lock:
         world.add_debug(f"ARBITER_TURN_LOCK active offensive_ships={world.offensive_ships}")
 
+    # ── 3.3. Stable launchpad strategy (pre-search path) ─────────────────────
+    # High-priority proposals for static/large-radius planets. Runs in both
+    # pre-search (here) and midgame (search pool, above).  The step 2a/2b path
+    # already handles opening; this covers mid-game step < 55 and late-opening.
+    if not search_active and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline:
+        lp_props = generate_launchpad_strategy_missions(world, fleet_ratio, deadline)
+        if lp_props and time.perf_counter() < deadline:
+            coordinate_missions(world, lp_props, moves, fleet_ratio, deadline)
+
     # ── 3.5. Always-on capture opportunity engine (pre-search path only) ──────
     # In midgame (search_active=True) the engine feeds into the search pool below.
     # Here it runs unconditionally during opening / 4-player / any early step so
@@ -7758,6 +7961,11 @@ def agent(obs, config=None):
 
         # ── Collect offensive proposals for beam-search ───────────────────────
         search_pool: list = []
+
+        # Stable launchpad strategy: static/large-radius planets get highest priority
+        # in the search pool so the planner always considers the best launchpad target.
+        if not no_offense and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline:
+            search_pool += generate_launchpad_strategy_missions(world, fleet_ratio, deadline)
 
         # Always-on capture opportunity engine feeds into the search pool.
         # This ensures the engine runs at all steps >= 55, with the search planner
