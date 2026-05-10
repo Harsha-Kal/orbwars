@@ -211,6 +211,11 @@ ENEMY_GATE_MAX_MY_PCT      = 0.28  # my control below which neutrals are softly 
 ENEMY_GATE_WEAK_SHIPS      = 12    # <= this ships → very weak enemy
 ENEMY_GATE_WEAK_LOCAL      = 15    # <= this ships → "weak" for LOCAL_SWEEP phase rule
 
+# ── small planet bridge logic ─────────────────────────────────────────────────
+SMALL_BRIDGE_THRESHOLD    = 20.0  # small_bridge_score above this → worth capturing
+SMALL_BRIDGE_CAPTURE_DIST = 32.0  # only capture small bridge planets within this cluster_dist
+SMALL_STORAGE_CAPTURE_DIST = 20.0 # pure-storage small planets captured only when this close
+
 # ── always-on capture opportunity engine ──────────────────────────────────────
 CAPTURE_OPP_MAX_DIST      = 55.0  # max cluster_distance to scan for opportunities
 CAPTURE_OPP_MAX_ETA       = 30.0  # max ETA for an opportunity candidate
@@ -1321,11 +1326,19 @@ class WorldModel:
                 and target_role in ("MEDIUM", "LARGE")
                 and dp(src, tgt) <= CAPTURE_OPP_MAX_DIST
             )
+            # Allow small storage to fund a bridge-value small planet
+            small_bridge_escape = (
+                mission_type == "CAPTURE_NEUTRAL"
+                and tgt is not None
+                and target_role == "SMALL"
+                and small_bridge_score(world, tgt) >= SMALL_BRIDGE_THRESHOLD
+                and dp(src, tgt) <= SMALL_BRIDGE_CAPTURE_DIST
+            )
             local_support = tgt is not None and dp(src, tgt) <= CHEAP_RECAPTURE_LOCAL_DIST
             if allowed_storage_release:
                 if mission_type == "RECAPTURE_LOST":
                     self.add_debug(f"SMALL_STORAGE_RELEASE_RECAPTURE src=p{src.id} target=p{getattr(tgt, 'id', '?')}")
-            elif launchpad_escape:
+            elif launchpad_escape or small_bridge_escape:
                 pass
             elif local_support and mission_type in ("CAPTURE_NEUTRAL", "LOCAL_PRODUCTION_CAPTURE"):
                 pass
@@ -4040,7 +4053,14 @@ def launchpad_role_score(world, p, start_type):
     elif role == "MEDIUM":
         score += 130.0
     else:
-        score -= 140.0
+        # Small planet: replace blanket -140 with bridge-value-aware scoring.
+        # If the planet has meaningful bridge/connector value, it should be
+        # captured. Otherwise penalise but not as harshly as before.
+        bv = small_bridge_score(world, p)
+        if bv >= SMALL_BRIDGE_THRESHOLD:
+            score += bv * 0.8          # bridge value partially offsets small penalty
+        else:
+            score -= 80.0              # cheaper penalty; still below medium/large
     if is_static_planet(p):
         score += 120.0
         world.add_debug(f"STATIC_LAUNCHPAD_BONUS p{p.id} role={role}")
@@ -4192,12 +4212,19 @@ def static_corner_value(world, target):
             world.add_debug(f"STATIC_HIGH_RADIUS_PRIORITY p{target.id} zone={zone}")
         elif role == "MEDIUM":
             score += 150.0
+        else:
+            bv = small_bridge_score(world, target)
+            score += bv * 0.7 - 60.0  # static small: bridge value rescues it
     elif role == "LARGE":
         score += 120.0
     elif role == "MEDIUM":
         score += 75.0
     else:
-        score -= 140.0
+        bv = small_bridge_score(world, target)
+        if bv >= SMALL_BRIDGE_THRESHOLD:
+            score += bv * 0.6 - 20.0
+        else:
+            score -= 120.0
 
     if zone == "my_start_corner":
         score += 170.0 if not _my_corner_secured(world) else 45.0
@@ -4239,8 +4266,13 @@ def _corner_candidate_sources(world, target):
 def _corner_target_allowed(world, target):
     if target.owner == world.player or world.is_comet(target):
         return False
+    # Small planets are allowed when they have meaningful bridge value for
+    # connecting corners or launchpads; otherwise still excluded from the
+    # primary corner strategy to keep focus on medium/large targets.
     if radius_class(target) == "SMALL":
-        return False
+        bv = small_bridge_score(world, target)
+        if bv < SMALL_BRIDGE_THRESHOLD:
+            return False
     if target.owner == -1:
         return True
     if world.step >= FOUR_P_ATTACK_STEP:
@@ -4404,6 +4436,92 @@ def find_4p_corner_expansion_target(world):
         return _make_4p_corner_proposal(world, fallback, "adjacent_bridge")
 
     return None
+
+
+def small_bridge_score(world, p):
+    """
+    Calculate how valuable a small-radius planet is as a bridge, connector,
+    stepping-stone, or territory node.
+
+    Returns a float ≥ 0.  A score above SMALL_BRIDGE_THRESHOLD makes the
+    planet worth capturing even though its radius is below SMALL_RADIUS.
+
+    Factors rewarded:
+      - shortens route from my cluster to a static/large launchpad,
+      - connects two owned/target launchpads,
+      - bridges my corner to an adjacent corner (4-player),
+      - creates a safe route toward enemy territory,
+      - close and cheap to capture,
+      - can be held safely.
+
+    Emits SMALL_BRIDGE_VALUE_FOUND when score > 0.
+    """
+    if radius_class(p) != "SMALL":
+        return 0.0
+    if p.owner == world.player or world.is_comet(p):
+        return 0.0
+
+    score = 0.0
+
+    cluster_d = world.cluster_distance(p)
+    src = min(world.my_planets, key=lambda m: dp(m, p), default=None)
+    if src is None:
+        return 0.0
+    pool = sum(world.surplus(m) for m in world.my_planets)
+    need = world.ships_needed_to_capture(src, p, pool) if pool > 0 else 999
+    eta  = world.eta(src, p, max(1, need)) if need > 0 else 999.0
+
+    # ── Cheap & close: any small planet near my cluster is a territory bonus ──
+    if cluster_d <= 22.0 and need <= 15:
+        score += 30.0
+
+    # ── Shortens route to a medium/large/static planet ───────────────────────
+    cx = sum(m.x for m in world.my_planets) / max(1, len(world.my_planets))
+    cy = sum(m.y for m in world.my_planets) / max(1, len(world.my_planets))
+    for target in world.normal_planets:
+        if target.id == p.id or target.owner == world.player or world.is_comet(target):
+            continue
+        if radius_class(target) not in ("MEDIUM", "LARGE") and not is_static_planet(target):
+            continue
+        direct = dist(cx, cy, target.x, target.y)
+        via    = dist(cx, cy, p.x, p.y) + dp(p, target)
+        if via < direct * (1.0 + BRIDGE_MIN_SHORTCUT) and dp(p, target) <= BRIDGE_RELAY_DIST:
+            shortcut_gain = direct - via + dp(p, target) * 0.5
+            score += max(10.0, shortcut_gain * 1.5)
+            world.add_debug(f"SMALL_BRIDGE_VALUE_FOUND p{p.id} -> target=p{target.id} gain={shortcut_gain:.1f}")
+
+    # ── Connects two owned launchpads ─────────────────────────────────────────
+    pads = owned_launchpads(world)
+    if len(pads) >= 2:
+        for i, pad_a in enumerate(pads):
+            for pad_b in pads[i + 1:]:
+                via_p = dp(pad_a, p) + dp(p, pad_b)
+                direct_ab = dp(pad_a, pad_b)
+                if via_p < direct_ab * 1.25:
+                    score += 20.0
+
+    # ── 4-player: bridge between corners ─────────────────────────────────────
+    if world.is_four_player:
+        zone = classify_corner_zone(world, p)
+        if zone in ("clockwise_adjacent_corner", "counterclockwise_adjacent_corner"):
+            score += 18.0
+            if not _adjacent_corner_secured(world, zone):
+                score += 22.0  # stepping stone toward unsecured adjacent corner
+
+    # ── Safe route toward enemy territory ────────────────────────────────────
+    if world.enemy_planets:
+        nearest_enemy_d = min(dp(p, e) for e in world.enemy_planets)
+        # Sits between my cluster and the enemy
+        toward_enemy = dist(cx, cy, p.x, p.y) < min(dist(cx, cy, e.x, e.y) for e in world.enemy_planets)
+        if toward_enemy and nearest_enemy_d < 35.0:
+            score += 15.0
+
+    # ── Holdability ──────────────────────────────────────────────────────────
+    can_hold = world.can_hold_after_capture(p, eta, need) if 0 < need <= pool else False
+    if not can_hold:
+        score -= 20.0
+
+    return max(0.0, score)
 
 
 def find_best_launchpad_target(world):
@@ -4808,9 +4926,15 @@ def early_target_score(world, src, tgt):
     elif role == "MEDIUM":
         score += 45.0
     else:
-        score -= 25.0
-        if d <= 18.0 and need <= 10:
-            score += 20.0
+        # Small planet: apply bridge-value-aware adjustment.
+        bv = small_bridge_score(world, tgt)
+        if bv >= SMALL_BRIDGE_THRESHOLD:
+            score += bv * 0.5           # bridge value partially compensates
+            world.add_debug(f"SMALL_BRIDGE_VALUE_FOUND p{tgt.id} bv={bv:.1f} in early_target_score")
+        elif d <= 18.0 and need <= 10:
+            score += 5.0                # very cheap close small → minor bonus
+        else:
+            score -= 25.0
     if prod >= 5:
         score += 70.0
     elif prod >= 4:
@@ -7120,6 +7244,23 @@ def capture_opportunity_score(world, target, src, need, eta, fleet_ratio):
     if is_bridge_planet(world, target):
         s += 22.0
 
+    # ── Small-planet bridge / territory scoring ───────────────────────────────
+    if radius_class(target) == "SMALL":
+        bv = small_bridge_score(world, target)
+        if bv >= SMALL_BRIDGE_THRESHOLD:
+            s += bv * 0.55
+            world.add_debug(f"SMALL_BRIDGE_VALUE_FOUND p{target.id} bv={bv:.1f}")
+        elif cluster_d <= SMALL_STORAGE_CAPTURE_DIST:
+            # Pure storage value: useful for territory continuity when very close
+            s += 12.0
+        else:
+            # Distant small planet with no bridge value: soft penalty
+            s -= 20.0
+
+    # ── Launchpad value: static/large-radius targets get a strong bonus ───────
+    if is_launchpad_candidate(world, target, get_start_type(world) if world.my_planets else "MEDIUM"):
+        s += launchpad_role_score(world, target, get_start_type(world) if world.my_planets else "MEDIUM") * 0.20
+
     # ── Anti-waiting: bonus when bot owns few planets ─────────────────────────
     if len(world.my_planets) < 4:
         s += 20.0                             # aggressively expand with few planets
@@ -7172,6 +7313,10 @@ def find_capture_opportunities(world, fleet_ratio, deadline):
         f"CAPTURE_OPPORTUNITY_SCAN step={world.step} "
         f"neutrals={len(world.neutral_planets)} enemies={len(world.enemy_planets)} "
         f"my_planets={len(world.my_planets)} fleet_ratio={fleet_ratio:.2f}"
+    )
+    world.add_debug(
+        f"SMALL_BRIDGE_SCAN step={world.step} "
+        f"small_planets={sum(1 for p in world.normal_planets if radius_class(p) == 'SMALL' and p.owner != world.player and not world.is_comet(p))}"
     )
 
     pool = sum(world.surplus(p) for p in world.my_planets)
@@ -7277,7 +7422,18 @@ def find_capture_opportunities(world, fleet_ratio, deadline):
 
         prop.priority = 78.0 + score * 0.28
 
-        # Emit context-specific debug markers for enemy captures
+        # Emit context-specific debug markers
+        if radius_class(target) == "SMALL":
+            bv = small_bridge_score(world, target)
+            if bv >= SMALL_BRIDGE_THRESHOLD:
+                world.add_debug(f"SMALL_BRIDGE_CAPTURE_SELECTED p{target.id} bv={bv:.1f} score={score:.1f}")
+                if world.is_four_player or (world.enemy_planets and world.cluster_distance(target) < 30.0):
+                    world.add_debug(f"SMALL_PLANET_CAPTURED_AS_CONNECTOR p{target.id}")
+            elif world.cluster_distance(target) <= SMALL_STORAGE_CAPTURE_DIST:
+                world.add_debug(f"SMALL_STORAGE_CAPTURE_SELECTED p{target.id} cluster_d={world.cluster_distance(target):.1f}")
+            else:
+                world.add_debug(f"SMALL_PLANET_REJECT_NO_BRIDGE_VALUE p{target.id} bv={bv:.1f}")
+
         if is_enemy:
             neutral_pct = len(world.neutral_planets) / max(1, len(world.normal_planets))
             if world.is_four_player and world.step < FOUR_P_ATTACK_STEP:
