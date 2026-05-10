@@ -172,6 +172,27 @@ SOFT_DEADLINE    = 0.82
 SIM_HORIZON      = 100
 MAX_GROUP_SOURCES = 7
 
+# ── SEARCH_ATTACK_PLANNER ─────────────────────────────────────────────────────
+SEARCH_MAX_CANDIDATES  = 10     # top proposals evaluated in the beam pass
+SEARCH_SELECT_LIMIT    = 2      # max offensive missions committed per turn
+SEARCH_MIN_SCORE       = -35.0  # reject proposals whose search score < this
+SEARCH_TIME_BUDGET     = 0.10   # seconds budget for the full search pass
+SEARCH_RELAY_HORIZON   = 20.0   # max ETA for relay capture to count toward relay value
+
+# ── fleet packet discipline ───────────────────────────────────────────────────
+MIN_SEND_SHIPS   = 10   # no fleet below this size; prevents panic micro-fleets
+SEND_GRANULARITY = 5    # every launch size must be a multiple of this value
+
+# ── map control phases (planet % based, step number is secondary) ─────────────
+PHASE_OPENING_PCT  = 0.12   # my control below this → OPENING_EXPANSION
+PHASE_SWEEP_PCT    = 0.28   # my control below this → LOCAL_SWEEP
+PHASE_EXPAND_PCT   = 0.45   # my control below this → EXPANSION_CONTROL
+# above 0.45 → CONTACT or COLLAPSE based on enemy proximity
+
+# ── bridge planet detection ───────────────────────────────────────────────────
+BRIDGE_RELAY_DIST   = 50.0  # max distance from bridge to next useful capture target
+BRIDGE_MIN_SHORTCUT = 0.15  # bridge must shorten direct route by at least this fraction
+
 # ── 4-player ──────────────────────────────────────────────────────────────────
 FOUR_P_ATTACK_STEP = 80
 FOUR_P_EXPAND_STEP = 100
@@ -202,6 +223,23 @@ CHAIN_PROD4_BONUS        = 90.0
 CHAIN_PROD5_BONUS        = 150.0
 
 DEBUG = False
+
+
+def normalize_send_amount(need):
+    """
+    Round `need` up to the nearest valid fleet-packet size.
+    All offensive launches must be >= MIN_SEND_SHIPS (10) and a multiple of
+    SEND_GRANULARITY (5): valid sizes are 10, 15, 20, 25, 30, ...
+    Returns 0 if need <= 0.
+
+    Callers must still verify the source can spare the normalized amount;
+    if it cannot, skip the source rather than sending a smaller invalid amount.
+    """
+    if need <= 0:
+        return 0
+    need = max(MIN_SEND_SHIPS, int(need))
+    return int(math.ceil(need / SEND_GRANULARITY) * SEND_GRANULARITY)
+
 
 # ── persistent global state ───────────────────────────────────────────────────
 _wave_reservation = {
@@ -405,6 +443,15 @@ class MidgameState:
     FRONTLINE_STABILIZE  = "FRONTLINE_STABILIZE"
     FOCUSED_BREACH       = "FOCUSED_BREACH"
     RECOVER_AND_HOLD     = "RECOVER_AND_HOLD"
+
+
+class ControlPhase:
+    """Strategic phase driven by map-control percentage, not step number."""
+    OPENING_EXPANSION = "OPENING_EXPANSION"   # my_pct < 12% or <= 3 planets
+    LOCAL_SWEEP       = "LOCAL_SWEEP"         # 12%–28%, many neutrals remain
+    EXPANSION_CONTROL = "EXPANSION_CONTROL"   # 28%–45%, cluster stable
+    CONTACT           = "CONTACT"             # frontier reached or enemy near
+    COLLAPSE          = "COLLAPSE"            # dominant control, finish opponent
 
 
 @dataclass
@@ -1236,9 +1283,29 @@ class WorldModel:
         return True, ""
 
     def commit(self, src, tgt, ships, moves, mission_type=None, mission_id=None, planned_sources=None):
-        ships = int(min(ships, int(src.ships) - self.committed.get(src.id, 0)))
+        available = int(src.ships) - self.committed.get(src.id, 0)
+        ships = int(min(int(ships), available))
         if ships <= 0:
             return False
+
+        # ── Fleet packet discipline ───────────────────────────────────────────
+        # All non-critical missions must launch normalized fleet packets:
+        #   >= MIN_SEND_SHIPS and a multiple of SEND_GRANULARITY.
+        # Critical missions (DEFEND_HOLD, SAVE_UNDER_ATTACK, etc.) are exempt so
+        # emergency defense never silently fails due to rounding constraints.
+        _mt_check = canonical_mission_type(mission_type)
+        if _mt_check not in CRITICAL_MISSIONS:
+            normalized = normalize_send_amount(ships)
+            if normalized != ships:
+                if normalized > available:
+                    self.add_debug(
+                        f"BLOCK_INVALID_SEND_SIZE mission={_mt_check} src=p{src.id} "
+                        f"ships={ships} normalized={normalized} available={available}"
+                    )
+                    return False
+                self.add_debug(f"SEND_NORMALIZED need={ships} send={normalized}")
+                ships = normalized
+
         if mission_type is None:
             if tgt.owner == self.player:
                 mission_type = "REINFORCE_CAPTURE"
@@ -1509,6 +1576,48 @@ def choose_strategy_mode(world, idle_turns):
     if f["high_neutral_count"] > 0:
         return StrategyMode.SAFE_EXPANSION
     return StrategyMode.CONTEST_NEUTRALS
+
+
+def compute_control_pct(world):
+    """Return (my_pct, enemy_pct, neutral_pct) as fractions of all non-comet planets."""
+    total = max(1, len(world.normal_planets))
+    return (
+        len(world.my_planets)      / total,
+        len(world.enemy_planets)   / total,
+        len(world.neutral_planets) / total,
+    )
+
+
+def classify_strategic_phase(world):
+    """
+    Classify the current strategic phase from map-control percentage.
+    Step number is used only as a secondary tiebreaker so the bot keeps
+    expanding whenever the map still has unclaimed territory, regardless of turn.
+    """
+    my_pct, enemy_pct, neutral_pct = compute_control_pct(world)
+
+    if my_pct < PHASE_OPENING_PCT or len(world.my_planets) <= 3:
+        return ControlPhase.OPENING_EXPANSION
+
+    if my_pct < PHASE_SWEEP_PCT:
+        return ControlPhase.LOCAL_SWEEP
+
+    near_enemy = any(
+        min((dp(m, e) for m in world.my_planets), default=999.0) < FRONTLINE_DIST
+        for e in world.enemy_planets
+        if not world.is_comet(e)
+    )
+
+    if my_pct < PHASE_EXPAND_PCT:
+        return ControlPhase.CONTACT if near_enemy else ControlPhase.EXPANSION_CONTROL
+
+    # Dominant control → check if opponent is nearly finished
+    if (enemy_pct < 0.15
+            or (world.enemy_prod > 0 and world.enemy_prod < world.my_prod * 0.5)
+            or not world.neutral_planets):
+        return ControlPhase.COLLAPSE
+
+    return ControlPhase.CONTACT
 
 
 def launchpad_target_score(world, src, tgt, mode=None):
@@ -5756,6 +5865,371 @@ def generate_midgame_control_missions(world, mg_state, front_planet, fleet_ratio
     return proposals
 
 
+# ── bridge planet helpers ─────────────────────────────────────────────────────
+
+def is_bridge_planet(world, planet):
+    """
+    True if `planet` (owned by us) lies usefully between the cluster center and
+    a future expansion target, shortening the effective route by >= BRIDGE_MIN_SHORTCUT.
+
+    A bridge gives us a closer launch point so fleet packets arrive faster.
+    Used to:
+      • give bonus score in the search planner for bridge captures,
+      • decide whether to keep feeding a small/low-production planet,
+      • avoid penalising reinforcement of small planets that genuinely help routing.
+    """
+    if not world.my_planets or not (world.neutral_planets + world.enemy_planets):
+        return False
+    cx = sum(p.x for p in world.my_planets) / len(world.my_planets)
+    cy = sum(p.y for p in world.my_planets) / len(world.my_planets)
+    for tgt in world.neutral_planets + world.enemy_planets:
+        if world.is_comet(tgt) or dp(planet, tgt) > BRIDGE_RELAY_DIST:
+            continue
+        direct = dist(cx, cy, tgt.x, tgt.y)
+        via    = dist(cx, cy, planet.x, planet.y) + dp(planet, tgt)
+        if via < direct * (1.0 + BRIDGE_MIN_SHORTCUT):
+            return True
+    return False
+
+
+def nearest_occupiable_from_bridge(world, bridge):
+    """
+    Return nearby capturable planets sorted by (distance, cost) from this bridge.
+    Used to decide whether the bridge still has work to do (i.e., should_feed_bridge).
+    """
+    candidates = []
+    for tgt in world.neutral_planets + world.enemy_planets:
+        if world.is_comet(tgt):
+            continue
+        d = dp(bridge, tgt)
+        if d > BRIDGE_RELAY_DIST:
+            continue
+        need = world.ships_needed_to_capture(bridge, tgt, int(bridge.ships))
+        if need <= 0:
+            continue
+        candidates.append((d, need, tgt))
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    return [tgt for _, _, tgt in candidates]
+
+
+def should_feed_bridge(world, planet):
+    """
+    True when a bridge planet should receive more ships before it can execute
+    the next relay capture.  Only fires when:
+      - planet is confirmed as a bridge,
+      - it lacks sufficient surplus to capture the nearest reachable target
+        after normalization.
+    """
+    if not is_bridge_planet(world, planet):
+        return False
+    reserve      = world.reserve_for(planet)
+    next_targets = nearest_occupiable_from_bridge(world, planet)
+    if not next_targets:
+        return False
+    need = world.ships_needed_to_capture(planet, next_targets[0], int(planet.ships))
+    norm_need = normalize_send_amount(need)
+    return int(planet.ships) < reserve + norm_need + 5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SEARCH_ATTACK_PLANNER helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sim_proposal(world, prop):
+    """
+    Lightweight simulation of a MissionProposal's outcome.
+    Uses cached simulate_planet_timeline / projected_state — fast in practice.
+    Returns a stat dict, or None if the proposal is invalid.
+    """
+    tgt = world.planet_by_id.get(prop.target_id)
+    if tgt is None or world.is_comet(tgt):
+        return None
+    total_sent = sum(s for _, s, _, _ in prop.planned_sources)
+    if total_sent <= 0:
+        return None
+    arrival = int(math.ceil(prop.eta_max))
+
+    # ── ownership after arrival ───────────────────────────────────────────────
+    extra = tuple(
+        (max(1, int(math.ceil(eta))), world.player, int(ships))
+        for _, ships, _, eta in prop.planned_sources if int(ships) > 0
+    )
+    owner_after, ships_after = world.projected_state(
+        prop.target_id, arrival + 1, extra_arrivals=extra
+    )
+    captured = (owner_after == world.player)
+
+    # ── holdability ───────────────────────────────────────────────────────────
+    holds = False
+    if captured:
+        plan_tl = tuple(
+            (max(1, int(math.ceil(eta))), world.player, int(ships))
+            for _, ships, _, eta in prop.planned_sources
+        )
+        horizon = min(SIM_HORIZON, arrival + 30)
+        tl = world.simulate_planet_timeline(tgt, horizon, planned=plan_tl)
+        holds = tl["fall_turn"] is None
+
+    # ── fleet ratio after launch ──────────────────────────────────────────────
+    cur_planet = sum(int(p.ships) for p in world.my_planets)
+    cur_fleet  = sum(int(f.ships) for f in world.my_fleets)
+    post_fleet_ratio = (cur_fleet + total_sent) / max(
+        1, cur_planet - total_sent + cur_fleet + total_sent
+    )
+
+    # ── source hollowing ──────────────────────────────────────────────────────
+    hollow_count = 0
+    for src_id, ships, _, _ in prop.planned_sources:
+        src = world.planet_by_id.get(src_id)
+        if src is None:
+            continue
+        after_commit = int(src.ships) - world.committed.get(src_id, 0) - ships
+        reserve = world.reserve_for(src)
+        if after_commit < reserve or after_commit < max(4, int(src.ships) * 0.18):
+            hollow_count += 1
+
+    # ── enemy response ETA ────────────────────────────────────────────────────
+    enemy_back = 999.0
+    if captured and world.enemy_planets:
+        enemy_back = min(
+            (world.eta(e, tgt, max(1, int(e.ships) // 2)) for e in world.enemy_planets),
+            default=999.0,
+        )
+
+    # ── relay value: chain opportunities from the captured planet ─────────────
+    relay_val = 0.0
+    if captured and holds and ships_after > 0:
+        for n in world.neutral_planets + world.enemy_planets:
+            if n.id == prop.target_id or world.is_comet(n):
+                continue
+            d_relay = dp(tgt, n)
+            if d_relay > LAUNCHPAD_RADIUS:
+                continue
+            relay_eta = travel_turns(d_relay, max(1, ships_after // 2))
+            if relay_eta <= SEARCH_RELAY_HORIZON:
+                relay_val += int(n.production) * 12.0 / max(1.0, relay_eta)
+
+    cluster_d = world.cluster_distance(tgt)
+    return {
+        "captured":        captured,
+        "holds":           holds,
+        "post_fleet_ratio": post_fleet_ratio,
+        "hollow_count":    hollow_count,
+        "enemy_back":      enemy_back,
+        "prod_gain":       int(tgt.production) if captured else 0,
+        "enemy_prod_lost": int(tgt.production) if (
+            captured and tgt.owner not in (-1, world.player)
+        ) else 0,
+        "cluster_d":       cluster_d,
+        "isolated":        cluster_d > OCCUPIABLE_MAX_DIST,
+        "relay_val":       relay_val,
+        "total_sent":      total_sent,
+        "ships_after":     ships_after if captured else 0,
+        "arrival":         arrival,
+        "enemy_owns":      tgt.owner not in (-1, world.player),
+    }
+
+
+def _score_search_proposal(world, prop, sim):
+    """
+    Score a proposal from its simulated outcome. Higher is better.
+
+    Rewards: production gained, stable capture, enemy prod reduced, connected
+    cluster growth, relay/route-fill value, bridge capture, nearest-occupiable
+    bonus, strong grouped attack.
+
+    Penalties: fleet overextension, hollow sources, isolated far captures,
+    failed captures, fragile near-enemy planets, rapid enemy retake, scattered
+    tiny attacks, backyard-locked drain, reinforcing non-bridge low-prod planets,
+    fleets that do not convert to capture/defense/bridge value.
+    """
+    if sim is None:
+        return -9999.0
+    tgt = world.planet_by_id.get(prop.target_id)
+    if tgt is None:
+        return -9999.0
+
+    s = 0.0
+    future = max(1, world.remaining - sim["arrival"])
+    ctrl_phase = classify_strategic_phase(world)
+
+    # ── rewards ───────────────────────────────────────────────────────────────
+    if sim["captured"] and sim["holds"]:
+        s += sim["prod_gain"] * future * 0.55        # production value over game
+        s += 45.0 + int(tgt.production) * 16.0       # stably captured bonus
+        s += sim["enemy_prod_lost"] * 32.0            # enemy production taken
+
+        # Connected cluster growth (closer to cluster = more useful territory)
+        if not sim["isolated"]:
+            s += max(0.0, OCCUPIABLE_MAX_DIST - sim["cluster_d"]) * 1.5
+            # Count nearby owned planets as "cluster strength" bonus
+            nearby_owned = sum(
+                1 for m in world.my_planets if dp(m, tgt) <= LAUNCHPAD_RADIUS
+            )
+            s += nearby_owned * 6.0
+
+        s += sim["relay_val"] * 0.38                  # relay / route-fill value
+
+        # Bridge bonus: this capture shortens the route to future targets
+        if is_bridge_planet(world, tgt):
+            s += 32.0
+
+        # Nearest-occupiable bonus: reward capturing the very closest available planet
+        nearest_occ_d = min(
+            (min(dp(m, n) for m in world.my_planets)
+             for n in world.neutral_planets + world.enemy_planets
+             if not world.is_comet(n)),
+            default=999.0,
+        )
+        if sim["cluster_d"] <= nearest_occ_d * 1.25:
+            s += 18.0
+
+        # Phase-aware expansion bonus: extra reward when map still has space to grow
+        if ctrl_phase in (ControlPhase.OPENING_EXPANSION, ControlPhase.LOCAL_SWEEP,
+                          ControlPhase.EXPANSION_CONTROL):
+            s += 12.0
+
+        # Strong grouped attack (multiple coordinated sources)
+        if len(prop.planned_sources) >= 2:
+            s += 10.0
+
+    elif sim["captured"]:
+        s += 8.0                                      # captured but can't hold
+
+    # ── penalties ─────────────────────────────────────────────────────────────
+    if not sim["captured"]:
+        s -= 90.0                                     # failed/trickle attack
+
+    ratio_over = max(0.0, sim["post_fleet_ratio"] - FLEET_RATIO_SOFT)
+    s -= ratio_over * 130.0                           # fleet overextension
+    s -= sim["hollow_count"] * 22.0                   # drained source planets
+
+    if sim["isolated"]:
+        s -= 45.0 + max(0.0, sim["cluster_d"] - OCCUPIABLE_MAX_DIST) * 0.9
+
+    if sim["captured"]:
+        enemy_d = world.nearest_enemy_distance(tgt)
+        if enemy_d < 22.0 and sim["ships_after"] < int(tgt.production) * 3 + 6:
+            s -= 30.0                                 # fragile near-enemy capture
+        if sim["enemy_back"] < sim["arrival"] + 8:
+            s -= 28.0                                 # enemy can retake very quickly
+
+    # Scattered tiny attack (especially against enemy planets)
+    if sim["total_sent"] < MIN_SEND_SHIPS * 1.5 and sim["enemy_owns"]:
+        s -= 50.0
+
+    # Backyard-locked source being drained
+    if any(sid in world.backyard_locked_sources for sid, _, _, _ in prop.planned_sources):
+        s -= 55.0
+
+    # Penalize reinforcing low-production planets that are not useful bridges
+    if prop.kind in ("REINFORCE_CAPTURE",) and tgt.owner == world.player:
+        if int(tgt.production) <= 1 and not is_bridge_planet(world, tgt):
+            s -= 30.0
+
+    # During expansion phases, penalize far captures when closer ones exist
+    if ctrl_phase in (ControlPhase.OPENING_EXPANSION, ControlPhase.LOCAL_SWEEP):
+        if sim["cluster_d"] > OCCUPIABLE_MAX_DIST * 0.75:
+            s -= 18.0
+
+    # Penalize fleets whose source contributions are non-normalized (post-filter sanity)
+    for _, ships, _, _ in prop.planned_sources:
+        if 0 < ships < MIN_SEND_SHIPS:
+            s -= 20.0  # proposal includes a sub-minimum contribution
+
+    return s
+
+
+def search_attack_planner(world, proposals, fleet_ratio, deadline):
+    """
+    Beam-search style offensive planner.
+
+    1. Sort candidate proposals by existing priority.
+    2. Simulate each (up to SEARCH_MAX_CANDIDATES) using _sim_proposal.
+    3. Score each simulation with _score_search_proposal.
+    4. Select the best SEARCH_SELECT_LIMIT proposals (reject negative-score ones).
+    5. Return (selected, blocked); blocked=True suppresses all other offensive
+       fallback for this turn.
+
+    Debug labels emitted:
+        SEARCH_START, SEARCH_CANDIDATES, SEARCH_EVAL,
+        SEARCH_SELECT, SEARCH_REJECT_NEGATIVE, SEARCH_REJECT,
+        SEARCH_BLOCK_PANIC, SEARCH_TIMEOUT_FALLBACK
+    """
+    if not proposals:
+        return [], False
+
+    # Panic gate: fleet ratio already too high
+    if fleet_ratio > FLEET_RATIO_HARD:
+        world.add_debug(f"SEARCH_BLOCK_PANIC fleet_ratio={fleet_ratio:.2f}")
+        return [], True
+
+    search_end = min(deadline, time.perf_counter() + SEARCH_TIME_BUDGET)
+
+    candidates = sorted(proposals, key=lambda p: -p.priority)[:SEARCH_MAX_CANDIDATES]
+
+    world.add_debug(
+        f"SEARCH_START candidates={len(candidates)} fleet={fleet_ratio:.2f} step={world.step}"
+    )
+    world.add_debug(
+        "SEARCH_CANDIDATES " + " | ".join(
+            f"{p.kind[:6]}->p{p.target_id}(p={p.priority:.0f})" for p in candidates[:6]
+        )
+    )
+
+    scored: list = []
+    for prop in candidates:
+        if time.perf_counter() > search_end:
+            world.add_debug(
+                f"SEARCH_TIMEOUT_FALLBACK evaluated={len(scored)}/{len(candidates)}"
+            )
+            break
+        sim = _sim_proposal(world, prop)
+        if sim is None:
+            continue
+        score = _score_search_proposal(world, prop, sim)
+        world.add_debug(
+            f"SEARCH_EVAL {prop.kind}->p{prop.target_id} "
+            f"score={score:.1f} cap={sim['captured']} holds={sim['holds']} "
+            f"prod={sim['prod_gain']} ratio={sim['post_fleet_ratio']:.2f} "
+            f"hollow={sim['hollow_count']} relay={sim['relay_val']:.1f}"
+        )
+        scored.append((score, prop))
+
+    if not scored:
+        return [], False
+
+    scored.sort(key=lambda x: -x[0])
+
+    selected: list = []
+    for score, prop in scored:
+        if score < SEARCH_MIN_SCORE:
+            world.add_debug(
+                f"SEARCH_REJECT_NEGATIVE {prop.kind}->p{prop.target_id} score={score:.1f}"
+            )
+            continue
+        if len(selected) >= SEARCH_SELECT_LIMIT:
+            break
+        selected.append(prop)
+
+    selected_ids = {p.target_id for p in selected}
+    for score, prop in scored:
+        if prop.target_id in selected_ids:
+            world.add_debug(
+                f"SEARCH_SELECT {prop.kind}->p{prop.target_id} "
+                f"score={score:.1f} pri={prop.priority:.1f} reason={prop.reason[:60]}"
+            )
+        elif score >= SEARCH_MIN_SCORE:
+            world.add_debug(
+                f"SEARCH_REJECT {prop.kind}->p{prop.target_id} "
+                f"score={score:.1f} reason=not_top_{SEARCH_SELECT_LIMIT}"
+            )
+
+    # Any candidates scored → block other offensive fallback this turn
+    blocked = len(scored) > 0
+    return selected, blocked
+
+
 # ── contact recovery ─────────────────────────────────────────────────────────
 
 def agent(obs, config=None):
@@ -5816,6 +6290,15 @@ def agent(obs, config=None):
         MIDGAME_START_STEP <= world.step < MIDGAME_END_STEP
         and len(world.my_planets) >= 3
         and not in_forced_opening
+        and not world.features["final"]
+    )
+    # search_active: True in midgame (not forced-opening, not final).
+    # Offensive missions are routed through search_attack_planner instead of the
+    # plain coordinator; chain/occupiable expansion steps are also moved into the
+    # search pool so the planner can evaluate them holistically.
+    search_active = (
+        not in_forced_opening
+        and world.step >= MIDGAME_START_STEP
         and not world.features["final"]
     )
     if mg_active:
@@ -5886,7 +6369,12 @@ def agent(obs, config=None):
         if hv_props:
             coordinate_missions(world, hv_props, moves, fleet_ratio, deadline)
 
-    if not threat_planets and not arbiter_turn_lock and time.perf_counter() < deadline:
+    # no_offense: True when HV neutral or arbiter locked this turn's offensive budget.
+    # Also updated to True by search_attack_planner if fleet ratio panics.
+    no_offense = high_value_neutral_block or arbiter_turn_lock
+
+    # Chain missions run here only during early game; in midgame they enter the search pool.
+    if not search_active and not threat_planets and not arbiter_turn_lock and time.perf_counter() < deadline:
         chain_props = generate_launchpad_chain_missions(world, mode, deadline)
         if chain_props:
             coordinate_missions(
@@ -5897,7 +6385,8 @@ def agent(obs, config=None):
         world.add_debug("SKIP_CHAIN_AFTER_ARBITER")
 
     # ── 4c. Nearest occupiable expansion (neutral + weak enemy near cluster) ──
-    if not threat_planets and not arbiter_turn_lock and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline:
+    # In midgame, occupiable expansion enters the search pool instead of firing here.
+    if not search_active and not threat_planets and not arbiter_turn_lock and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline:
         occ_props = generate_nearest_occupiable_expansion_missions(world, deadline)
         if occ_props:
             coordinate_missions(world, occ_props, moves, fleet_ratio, deadline)
@@ -5944,128 +6433,306 @@ def agent(obs, config=None):
         if forced_opening_capture(world, moves):
             return _finish()
 
-    # ── 6. Midgame control (step 55–220) ─────────────── proposals → coordinate_missions
-    active_front_planet = None  # shared with coordinator below
+    # ── 6. Midgame state pre-computation ──────────────────────────────────────
+    active_front_planet = None
+    mg_state            = None
+    cluster_stab        = 0.5
+
     if mg_active and time.perf_counter() < deadline:
-        mg_state = classify_midgame_state(world, fleet_ratio)
+        mg_state     = classify_midgame_state(world, fleet_ratio)
         cluster_stab = compute_cluster_stability(world, fleet_ratio)
         active_front_planet, front_desc = select_active_front(world)
         world.add_debug(
             f"MIDGAME mode={mg_state} stab={cluster_stab:.2f} front={front_desc} "
             f"fleet={fleet_ratio:.2f}"
         )
-        mg_blocked = fleet_ratio > MIDGAME_FLEET_HARD
-        if mg_blocked:
-            world.add_debug(f"MIDGAME_RATIO_GUARD fleet={fleet_ratio:.2f}")
-        if not high_value_neutral_block and not arbiter_turn_lock and cluster_stab >= MIDGAME_STABILITY_THRESHOLD and not mg_blocked:
-            mg_props = generate_midgame_control_missions(
-                world, mg_state, active_front_planet, fleet_ratio, deadline
-            )
-            if mg_props and time.perf_counter() < deadline:
-                coordinate_missions(
-                    world, mg_props, moves, fleet_ratio, deadline,
-                    midgame_active=True, midgame_front=active_front_planet
-                )
-        elif high_value_neutral_block:
-            world.add_debug("MIDGAME_OFFENSE_BLOCKED reason=high-value neutral pending")
-        elif mg_blocked:
-            world.add_debug(f"MIDGAME_RATIO_GUARD fleet={fleet_ratio:.2f}")
-        else:
-            world.add_debug(
-                f"MIDGAME_OFFENSE_BLOCKED stab={cluster_stab:.2f} fleet={fleet_ratio:.2f}"
-            )
 
-    # ── 7. Mission coordinator ───────────────────────── proposals → coordinate_missions
-    proposals: list = []
-    no_offense = high_value_neutral_block or arbiter_turn_lock
-    if high_value_neutral_block:
-        world.add_debug("NORMAL_OFFENSE_BLOCKED reason=high-value neutral exists")
-    if arbiter_turn_lock:
-        world.add_debug(f"SKIP_COORDINATOR_AFTER_ARBITER offensive_ships={world.offensive_ships}")
-    if not no_offense and not protect_lead and time.perf_counter() < deadline:
-        proposals += generate_breach_kill_missions(world)
-    if not no_offense and time.perf_counter() < deadline:
-        proposals += generate_snipe_missions(world)
-    if not no_offense and time.perf_counter() < deadline:
-        proposals += generate_expansion_missions(world, deadline)
-    if not no_offense and not protect_lead and time.perf_counter() < deadline:
-        proposals += generate_local_strike_missions(world)
-    if not no_offense and not protect_lead and time.perf_counter() < deadline:
-        proposals += generate_sync_attack_missions(world, mode, deadline)
-    if not no_offense and not protect_lead and time.perf_counter() < deadline:
-        proposals += generate_anti_leader_missions(world)
-    if not no_offense and not protect_lead and time.perf_counter() < deadline:
-        proposals += generate_collapse_missions(world, mode)
-    if not no_offense and not protect_lead and time.perf_counter() < deadline:
-        proposals += generate_opportunistic_strike_missions(world, fleet_ratio, deadline, arbiter_fired=arbiter_fired)
-    elif arbiter_turn_lock and not high_value_neutral_block:
-        world.add_debug(f"SKIP_STRIKE_AFTER_ARBITER offensive_ships={world.offensive_ships}")
-    # ── 8. Endgame consolidation + final drain ────────── proposals → coordinate_missions
-    if world.remaining < ENDGAME_CONSOL_REMAINING and time.perf_counter() < deadline:
-        proposals += generate_endgame_consolidation_missions(world)
-    if time.perf_counter() < deadline:
-        proposals += generate_final_drain_missions(world)
+    # ── 6.5 / 7. SEARCH_ATTACK_PLANNER (midgame and beyond) ──────────────────
+    #
+    # When search_active (step >= 55, not forced-opening, not final):
+    #   • Defensive midgame missions (infection recapture, capture-hold) commit directly.
+    #   • ALL offensive proposals are collected, beam-evaluated, and the best
+    #     1–2 are forwarded to coordinate_missions.  All other offensive fallback
+    #     is blocked for this turn.
+    #
+    # When NOT search_active (early game / final drain):
+    #   • Original midgame control + coordinator run unchanged.
+    #
+    # search_offense_fired: set True when the search commits >= 10 offensive ships.
+    # Used to suppress generic fallback tempo so we don't add scattered attacks
+    # on top of a well-chosen search mission.
+    search_offense_fired = False
+    if search_active and time.perf_counter() < deadline:
+        mg_blocked = mg_active and fleet_ratio > MIDGAME_FLEET_HARD
 
-    # Inject organized wave if reservation is ready or overdue
-    if _wave_reservation["target_id"] is not None and time.perf_counter() < deadline:
-        rsv_tgt = world.planet_by_id.get(_wave_reservation["target_id"])
-        if rsv_tgt is None or rsv_tgt.owner == world.player:
-            _wave_reservation["target_id"] = None
-        else:
-            rsv_pool = sum(world.surplus(p) for p in world.my_planets
-                          if p.id in set(_wave_reservation["source_ids"]))
-            force_launch = world.step >= _wave_reservation["launch_by_step"]
-            if rsv_pool >= _wave_reservation["required_ships"] or force_launch:
-                wave_prop = generate_organized_wave_mission(world, rsv_tgt)
-                if wave_prop is not None:
-                    proposals.insert(0, wave_prop)
+        # ── Defensive midgame: bypass search, commit directly ─────────────────
+        if mg_active and mg_state is not None and not mg_blocked:
+            if (not high_value_neutral_block and not arbiter_turn_lock
+                    and cluster_stab >= MIDGAME_STABILITY_THRESHOLD):
+                def_mg: list = []
+                if time.perf_counter() < deadline:
+                    def_mg += generate_midgame_infection_missions(
+                        world, active_front_planet, deadline
+                    )
+                if time.perf_counter() < deadline:
+                    def_mg += generate_capture_and_hold_missions(world)
+                if def_mg and time.perf_counter() < deadline:
+                    coordinate_missions(
+                        world, def_mg, moves, fleet_ratio, deadline,
+                        midgame_active=mg_active, midgame_front=active_front_planet,
+                    )
+
+        # ── Collect offensive proposals for beam-search ───────────────────────
+        search_pool: list = []
+
+        if not mg_blocked and cluster_stab >= MIDGAME_STABILITY_THRESHOLD:
+            if (mg_active and mg_state is not None
+                    and not high_value_neutral_block and not arbiter_turn_lock):
+                if mg_state in (MidgameState.STABLE_EXPAND, MidgameState.CONTEST_NEUTRALS):
+                    if time.perf_counter() < deadline:
+                        search_pool += generate_midgame_neutral_contest_missions(world, deadline)
+                if (mg_state == MidgameState.FOCUSED_BREACH
+                        and active_front_planet is not None):
+                    if time.perf_counter() < deadline:
+                        search_pool += generate_midgame_focused_breach_missions(
+                            world, active_front_planet, deadline
+                        )
+
+        if not no_offense and not protect_lead and time.perf_counter() < deadline:
+            search_pool += generate_breach_kill_missions(world)
+        if not no_offense and time.perf_counter() < deadline:
+            search_pool += generate_expansion_missions(world, deadline)
+        if not no_offense and not protect_lead and time.perf_counter() < deadline:
+            search_pool += generate_local_strike_missions(world)
+        if not no_offense and not protect_lead and time.perf_counter() < deadline:
+            search_pool += generate_sync_attack_missions(world, mode, deadline)
+        if not no_offense and not protect_lead and time.perf_counter() < deadline:
+            search_pool += generate_anti_leader_missions(world)
+        if not no_offense and not protect_lead and time.perf_counter() < deadline:
+            search_pool += generate_collapse_missions(world, mode)
+        if (not no_offense and not protect_lead and not arbiter_turn_lock
+                and time.perf_counter() < deadline):
+            search_pool += generate_opportunistic_strike_missions(
+                world, fleet_ratio, deadline, arbiter_fired
+            )
+        # Launchpad chain + nearest-occupiable moved from step 4 into the search pool
+        if (not no_offense and not protect_lead and not arbiter_turn_lock
+                and time.perf_counter() < deadline):
+            search_pool += generate_launchpad_chain_missions(world, mode, deadline)
+        if (not no_offense and fleet_ratio <= FLEET_RATIO_SOFT
+                and time.perf_counter() < deadline):
+            search_pool += generate_nearest_occupiable_expansion_missions(world, deadline)
+
+        # Wave reservation: inject if pool is ready or overdue
+        if _wave_reservation["target_id"] is not None and time.perf_counter() < deadline:
+            rsv_tgt = world.planet_by_id.get(_wave_reservation["target_id"])
+            if rsv_tgt is None or rsv_tgt.owner == world.player:
                 _wave_reservation["target_id"] = None
-
-    # Midgame: tighter fleet caps and one-front filter on coordinator proposals
-    filter_front = active_front_planet
-
-    if mg_active:
-        if fleet_ratio > MIDGAME_FLEET_HARD:
-            proposals = [p for p in proposals if p.kind in CRITICAL_MISSIONS]
-        elif fleet_ratio > MIDGAME_FLEET_SOFT:
-            proposals = [
-                p for p in proposals
-                if p.kind in CRITICAL_MISSIONS or p.kind in (
-                    "CAPTURE_NEUTRAL", "LOCAL_PRODUCTION_CAPTURE", "HIGH_VALUE_NEUTRAL_RACE"
+            else:
+                rsv_pool = sum(
+                    world.surplus(p) for p in world.my_planets
+                    if p.id in set(_wave_reservation["source_ids"])
                 )
-            ]
-        # One-front filter
-        if filter_front is not None:
-            always_free = CRITICAL_MISSIONS | {
-                "FINISH_ZERO_CAPTURE", "REINFORCE_CAPTURE",
-                "CAPTURE_NEUTRAL", "LOCAL_PRODUCTION_CAPTURE", "HIGH_VALUE_NEUTRAL_RACE"
-            }
-            keep = []
-            for prop in proposals:
-                if prop.kind in always_free:
-                    keep.append(prop)
-                    continue
-                tgt = world.planet_by_id.get(prop.target_id)
-                if tgt is None:
-                    continue
-                d = dp(tgt, filter_front)
-                if d <= MIDGAME_FRONT_RADIUS:
-                    keep.append(prop)
-                else:
-                    world.add_debug(f"MG_FRONT_FILTER {prop.kind} p{prop.target_id} d={d:.1f}")
-            proposals = keep
+                force_launch = world.step >= _wave_reservation["launch_by_step"]
+                if rsv_pool >= _wave_reservation["required_ships"] or force_launch:
+                    wave_prop = generate_organized_wave_mission(world, rsv_tgt)
+                    if wave_prop is not None:
+                        search_pool.insert(0, wave_prop)
+                    _wave_reservation["target_id"] = None
 
-    if not moves and proposals and time.perf_counter() < deadline:
-        coordinate_missions(
-            world, proposals, moves, fleet_ratio, deadline,
-            midgame_active=mg_active, midgame_front=filter_front
-        )
+        # ── Run beam-search planner ───────────────────────────────────────────
+        if search_pool and time.perf_counter() < deadline:
+            selected_offensive, search_blocked = search_attack_planner(
+                world, search_pool, fleet_ratio, deadline
+            )
+            if search_blocked:
+                no_offense = True
 
-    # ── 9. Fallback tempo ─────────────────────────────── commits directly
-    if not moves and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline:
+            # Track whether search committed any real offensive ships
+            if selected_offensive and any(
+                p.kind in OFFENSIVE_MISSIONS for p in selected_offensive
+            ):
+                search_offense_fired = True
+
+            # Apply midgame fleet-ratio + one-front filters to selected proposals
+            if mg_active and selected_offensive:
+                if fleet_ratio > MIDGAME_FLEET_HARD:
+                    selected_offensive = [
+                        p for p in selected_offensive if p.kind in CRITICAL_MISSIONS
+                    ]
+                elif fleet_ratio > MIDGAME_FLEET_SOFT:
+                    selected_offensive = [
+                        p for p in selected_offensive
+                        if p.kind in CRITICAL_MISSIONS | {
+                            "CAPTURE_NEUTRAL", "LOCAL_PRODUCTION_CAPTURE",
+                            "HIGH_VALUE_NEUTRAL_RACE",
+                        }
+                    ]
+                if active_front_planet is not None:
+                    always_free = CRITICAL_MISSIONS | {
+                        "FINISH_ZERO_CAPTURE", "REINFORCE_CAPTURE",
+                        "CAPTURE_NEUTRAL", "LOCAL_PRODUCTION_CAPTURE",
+                        "HIGH_VALUE_NEUTRAL_RACE",
+                    }
+                    keep = []
+                    for prop in selected_offensive:
+                        if prop.kind in always_free:
+                            keep.append(prop)
+                            continue
+                        tgt_c = world.planet_by_id.get(prop.target_id)
+                        if (tgt_c is not None
+                                and dp(tgt_c, active_front_planet) <= MIDGAME_FRONT_RADIUS):
+                            keep.append(prop)
+                        else:
+                            world.add_debug(
+                                f"SEARCH_MG_FRONT_FILTER {prop.kind} p{prop.target_id}"
+                            )
+                    selected_offensive = keep
+
+            if selected_offensive and time.perf_counter() < deadline:
+                coordinate_missions(
+                    world, selected_offensive, moves, fleet_ratio, deadline,
+                    midgame_active=mg_active, midgame_front=active_front_planet,
+                )
+
+        # Snipe: time-sensitive (specific timing window), always runs after search
+        if not no_offense and time.perf_counter() < deadline:
+            snipe_props = generate_snipe_missions(world)
+            if snipe_props and time.perf_counter() < deadline:
+                coordinate_missions(world, snipe_props, moves, fleet_ratio, deadline)
+
+    else:
+        # ── original midgame + coordinator (pre-55, post-220, or final) ───────
+
+        if mg_active and time.perf_counter() < deadline:
+            mg_blocked = fleet_ratio > MIDGAME_FLEET_HARD
+            if mg_blocked:
+                world.add_debug(f"MIDGAME_RATIO_GUARD fleet={fleet_ratio:.2f}")
+            if (not high_value_neutral_block and not arbiter_turn_lock
+                    and cluster_stab >= MIDGAME_STABILITY_THRESHOLD and not mg_blocked):
+                mg_props = generate_midgame_control_missions(
+                    world, mg_state, active_front_planet, fleet_ratio, deadline
+                )
+                if mg_props and time.perf_counter() < deadline:
+                    coordinate_missions(
+                        world, mg_props, moves, fleet_ratio, deadline,
+                        midgame_active=True, midgame_front=active_front_planet,
+                    )
+            elif high_value_neutral_block:
+                world.add_debug("MIDGAME_OFFENSE_BLOCKED reason=high-value neutral pending")
+            elif mg_blocked:
+                world.add_debug(f"MIDGAME_RATIO_GUARD fleet={fleet_ratio:.2f}")
+            else:
+                world.add_debug(
+                    f"MIDGAME_OFFENSE_BLOCKED stab={cluster_stab:.2f} fleet={fleet_ratio:.2f}"
+                )
+
+        # ── original mission coordinator ──────────────────────────────────────
+        proposals: list = []
+        if high_value_neutral_block:
+            world.add_debug("NORMAL_OFFENSE_BLOCKED reason=high-value neutral exists")
+        if arbiter_turn_lock:
+            world.add_debug(
+                f"SKIP_COORDINATOR_AFTER_ARBITER offensive_ships={world.offensive_ships}"
+            )
+        if not no_offense and not protect_lead and time.perf_counter() < deadline:
+            proposals += generate_breach_kill_missions(world)
+        if not no_offense and time.perf_counter() < deadline:
+            proposals += generate_snipe_missions(world)
+        if not no_offense and time.perf_counter() < deadline:
+            proposals += generate_expansion_missions(world, deadline)
+        if not no_offense and not protect_lead and time.perf_counter() < deadline:
+            proposals += generate_local_strike_missions(world)
+        if not no_offense and not protect_lead and time.perf_counter() < deadline:
+            proposals += generate_sync_attack_missions(world, mode, deadline)
+        if not no_offense and not protect_lead and time.perf_counter() < deadline:
+            proposals += generate_anti_leader_missions(world)
+        if not no_offense and not protect_lead and time.perf_counter() < deadline:
+            proposals += generate_collapse_missions(world, mode)
+        if not no_offense and not protect_lead and time.perf_counter() < deadline:
+            proposals += generate_opportunistic_strike_missions(
+                world, fleet_ratio, deadline, arbiter_fired=arbiter_fired
+            )
+        elif arbiter_turn_lock and not high_value_neutral_block:
+            world.add_debug(
+                f"SKIP_STRIKE_AFTER_ARBITER offensive_ships={world.offensive_ships}"
+            )
+
+        # Wave reservation
+        if _wave_reservation["target_id"] is not None and time.perf_counter() < deadline:
+            rsv_tgt = world.planet_by_id.get(_wave_reservation["target_id"])
+            if rsv_tgt is None or rsv_tgt.owner == world.player:
+                _wave_reservation["target_id"] = None
+            else:
+                rsv_pool = sum(
+                    world.surplus(p) for p in world.my_planets
+                    if p.id in set(_wave_reservation["source_ids"])
+                )
+                force_launch = world.step >= _wave_reservation["launch_by_step"]
+                if rsv_pool >= _wave_reservation["required_ships"] or force_launch:
+                    wave_prop = generate_organized_wave_mission(world, rsv_tgt)
+                    if wave_prop is not None:
+                        proposals.insert(0, wave_prop)
+                    _wave_reservation["target_id"] = None
+
+        filter_front = active_front_planet
+        if mg_active:
+            if fleet_ratio > MIDGAME_FLEET_HARD:
+                proposals = [p for p in proposals if p.kind in CRITICAL_MISSIONS]
+            elif fleet_ratio > MIDGAME_FLEET_SOFT:
+                proposals = [
+                    p for p in proposals
+                    if p.kind in CRITICAL_MISSIONS or p.kind in (
+                        "CAPTURE_NEUTRAL", "LOCAL_PRODUCTION_CAPTURE", "HIGH_VALUE_NEUTRAL_RACE"
+                    )
+                ]
+            if filter_front is not None:
+                always_free = CRITICAL_MISSIONS | {
+                    "FINISH_ZERO_CAPTURE", "REINFORCE_CAPTURE",
+                    "CAPTURE_NEUTRAL", "LOCAL_PRODUCTION_CAPTURE", "HIGH_VALUE_NEUTRAL_RACE",
+                }
+                keep = []
+                for prop in proposals:
+                    if prop.kind in always_free:
+                        keep.append(prop)
+                        continue
+                    tgt = world.planet_by_id.get(prop.target_id)
+                    if tgt is None:
+                        continue
+                    d = dp(tgt, filter_front)
+                    if d <= MIDGAME_FRONT_RADIUS:
+                        keep.append(prop)
+                    else:
+                        world.add_debug(
+                            f"MG_FRONT_FILTER {prop.kind} p{prop.target_id} d={d:.1f}"
+                        )
+                proposals = keep
+
+        if not moves and proposals and time.perf_counter() < deadline:
+            coordinate_missions(
+                world, proposals, moves, fleet_ratio, deadline,
+                midgame_active=mg_active, midgame_front=filter_front,
+            )
+
+    # ── 8. Endgame consolidation + final drain ─────────── always run ──────────
+    if world.remaining < ENDGAME_CONSOL_REMAINING and time.perf_counter() < deadline:
+        eg_props = generate_endgame_consolidation_missions(world)
+        if eg_props and time.perf_counter() < deadline:
+            coordinate_missions(world, eg_props, moves, fleet_ratio, deadline)
+    if time.perf_counter() < deadline:
+        drain_props = generate_final_drain_missions(world)
+        if drain_props and time.perf_counter() < deadline:
+            coordinate_missions(world, drain_props, moves, fleet_ratio, deadline)
+
+    # ── 9. Fallback tempo ──────────────────────────────── commits directly ────
+    # Skip generic fallback when the search already fired a real offensive mission
+    # this turn — prevents tacking small uncoordinated attacks onto a chosen mission.
+    if (not moves and not search_offense_fired
+            and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline):
         force_action_if_stalling(world, moves, idle_turns, deadline)
 
-    if not moves and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline:
+    if (not moves and not search_offense_fired
+            and fleet_ratio <= FLEET_RATIO_SOFT and time.perf_counter() < deadline):
         fallback_tempo(world, moves)
 
     missed_opportunity_detector(world, moves)
