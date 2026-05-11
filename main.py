@@ -653,6 +653,7 @@ MISSION_TYPE_ALIASES = {
     "CAPTURE_HIGH_PROD_NEUTRAL": "LOCAL_PRODUCTION_CAPTURE",
     "REINFORCE_FRONTIER_HUB": "REINFORCE_CAPTURE",
     "RECAPTURE_LOST_PLANET": "RECAPTURE_LOST",
+    "CORE_CHAIN_RECOVERY": "CORE_CHAIN_RECOVERY",
     "CONTEST_ENEMY_PRODUCTION": "SYNC_ATTACK",
     "RESCUE_BEFORE_FALL": "SAVE_UNDER_ATTACK",
     "CONTEST_NEUTRAL": "HIGH_VALUE_NEUTRAL_RACE",
@@ -668,6 +669,7 @@ MISSION_TYPE_ALIASES = {
 MISSION_TYPES = {
     "DEFEND_HOLD",
     "SAVE_UNDER_ATTACK",
+    "CORE_CHAIN_RECOVERY",
     "RECAPTURE_LOST",
     "FINISH_ZERO_CAPTURE",
     "CAPTURE_NEUTRAL",
@@ -685,10 +687,8 @@ MISSION_TYPES = {
 CRITICAL_MISSIONS = {
     "DEFEND_HOLD",
     "SAVE_UNDER_ATTACK",
-    "RECAPTURE_LOST",
     "FINISH_ZERO_CAPTURE",
     "DOOMED_EVACUATION",
-    "FINAL_DRAIN",
 }
 
 REINFORCEMENT_MISSIONS = {
@@ -698,6 +698,7 @@ REINFORCEMENT_MISSIONS = {
 }
 
 OFFENSIVE_MISSIONS = {
+    "CORE_CHAIN_RECOVERY",
     "RECAPTURE_LOST",
     "FINISH_ZERO_CAPTURE",
     "CAPTURE_NEUTRAL",
@@ -1263,8 +1264,6 @@ class WorldModel:
         return last is not None and self.step - last <= SOURCE_COOLDOWN_TURNS
 
     def source_is_safe_for(self, src, tgt, mission_type, ships, mission_reason=""):
-        if mission_type == "FINAL_DRAIN":
-            return True, ""
         evac_fall_turn = None
         if mission_type == "DOOMED_EVACUATION":
             evac_tl = self.simulate_planet_timeline(src, DOOMED_EVAC_HORIZON)
@@ -1294,7 +1293,7 @@ class WorldModel:
             return False, "source unsafe: recently reinforced cooldown"
         if is_storage_planet(src) and mission_type in OFFENSIVE_MISSIONS and not evacuating:
             allowed_storage_release = mission_type in (
-                "RECAPTURE_LOST", "FINISH_ZERO_CAPTURE", "FINAL_DRAIN"
+                "CORE_CHAIN_RECOVERY", "RECAPTURE_LOST", "FINISH_ZERO_CAPTURE", "FINAL_DRAIN"
             )
             target_role = radius_class(tgt) if tgt is not None else "SMALL"
             launchpad_escape = (
@@ -1305,7 +1304,7 @@ class WorldModel:
             )
             local_support = tgt is not None and dp(src, tgt) <= CHEAP_RECAPTURE_LOCAL_DIST
             if allowed_storage_release:
-                if mission_type == "RECAPTURE_LOST":
+                if mission_type in ("CORE_CHAIN_RECOVERY", "RECAPTURE_LOST"):
                     self.add_debug(f"SMALL_STORAGE_RELEASE_RECAPTURE src=p{src.id} target=p{getattr(tgt, 'id', '?')}")
             elif launchpad_escape:
                 pass
@@ -1472,10 +1471,10 @@ class WorldModel:
             return True, ""
 
         if mission_type in OFFENSIVE_MISSIONS:
-            if tgt.owner == self.player and mission_type != "RECAPTURE_LOST":
+            if tgt.owner == self.player and mission_type not in ("CORE_CHAIN_RECOVERY", "RECAPTURE_LOST"):
                 return False, "mission invalidated: target already mine"
             owner_at, _, _ = self.target_owner_at_arrival(tgt, eta, planned=planned_arrivals)
-            if mission_type == "RECAPTURE_LOST" and tgt.owner == self.player and owner_at == self.player:
+            if mission_type in ("CORE_CHAIN_RECOVERY", "RECAPTURE_LOST") and tgt.owner == self.player and owner_at == self.player:
                 return False, "mission invalidated: recapture before fall"
             if mission_type in ("CAPTURE_NEUTRAL", "LOCAL_PRODUCTION_CAPTURE") and owner_at not in (-1, self.player):
                 return False, "target predicted enemy before arrival"
@@ -1609,7 +1608,7 @@ def should_allow_enemy_attack(world, target, mission_type, reason=""):
 
     Rules applied in order:
       1. Always block comets.
-      2. Always allow: recently-mine, actively-threatening, RECAPTURE_LOST,
+      2. Always allow: recently-mine, actively-threatening, core recovery,
          FINISH_ZERO_CAPTURE, enemy has <= 3 planets (collapse possible).
       3. Hard cap: fleet ratio > FLEET_RATIO_HARD → block.
       4. Not holdable AND far from cluster → block.
@@ -1625,7 +1624,7 @@ def should_allow_enemy_attack(world, target, mission_type, reason=""):
         return False
 
     # ── Always-allow shortcuts ────────────────────────────────────────────────
-    if mission_type in ("RECAPTURE_LOST", "FINISH_ZERO_CAPTURE"):
+    if mission_type in ("CORE_CHAIN_RECOVERY", "RECAPTURE_LOST", "FINISH_ZERO_CAPTURE"):
         world.add_debug(f"ENEMY_ATTACK_ALLOWED reason={mission_type} target=p{target.id}")
         return True
 
@@ -1704,6 +1703,7 @@ def very_recent_losses(world):
 
 def build_cheap_recapture_plan(world, lost):
     """DEPRECATED_OLD_PIPELINE_UNREACHABLE: active agent uses build_chain_retrigger_response()."""
+    return None
     """Return a decisive local recapture proposal, or None with a debug marker."""
     world.add_debug(f"CHEAP_RECAPTURE_CHECK p{lost.id}")
     local_sources = sorted(
@@ -1850,6 +1850,7 @@ def generate_counterattack_after_loss_missions(world, recent_losses, deadline):
 
 def try_cheap_recapture_or_counterattack(world, moves, fleet_ratio, deadline):
     """DEPRECATED_OLD_PIPELINE_UNREACHABLE: panic recapture is disabled in the chain agent."""
+    return False
     """One-turn recent-loss response with no locks, containment, or TTL strategy."""
     before_moves = len(moves)
     world.add_debug("BACKYARD_LOGIC_REMOVED")
@@ -1897,6 +1898,7 @@ def try_cheap_recapture_or_counterattack(world, moves, fleet_ratio, deadline):
 
 def choose_strategy_mode(world, idle_turns):
     """DEPRECATED_OLD_PIPELINE_UNREACHABLE: active agent follows the launchpad-chain pipeline."""
+    return StrategyMode.OPENING_TEMPO
     f = world.features
     if f["final"]:
         return StrategyMode.FINAL_DRAIN
@@ -2472,6 +2474,7 @@ def force_action_if_stalling(world, moves, idle_turns, deadline):
 
 def fallback_tempo(world, moves):
     """DEPRECATED_OLD_PIPELINE_UNREACHABLE: active agent uses chain-aware fallback only."""
+    return False
     if moves:
         return False
     targets = world.neutral_planets or world.enemy_planets
@@ -5119,6 +5122,7 @@ def early_nearest_expansion_360(world, moves):
 
 def forced_opening_capture(world, moves):
     """DEPRECATED_OLD_PIPELINE_UNREACHABLE: active opening is launchpad-chain route scoring."""
+    return False
     """Stuck detector: force-capture nearest neutral when stuck on 1 planet past OPENING_STUCK_STEP."""
     if len(world.my_planets) != 1 or world.step < OPENING_STUCK_STEP:
         return False
@@ -7413,6 +7417,7 @@ def _score_search_proposal(world, prop, sim):
 
 def search_attack_planner(world, proposals, fleet_ratio, deadline):
     """DEPRECATED_OLD_PIPELINE_UNREACHABLE: active agent commits funded chain proposals directly."""
+    return [], False
     """
     Beam-search style offensive planner.
 
@@ -8182,7 +8187,7 @@ def build_chain_retrigger_response(world, lost_planet, states, chain_plan=None, 
     Returns a MissionProposal (or None if banking is chosen).
     """
     world.add_debug(f"PLANET_LOST_CHAIN_RETRIGGERED p{lost_planet.id}")
-    world.add_debug(f"CHEAP_RECAPTURE_DISABLED_BY_CHAIN_POLICY p{lost_planet.id}")
+    world.add_debug(f"CORE_CHAIN_RECOVERY_POLICY_SOURCE_FIRST p{lost_planet.id}")
 
     source = identify_attack_source(world, lost_planet)
     safe_surplus = sum(st.safe_surplus for st in states.values())
@@ -8241,7 +8246,7 @@ def build_chain_retrigger_response(world, lost_planet, states, chain_plan=None, 
     if not _is_core_chain_planet(world, lost_planet, chain_plan):
         return None
 
-    world.add_debug(f"CHEAP_RECAPTURE_ALLOWED_ONLY_CORE_EMERGENCY p{lost_planet.id}")
+    world.add_debug(f"CORE_CHAIN_RECOVERY_ALLOWED p{lost_planet.id}")
     nearby = sorted(
         [p for p in world.my_planets
          if dp(p, lost_planet) <= 34.0
@@ -8263,15 +8268,16 @@ def build_chain_retrigger_response(world, lost_planet, states, chain_plan=None, 
     ok_grp, _ = validate_grouped_launch(world, lost_planet, planned)
     if not ok_grp or not world.can_hold_after_capture(lost_planet, max(eta_vals), total):
         return None
+    world.add_debug(f"CORE_CHAIN_RECOVERY_SELECTED p{lost_planet.id} total={total}")
     return MissionProposal(
-        kind="RECAPTURE_LOST",
+        kind="CORE_CHAIN_RECOVERY",
         target_id=lost_planet.id,
         priority=111.0,
         required_ships=total,
         planned_sources=planned,
         eta_min=min(eta_vals),
         eta_max=max(eta_vals),
-        reason=f"core_emergency_recapture p{lost_planet.id}",
+        reason=f"core_chain_recovery p{lost_planet.id}",
     )
 
 
@@ -8319,16 +8325,42 @@ def emergency_defense_chain(world, states, moves):
 
 # ── Endgame drain ─────────────────────────────────────────────────────────────
 
-def _final_drain_chain(world, moves):
-    """Send all remaining surplus to reachable targets in the final steps."""
+def _final_drain_target_value(world, target, chain_plan):
+    if target.owner == world.player or world.is_comet(target):
+        return False
+    if target.id in set(chain_plan[:10]):
+        return True
+    if target.owner not in (-1, world.player):
+        return True
+    return (
+        int(target.production) >= 4
+        or (is_idle(target) and _planet_role(target) in (ROLE_LAUNCHPAD, ROLE_BRIDGE))
+        or _chain_small_has_value(world, target)
+    )
+
+
+def _final_drain_chain(world, moves, chain_plan=None):
+    """Endgame drain only into chain/collapse targets that can convert before time."""
+    chain_plan = chain_plan or []
     for src in sorted(world.my_planets, key=lambda p: -int(p.ships)):
         spare = round_down_to_granularity(
             max(0, int(src.ships) - world.committed.get(src.id, 0) - 1)
         )
         if spare < MIN_SEND_SHIPS:
             continue
-        for tgt in sorted(world.enemy_planets + world.neutral_planets,
-                          key=lambda t: world.eta(src, t, spare)):
+        targets = [
+            tgt for tgt in world.enemy_planets + world.neutral_planets
+            if _final_drain_target_value(world, tgt, chain_plan)
+        ]
+        for tgt in sorted(
+            targets,
+            key=lambda t: (
+                0 if t.id in set(chain_plan[:10]) else 1,
+                0 if t.owner not in (-1, world.player) else 1,
+                world.eta(src, t, spare),
+                -int(t.production),
+            ),
+        ):
             if world.is_comet(tgt):
                 continue
             if world.eta(src, tgt, spare) > world.remaining - 1:
@@ -8336,6 +8368,8 @@ def _final_drain_chain(world, moves):
             need = world.ships_needed_to_capture(src, tgt, spare)
             send = normalize_send_amount(need)
             if send < MIN_SEND_SHIPS or send > spare:
+                continue
+            if not world.can_hold_after_capture(tgt, world.eta(src, tgt, send), send, final_all_in=True):
                 continue
             if world.commit(src, tgt, send, moves, mission_type="FINAL_DRAIN"):
                 break
@@ -8563,7 +8597,7 @@ def agent(obs, config=None):
 
     # ── 9. Final drain (endgame only) ─────────────────────────────────────────
     if world.features.get("final") and time.perf_counter() < deadline:
-        _final_drain_chain(world, moves)
+        _final_drain_chain(world, moves, chain_plan)
 
     if DEBUG:
         for event in world.debug_events:
