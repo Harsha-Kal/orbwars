@@ -199,6 +199,9 @@ SEND_GRANULARITY = 5    # every launch size must be a multiple of this value
 PHASE_OPENING_PCT  = 0.12   # my control below this → OPENING_EXPANSION
 PHASE_SWEEP_PCT    = 0.28   # my control below this → LOCAL_SWEEP
 PHASE_EXPAND_PCT   = 0.45   # my control below this → EXPANSION_CONTROL
+PHASE_INITIAL_MAX   = 0.20   # control-based INITIAL_EXPANSION ceiling
+PHASE_MIDGAME_MAX   = 0.50   # control-based MIDGAME_CONTROL ceiling
+PHASE_COLLAPSE_MIN  = 0.65   # control-based COLLAPSE trigger
 # above 0.45 → CONTACT or COLLAPSE based on enemy proximity
 
 # ── bridge planet detection ───────────────────────────────────────────────────
@@ -590,6 +593,10 @@ class MidgameState:
 
 class ControlPhase:
     """Strategic phase driven by map-control percentage, not step number."""
+    INITIAL_EXPANSION = "INITIAL_EXPANSION"
+    MIDGAME_CONTROL   = "MIDGAME_CONTROL"
+    DOMINANCE_PHASE   = "DOMINANCE_PHASE"
+    COLLAPSE_PHASE    = "COLLAPSE_PHASE"
     OPENING_EXPANSION = "OPENING_EXPANSION"   # my_pct < 12% or <= 3 planets
     LOCAL_SWEEP       = "LOCAL_SWEEP"         # 12%–28%, many neutrals remain
     EXPANSION_CONTROL = "EXPANSION_CONTROL"   # 28%–45%, cluster stable
@@ -1083,9 +1090,18 @@ class WorldModel:
         high_neutrals = sum(1 for n in self.neutral_planets if n.production >= 4)
         enemy_avg_ships = sum(p.ships for p in self.enemy_planets) / max(1, len(self.enemy_planets))
         incoming_threat_count = sum(1 for p in self.my_planets if self.real_incoming_threat(p)["deficit"] > 0)
+        control_ratio = len(self.my_planets) / max(1, len(self.normal_planets))
+        control_final = (
+            self.step >= FINAL_STEPS
+            or self.remaining < 45
+            or (control_ratio >= PHASE_COLLAPSE_MIN and bool(self.enemy_planets))
+            or (control_ratio >= PHASE_MIDGAME_MAX and self.my_total_ships > self.enemy_total_ships * 1.5)
+            or (control_ratio >= PHASE_MIDGAME_MAX and self.my_prod > self.enemy_prod * 1.4)
+        )
         self.features = {
             "prod_ratio": self.my_prod / max(1, self.enemy_prod),
             "ship_ratio": self.my_total_ships / max(1, self.enemy_total_ships),
+            "control_ratio": control_ratio,
             "leader_ahead": self.leader is not None and self.leader_score > self.my_score * 1.22,
             "neutral_count": len(self.neutral_planets),
             "high_neutral_count": high_neutrals,
@@ -1095,7 +1111,7 @@ class WorldModel:
             "ahead": self.my_score > max(1, self.leader_score) * 1.18 or self.my_prod > max(1, self.enemy_prod) * 1.25,
             "behind": self.my_score * 1.25 < max(1, self.leader_score) or self.my_prod * 1.3 < max(1, self.enemy_prod),
             "late": self.step > 380 or self.remaining < 120,
-            "final": self.step >= FINAL_STEPS or self.remaining < 45,
+            "final": control_final,
         }
 
     def aim(self, src, tgt, ships):
@@ -2055,6 +2071,57 @@ def compute_control_pct(world):
         len(world.my_planets)      / total,
         len(world.enemy_planets)   / total,
         len(world.neutral_planets) / total,
+    )
+
+
+def planet_control_ratio(world):
+    ratio = len(world.my_planets) / max(1, len(world.normal_planets))
+    world.add_debug(f"PLANET_CONTROL_RATIO {ratio:.2f}")
+    return ratio
+
+
+def enemy_planets_total(world):
+    return len([p for p in world.enemy_planets if not world.is_comet(p)])
+
+
+def collapse_phase_triggered(world, control_ratio=None):
+    control_ratio = planet_control_ratio(world) if control_ratio is None else control_ratio
+    return (
+        control_ratio >= PHASE_COLLAPSE_MIN
+        or enemy_planets_total(world) <= 6
+        or world.my_prod > world.enemy_prod * 1.6
+        or world.my_total_ships > world.enemy_total_ships * 1.7
+    )
+
+
+def control_phase_selected(world):
+    control_ratio = planet_control_ratio(world)
+    if collapse_phase_triggered(world, control_ratio):
+        phase = ControlPhase.COLLAPSE_PHASE
+        world.add_debug("COLLAPSE_PHASE_BY_PLANET_CONTROL")
+    elif control_ratio >= PHASE_MIDGAME_MAX:
+        phase = ControlPhase.DOMINANCE_PHASE
+        world.add_debug("DOMINANCE_PHASE_TRIGGERED")
+    elif control_ratio >= PHASE_INITIAL_MAX:
+        phase = ControlPhase.MIDGAME_CONTROL
+        world.add_debug("MIDGAME_CONTROL_PHASE")
+    else:
+        phase = ControlPhase.INITIAL_EXPANSION
+        world.add_debug("INITIAL_EXPANSION_PHASE")
+    world.add_debug(f"CONTROL_PHASE_SELECTED {phase}")
+    return phase, control_ratio
+
+
+def control_based_final_phase(world, phase=None, control_ratio=None):
+    if control_ratio is None:
+        control_ratio = len(world.my_planets) / max(1, len(world.normal_planets))
+    return (
+        world.step >= FINAL_STEPS
+        or world.remaining < 45
+        or (control_ratio >= PHASE_COLLAPSE_MIN and enemy_planets_total(world) > 0)
+        or (control_ratio >= PHASE_MIDGAME_MAX and world.my_total_ships > world.enemy_total_ships * 1.5)
+        or (control_ratio >= PHASE_MIDGAME_MAX and world.my_prod > world.enemy_prod * 1.4)
+        or phase == ControlPhase.COLLAPSE_PHASE
     )
 
 
@@ -7842,6 +7909,10 @@ def _chain_planet_score(world, planet):
 def _chain_small_has_value(world, planet, anchor=None):
     if _planet_role(planet) != ROLE_STORAGE:
         return True
+    if planet.owner not in (-1, world.player):
+        nearest = min((dp(m, planet) for m in world.my_planets), default=999.0)
+        if nearest <= 70.0 or enemy_planets_total(world) <= 8:
+            return True
     nearby_value = [
         q for q in world.normal_planets
         if q.id != planet.id
@@ -9472,6 +9543,12 @@ def _nearest_useful_target_candidate(world, states, chain_plan, exclude_target_i
 def _distance_discipline_allows_target(world, states, target, mission_reason):
     if target is None or world.step > 120:
         return True
+    control_ratio = len(world.my_planets) / max(1, len(world.normal_planets))
+    if control_ratio < PHASE_INITIAL_MAX and target.owner not in (-1, world.player):
+        nearest = min((dp(m, target) for m in world.my_planets), default=999.0)
+        if nearest > 55.0 or not is_local_enemy_opportunity(world, target):
+            world.add_debug(f"INITIAL_EXPANSION_BLOCKED_FAR_TARGET p{target.id}")
+            return False
     if any(tag in (mission_reason or "") for tag in ("nearest_useful", "small_start_escape", "defense", "recovery", "final", "collapse")):
         return True
     src = min(world.my_planets, key=lambda p: dp(p, target), default=None)
@@ -10020,6 +10097,11 @@ def run_adaptive_strategy_mode(world, states, chain_plan, opponent_models, adapt
 def _target_improves_control(world, target, chain_plan):
     if target.owner == world.player or world.is_comet(target):
         return False
+    if target.owner not in (-1, world.player) and _planet_role(target) == ROLE_STORAGE:
+        nearest = min((dp(m, target) for m in world.my_planets), default=999.0)
+        if nearest <= 72.0 or enemy_planets_total(world) <= 8:
+            world.add_debug(f"SMALL_PLANET_CONTROL_BONUS p{target.id}")
+            return True
     if int(target.production) >= 2:
         return True
     if _planet_role(target) in (ROLE_BRIDGE, ROLE_LAUNCHPAD):
@@ -10029,11 +10111,15 @@ def _target_improves_control(world, target, chain_plan):
     if is_idle(target):
         return True
     if _chain_small_has_value(world, target):
+        if target.owner == -1 and _planet_role(target) == ROLE_STORAGE:
+            world.add_debug(f"SMALL_NEUTRAL_CONNECTOR_SELECTED p{target.id}")
         return True
     if len(_campaign_followup_options(world, target)) >= 1:
         return True
     if target.owner not in (-1, world.player) and is_local_enemy_opportunity(world, target):
         return True
+    if target.owner == -1 and _planet_role(target) == ROLE_STORAGE:
+        world.add_debug(f"SMALL_NEUTRAL_REJECTED_NOT_USEFUL p{target.id}")
     return False
 
 
@@ -10644,6 +10730,135 @@ def run_midgame_dominance_attack_mode(world, states, chain_plan, moves, deadline
     return launched > 0
 
 
+def _small_enemy_planet_score(world, target, chain_plan, phase):
+    nearest = min((dp(m, target) for m in world.my_planets), default=999.0)
+    score = max(0.0, 95.0 - nearest) * 2.0 - int(target.ships) * 1.2
+    if target.id in set(chain_plan[:18]) or len(_campaign_followup_options(world, target)) >= 1:
+        score += 95.0
+    if is_local_enemy_opportunity(world, target):
+        score += 75.0
+    if enemy_planets_total(world) <= 8:
+        score += 180.0
+    if phase in (ControlPhase.DOMINANCE_PHASE, ControlPhase.COLLAPSE_PHASE):
+        score += 120.0
+    if target.owner == world.leader:
+        score += 45.0
+    return score
+
+
+def run_small_opponent_planet_capture_mode(world, states, chain_plan, phase, moves, deadline):
+    if moves or time.perf_counter() > deadline:
+        return False
+    candidates = []
+    for target in world.enemy_planets:
+        if world.is_comet(target) or _planet_role(target) != ROLE_STORAGE:
+            continue
+        nearest = min((dp(m, target) for m in world.my_planets), default=999.0)
+        if nearest > 82.0 and phase != ControlPhase.COLLAPSE_PHASE:
+            world.add_debug(f"SMALL_PLANET_REJECTED_FAR_ISOLATED p{target.id} d={nearest:.1f}")
+            continue
+        route_value = (
+            target.id in set(chain_plan[:18])
+            or len(_campaign_followup_options(world, target)) >= 1
+            or is_local_enemy_opportunity(world, target)
+            or phase in (ControlPhase.DOMINANCE_PHASE, ControlPhase.COLLAPSE_PHASE)
+            or enemy_planets_total(world) <= 8
+        )
+        if not route_value:
+            world.add_debug(f"SMALL_PLANET_REJECTED_FAR_ISOLATED p{target.id} d={nearest:.1f}")
+            continue
+        score = _small_enemy_planet_score(world, target, chain_plan, phase)
+        candidates.append((score, nearest, int(target.ships), target))
+    if not candidates:
+        return False
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+    world.add_debug("SMALL_OPPONENT_PLANET_CAPTURE_MODE")
+    for score, _nearest, _ships, target in candidates[:6]:
+        if target.id in set(chain_plan[:18]) or len(_campaign_followup_options(world, target)) >= 1:
+            world.add_debug(f"SMALL_PLANET_BRIDGE_BONUS p{target.id}")
+        if enemy_planets_total(world) <= 8:
+            world.add_debug(f"SMALL_PLANET_LAST_ENEMY_BONUS p{target.id}")
+        world.add_debug(f"SMALL_PLANET_CONTROL_BONUS p{target.id}")
+        prop = _main35_make_capture_prop(
+            world,
+            states,
+            target,
+            "small_opponent_planet_capture",
+            136.0 + score * 0.04,
+            max_sources=4,
+            source_radius=92.0 if phase == ControlPhase.COLLAPSE_PHASE else 76.0,
+            hold_margin=max(8, int(target.production) * 3),
+        )
+        if prop is None:
+            continue
+        if _commit_proposal(world, prop, moves):
+            world.add_debug(f"SMALL_ENEMY_PLANET_TARGETED p{target.id}")
+            return True
+    return False
+
+
+def run_control_phase_attack_mode(world, states, chain_plan, phase, control_ratio, moves, deadline):
+    if moves or time.perf_counter() > deadline:
+        return False
+    if phase not in (ControlPhase.DOMINANCE_PHASE, ControlPhase.COLLAPSE_PHASE):
+        return False
+    if phase == ControlPhase.DOMINANCE_PHASE:
+        world.add_debug("DOMINANCE_PHASE_TRIGGERED")
+        world.add_debug("CONTROL_BASED_FINAL_PHASE")
+        world.add_debug("STEP_BASED_FINAL_PHASE_BYPASSED")
+    else:
+        world.add_debug("COLLAPSE_PHASE_BY_PLANET_CONTROL")
+    candidates = []
+    for target in world.enemy_planets:
+        if world.is_comet(target):
+            continue
+        nearest = min((dp(m, target) for m in world.my_planets), default=999.0)
+        role = _planet_role(target)
+        category = 0
+        if int(target.production) >= 3:
+            category = 0
+        elif role == ROLE_LAUNCHPAD:
+            category = 1
+        elif role == ROLE_BRIDGE or is_local_enemy_opportunity(world, target):
+            category = 2
+        elif role == ROLE_STORAGE:
+            category = 3
+        if phase == ControlPhase.COLLAPSE_PHASE and enemy_planets_total(world) <= 6:
+            category = min(category, 2)
+        score = (
+            int(target.production) * 80.0
+            + max(0.0, 110.0 - nearest) * 1.8
+            - int(target.ships) * 0.75
+            + (90.0 if role == ROLE_STORAGE else 0.0)
+            + (160.0 if enemy_planets_total(world) <= 6 else 0.0)
+        )
+        candidates.append((category, -score, nearest, int(target.ships), target))
+    candidates.sort()
+    for _category, neg_score, _nearest, _ships, target in candidates[:10]:
+        reason = "control_based_collapse_attack" if phase == ControlPhase.COLLAPSE_PHASE else "dominance_phase_attack"
+        prop = _main35_make_capture_prop(
+            world,
+            states,
+            target,
+            reason,
+            170.0 + (-neg_score) * 0.03,
+            max_sources=6,
+            source_radius=120.0 if phase == ControlPhase.COLLAPSE_PHASE else 95.0,
+            hold_margin=max(12, int(target.production) * 5),
+        )
+        if prop is None:
+            continue
+        if _commit_proposal(world, prop, moves):
+            if phase == ControlPhase.COLLAPSE_PHASE:
+                world.add_debug(f"CONTROL_BASED_COLLAPSE_ATTACK p{target.id}")
+                world.add_debug("FINAL_DRAIN_STARTED_EARLY_BY_CONTROL")
+            else:
+                world.add_debug(f"DOMINANCE_ATTACK_SELECTED p{target.id}")
+            world.add_debug("NO_WAIT_UNTIL_FINAL_STEPS")
+            return True
+    return False
+
+
 # ── Source lock disabled ──────────────────────────────────────────────────────
 # The new strategy does not use backyard source locks.
 # world.backyard_locked_sources stays empty; no sources are locked by threat tracking.
@@ -10748,6 +10963,7 @@ def agent(obs, config=None):
     chain_plan = build_launchpad_chain_plan(world, states)
     world._active_chain_plan = chain_plan
     world._active_structure = classify_planet_structure(world, states, chain_plan)
+    control_phase, control_ratio = control_phase_selected(world)
 
     # ── 5. Choose staging launchpad ───────────────────────────────────────────
     staging_id = choose_staging_launchpad(world, states, chain_plan)
@@ -10756,9 +10972,16 @@ def agent(obs, config=None):
     # ── 5a. Main33 tempo layers, funded/committed by main34 packet rules ─────
     if not moves and time.perf_counter() < deadline:
         run_nearest_useful_target_lock(world, states, chain_plan, moves, deadline)
+        if moves and control_phase == ControlPhase.INITIAL_EXPANSION:
+            world.add_debug("INITIAL_EXPANSION_NEAREST_TARGET")
 
     if not moves and time.perf_counter() < deadline:
         run_midgame_stabilization_mode(world, states, chain_plan, moves, deadline)
+        if moves and control_phase == ControlPhase.MIDGAME_CONTROL:
+            world.add_debug("MIDGAME_STRUCTURE_STABILIZE")
+
+    if not moves and time.perf_counter() < deadline:
+        run_small_opponent_planet_capture_mode(world, states, chain_plan, control_phase, moves, deadline)
 
     if not moves and time.perf_counter() < deadline:
         run_four_player_expand_first(world, moves, deadline)
@@ -10793,6 +11016,9 @@ def agent(obs, config=None):
         run_expansion_campaign(world, states, chain_plan, moves, deadline)
 
     # ── 9. Midgame dominance: convert large advantage before final drain ─────
+    if not moves and time.perf_counter() < deadline:
+        run_control_phase_attack_mode(world, states, chain_plan, control_phase, control_ratio, moves, deadline)
+
     if not moves and time.perf_counter() < deadline:
         run_midgame_dominance_attack_mode(world, states, chain_plan, moves, deadline)
 
@@ -10977,7 +11203,11 @@ def agent(obs, config=None):
         log_missed_opportunities(world, states, chain_plan)
 
     # ── 14. Final drain (endgame only) ────────────────────────────────────────
-    if world.features.get("final") and time.perf_counter() < deadline:
+    if control_based_final_phase(world, control_phase, control_ratio) and time.perf_counter() < deadline:
+        if not (world.step >= FINAL_STEPS or world.remaining < 45):
+            world.add_debug("FINAL_DRAIN_STARTED_EARLY_BY_CONTROL")
+            world.add_debug("CONTROL_BASED_FINAL_PHASE")
+            world.add_debug("NO_WAIT_UNTIL_FINAL_STEPS")
         _final_drain_chain(world, moves, chain_plan)
 
     if DEBUG:
