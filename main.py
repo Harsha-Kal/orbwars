@@ -390,6 +390,19 @@ def aim_valid(src, tgt, ang_vel, ships):
     miss = dist(aimed_x, aimed_y, tx, ty)
     return angle, miss <= tgt.radius + HIT_MARGIN
 
+def aim_solution_metrics(src, tgt, ang_vel, ships):
+    tx, ty = tgt.x, tgt.y
+    d_est = dp(src, tgt)
+    for _ in range(18):
+        d_est = dist(src.x, src.y, tx, ty)
+        t_est = travel_turns(d_est, ships)
+        tx, ty = predict_pos(tgt, ang_vel, t_est)
+    angle = safe_angle(src.x, src.y, tx, ty)
+    aimed_x = src.x + d_est * math.cos(angle)
+    aimed_y = src.y + d_est * math.sin(angle)
+    miss = 0.0 if is_idle(tgt) else dist(aimed_x, aimed_y, tx, ty)
+    return angle, t_est, miss
+
 def fleet_target(fl, targets, ang_vel):
     """Best current target match for an in-flight fleet."""
     best = None
@@ -720,6 +733,9 @@ _mission_seq: dict = {}             # player -> next id
 _recently_reinforced: dict = {}     # player -> planet_id -> last step
 _doomed_owned_targets: dict = {}    # player -> planet_id -> last doomed step
 _opponent_model_memory: dict = {}   # player -> owner -> previous opponent snapshot
+_midgame_dominance_last: dict = {}  # player -> last step a dominance attack launched
+_shot_history: dict = {}            # player -> list of recent launched shot records
+_bad_shot_patterns: dict = {}       # player -> pattern -> {fails, banned_until}
 
 
 def canonical_mission_type(kind):
@@ -954,6 +970,7 @@ class WorldModel:
         self.mission_ledger = MissionLedger(self)
         self._compute_features()
         self._detect_game_type()
+        self._update_shot_memory()
         self._build_policy_maps()
 
     def _detect_game_type(self):
@@ -1086,6 +1103,87 @@ class WorldModel:
         if key not in self.shot_cache:
             self.shot_cache[key] = aim_valid(src, tgt, self.ang_vel, int(ships))
         return self.shot_cache[key]
+
+    def _shot_pattern_key(self, src, tgt, angle):
+        return (int(src.id), int(tgt.id), round(float(angle), 1))
+
+    def _update_shot_memory(self):
+        history = _shot_history.setdefault(self.player, [])
+        bad = _bad_shot_patterns.setdefault(self.player, {})
+        remaining = []
+        for rec in history:
+            if self.step < rec["arrival_step"]:
+                remaining.append(rec)
+                continue
+            tgt = self.planet_by_id.get(rec["target_id"])
+            if tgt is None:
+                continue
+            if rec.get("offensive") and tgt.owner != self.player:
+                pattern = rec["pattern"]
+                entry = bad.setdefault(pattern, {"fails": 0, "banned_until": -1})
+                entry["fails"] += 1
+                if entry["fails"] >= 3:
+                    entry["banned_until"] = self.step + 30
+                    self.add_debug(
+                        f"REPEATED_MISS_TARGET_BANNED src=p{pattern[0]} target=p{pattern[1]} angle={pattern[2]}"
+                    )
+                else:
+                    self.add_debug(
+                        f"RECENT_MISS_PATTERN_DETECTED src=p{pattern[0]} target=p{pattern[1]} angle={pattern[2]}"
+                    )
+            elif rec.get("offensive"):
+                pattern = rec["pattern"]
+                if pattern in bad:
+                    bad[pattern]["fails"] = max(0, bad[pattern]["fails"] - 1)
+        _shot_history[self.player] = [
+            rec for rec in remaining if self.step - rec.get("launch_step", self.step) <= 80
+        ]
+        for pattern in list(bad.keys()):
+            if bad[pattern].get("banned_until", -1) < self.step and bad[pattern].get("fails", 0) <= 0:
+                del bad[pattern]
+
+    def aim_confidence_check(self, src, tgt, ships, mission_type):
+        self.add_debug(f"AIM_CONFIDENCE_CHECK src=p{src.id} target=p{tgt.id} ships={int(ships)}")
+        angle, eta_guess, miss = aim_solution_metrics(src, tgt, self.ang_vel, int(ships))
+        pattern = self._shot_pattern_key(src, tgt, angle)
+        bad = _bad_shot_patterns.setdefault(self.player, {})
+        entry = bad.get(pattern)
+        if entry and entry.get("banned_until", -1) >= self.step:
+            self.add_debug(f"REPEATED_BAD_SHOT_BLOCKED src=p{src.id} target=p{tgt.id} angle={pattern[2]}")
+            self.add_debug(f"SAME_ANGLE_SPAM_REJECTED src=p{src.id} target=p{tgt.id}")
+            self.add_debug(f"RETARGET_AFTER_FAILED_SHOT src=p{src.id} target=p{tgt.id}")
+            return False, "repeated bad shot pattern"
+        if is_idle(tgt):
+            return True, ""
+        margin = tgt.radius + HIT_MARGIN
+        if eta_guess > 25:
+            margin = tgt.radius + min(1.5, HIT_MARGIN)
+        if eta_guess > 28:
+            margin = tgt.radius + 1.0
+        if miss > margin:
+            self.add_debug(
+                f"LOW_CONFIDENCE_AIM_REJECTED src=p{src.id} target=p{tgt.id} "
+                f"eta={eta_guess:.1f} miss={miss:.2f} margin={margin:.2f}"
+            )
+            return False, "low confidence moving-target aim"
+        self.add_debug(
+            f"MOVING_TARGET_AIM_VERIFIED src=p{src.id} target=p{tgt.id} "
+            f"eta={eta_guess:.1f} miss={miss:.2f}"
+        )
+        return True, ""
+
+    def record_shot_launch(self, src, tgt, ships, angle, eta, mission_type):
+        pattern = self._shot_pattern_key(src, tgt, angle)
+        _shot_history.setdefault(self.player, []).append({
+            "launch_step": self.step,
+            "arrival_step": self.step + max(1, int(math.ceil(eta))),
+            "source_id": src.id,
+            "target_id": tgt.id,
+            "angle": float(angle),
+            "ships": int(ships),
+            "pattern": pattern,
+            "offensive": tgt.owner != self.player and mission_type in OFFENSIVE_MISSIONS,
+        })
 
     def eta(self, src, tgt, ships):
         return travel_turns(dp(src, tgt), max(1, int(ships)))
@@ -1447,6 +1545,10 @@ class WorldModel:
         if not source_ok:
             return False, source_reason
 
+        aim_ok, aim_reason = self.aim_confidence_check(src, tgt, ships, mission_type)
+        if not aim_ok:
+            return False, aim_reason
+
         if mission_type == "DOOMED_EVACUATION":
             src_tl = self.simulate_planet_timeline(src, DOOMED_EVAC_HORIZON)
             fall_turn = src_tl["fall_turn"]
@@ -1594,6 +1696,7 @@ class WorldModel:
             )
         moves.append([src.id, angle, ships])
         self.committed[src.id] = self.committed.get(src.id, 0) + ships
+        self.record_shot_launch(src, tgt, ships, angle, self.eta(src, tgt, ships), mission_type)
         if tgt.owner != self.player:
             self.incoming_to_targets[tgt.id] = self.incoming_to_targets.get(tgt.id, 0) + ships
             self.offensive_ships += ships
@@ -7558,14 +7661,26 @@ def _start_planet_current(world):
 
 
 def _small_start_escape_mode(world, src=None):
-    if len(world.my_planets) != 1:
+    if world.step >= 60 or len(world.my_planets) > 2:
         return False
     start = _start_planet_current(world)
     if start is None or start.owner != world.player:
         return False
     if src is not None and src.id != start.id:
         return False
-    return _planet_role(start) == ROLE_STORAGE or int(start.production) <= SMALL_START_PROD_THRESH
+    small_or_low = start.radius <= RADIUS_SMALL or int(start.production) <= 2
+    if not small_or_low:
+        return False
+    anchor_owned = any(
+        p.id != start.id
+        and (
+            _planet_role(p) in (ROLE_BRIDGE, ROLE_LAUNCHPAD)
+            or int(p.production) > int(start.production)
+            or int(p.production) >= 3
+        )
+        for p in world.my_planets
+    )
+    return not anchor_owned
 
 
 def _small_start_escape_target_value(world, target):
@@ -7991,6 +8106,23 @@ def _fund_capture(
         if not safe:
             world.add_debug(f"PARTIAL_PACKET_REJECT_NO_CONVERSION src=p{src.id} reason={reason}")
             continue
+        structure = getattr(world, "_active_structure", None)
+        if (
+            structure
+            and 80 <= world.step <= 320
+            and mission_type in OFFENSIVE_MISSIONS
+            and mission_type not in ("FINAL_DRAIN", "COLLAPSE")
+        ):
+            labels = structure.get(src.id, set())
+            if STRUCT_ANCHOR in labels or STRUCT_BRIDGE in labels:
+                desired = _structure_desired_reserve(world, src, labels)
+                remaining_after = int(src.ships) - world.committed.get(src.id, 0) - contrib
+                if remaining_after < desired:
+                    if STRUCT_ANCHOR in labels:
+                        world.add_debug(f"ANCHOR_RESERVE_PRESERVED p{src.id} reserve={desired}")
+                    else:
+                        world.add_debug(f"BRIDGE_RESERVE_PRESERVED p{src.id} reserve={desired}")
+                    continue
         if world.eta(src, target, contrib) > world.remaining - 1:
             continue
         angle, ok = world.aim(src, target, contrib)
@@ -8055,16 +8187,19 @@ def _small_start_followup_count(world, target):
 def _small_start_escape_rank(world, target):
     role = _planet_role(target)
     followups = _small_start_followup_count(world, target)
-    if role in (ROLE_BRIDGE, ROLE_LAUNCHPAD):
+    if role == ROLE_LAUNCHPAD and int(target.production) >= 5:
         category = 0
-    elif is_idle(target):
+    elif role in (ROLE_BRIDGE, ROLE_LAUNCHPAD) and int(target.production) >= 4:
         category = 1
-    elif int(target.production) >= 3:
+    elif is_idle(target) and role in (ROLE_BRIDGE, ROLE_LAUNCHPAD):
         category = 2
-    elif role == ROLE_BRIDGE and followups >= 2:
+        world.add_debug(f"STATIC_ESCAPE_TARGET_SELECTED p{target.id}")
+    elif role == ROLE_BRIDGE:
         category = 3
-    elif role == ROLE_STORAGE and _chain_small_has_value(world, target):
+    elif int(target.production) >= 3:
         category = 4
+    elif role == ROLE_STORAGE and _chain_small_has_value(world, target):
+        category = 5
     else:
         category = 9
     src = world.my_planets[0] if world.my_planets else target
@@ -8080,19 +8215,26 @@ def _small_start_escape_rank(world, target):
 def run_small_start_escape(world, states, moves, deadline):
     if not _small_start_escape_mode(world) or moves or time.perf_counter() > deadline:
         return False
-    src = world.my_planets[0]
+    src = _start_planet_current(world)
+    if src is None or src.owner != world.player:
+        return False
     world.add_debug(f"SMALL_START_ESCAPE_MODE p{src.id}")
     candidates = [
         t for t in world.normal_planets
         if t.owner != world.player
         and not world.is_comet(t)
-        and dp(src, t) <= CHAIN_RADIUS + 18
+        and dp(src, t) <= 70.0
         and _small_start_escape_target_value(world, t)
     ]
     candidates.sort(key=lambda t: _small_start_escape_rank(world, t))
     for target in candidates[:8]:
         if time.perf_counter() > deadline:
             break
+        if target.owner not in (-1, world.player):
+            continue
+        if dp(src, target) > 45.0 and any(dp(src, n) <= 45.0 and _small_start_escape_target_value(world, n) for n in world.neutral_planets if not world.is_comet(n)):
+            world.add_debug(f"SMALL_START_SKIP_FAR_TARGET p{target.id} d={dp(src, target):.1f}")
+            continue
         plan, total, ok = _fund_capture(
             world,
             target,
@@ -8123,9 +8265,11 @@ def run_small_start_escape(world, states, moves, deadline):
         )
         if _commit_proposal(world, prop, moves):
             if _planet_role(target) in (ROLE_BRIDGE, ROLE_LAUNCHPAD) or int(target.production) > int(src.production):
+                world.add_debug(f"SMALL_START_BIGGER_TARGET_SELECTED p{target.id}")
                 world.add_debug(
                     f"SMALL_START_TO_MEDIUM_ANCHOR target=p{target.id} role={_planet_role(target)} prod={int(target.production)}"
                 )
+                world.add_debug(f"SMALL_START_ESCAPE_COMPLETED p{target.id}")
             return True
     return False
 
@@ -9195,6 +9339,10 @@ def _main35_make_capture_prop(
     if target.owner not in (-1, world.player):
         if not should_allow_enemy_attack(world, target, "SYNC_ATTACK", mission_reason):
             return None
+    if not _distance_discipline_allows_target(world, states, target, mission_reason):
+        return None
+    if not _structure_safe_for_deep_capture(world, states, getattr(world, "_active_chain_plan", []), target, mission_reason):
+        return None
     local_states = _main35_tempo_states(world, states)
     margin = hold_margin
     if margin is None:
@@ -9234,6 +9382,139 @@ def _main35_make_capture_prop(
         eta_max=max(eta_vals),
         reason=f"expansion_obligation_main35_{mission_reason} p{target.id}",
     )
+
+
+def _useful_target_value(world, target, anchor=None):
+    if target is None or target.owner == world.player or world.is_comet(target):
+        return False
+    if int(target.production) >= 2:
+        return True
+    if _planet_role(target) in (ROLE_BRIDGE, ROLE_LAUNCHPAD):
+        return True
+    if is_idle(target):
+        return True
+    if _chain_small_has_value(world, target, anchor):
+        return True
+    if len(_campaign_followup_options(world, target)) >= 1:
+        return True
+    if target.owner not in (-1, world.player) and is_local_enemy_opportunity(world, target):
+        return True
+    return False
+
+
+def _nearest_useful_target_candidate(world, states, chain_plan, exclude_target_id=None, build_prop=False):
+    best = None
+    for src in world.my_planets:
+        st = states.get(src.id)
+        if st is None or st.threatened or st.safe_surplus < MIN_SEND_SHIPS:
+            continue
+        for target in world.normal_planets:
+            if target.id == exclude_target_id or target.owner == world.player or world.is_comet(target):
+                continue
+            if target.owner not in (-1, world.player) and not is_local_enemy_opportunity(world, target):
+                continue
+            if not _useful_target_value(world, target, src):
+                continue
+            d = dp(src, target)
+            if d > 42.0:
+                continue
+            rough_need = max(MIN_SEND_SHIPS, normalize_send_amount(world.required_ships_to_capture(target, src)))
+            eta = world.eta(src, target, rough_need)
+            if not (eta <= 18.0 or d <= 32.0):
+                continue
+            hold = 2 if target.owner == -1 else max(8, int(target.production) * 3)
+            plan, total, ok = _fund_capture(
+                world,
+                target,
+                states,
+                max_sources=4,
+                mission_reason="nearest_useful_target_lock",
+                hold_margin_override=hold,
+                source_radius=42.0,
+            )
+            if not ok:
+                continue
+            eta_vals = [e for _, _, _, e in plan]
+            ok_grp, _reason = validate_grouped_launch(world, target, plan)
+            if not ok_grp:
+                continue
+            if not world.can_hold_after_capture(target, max(eta_vals), total):
+                continue
+            score = (
+                d * 5.0
+                + eta * 4.0
+                + int(target.ships) * 0.6
+                - int(target.production) * 18.0
+                - (55.0 if is_idle(target) else 0.0)
+                - (35.0 if _planet_role(target) in (ROLE_BRIDGE, ROLE_LAUNCHPAD) else 0.0)
+            )
+            if is_idle(target):
+                world.add_debug(f"STATIC_TARGET_PRIORITY p{target.id}")
+            prop = None
+            if build_prop:
+                kind = "CAPTURE_NEUTRAL" if target.owner == -1 else "SYNC_ATTACK"
+                prop = MissionProposal(
+                    kind=kind,
+                    target_id=target.id,
+                    priority=152.0 - score * 0.02,
+                    required_ships=total,
+                    planned_sources=plan,
+                    eta_min=min(eta_vals),
+                    eta_max=max(eta_vals),
+                    reason=f"nearest_useful_target_lock p{target.id}",
+                )
+            item = (score, d, eta, target, prop)
+            if best is None or item[:3] < best[:3]:
+                best = item
+    return best
+
+
+def _distance_discipline_allows_target(world, states, target, mission_reason):
+    if target is None or world.step > 120:
+        return True
+    if any(tag in (mission_reason or "") for tag in ("nearest_useful", "small_start_escape", "defense", "recovery", "final", "collapse")):
+        return True
+    src = min(world.my_planets, key=lambda p: dp(p, target), default=None)
+    if src is None:
+        return True
+    rough_need = max(MIN_SEND_SHIPS, normalize_send_amount(world.required_ships_to_capture(target, src)))
+    eta = world.eta(src, target, rough_need)
+    d = dp(src, target)
+    if eta <= 22.0 and d <= 42.0:
+        return True
+    world.add_debug("OPENING_DISTANCE_DISCIPLINE")
+    near = _nearest_useful_target_candidate(world, states, getattr(world, "_active_chain_plan", []), exclude_target_id=target.id)
+    if near is None:
+        if eta > 28.0 and not is_idle(target):
+            world.add_debug(f"FAR_EXPANSION_BLOCKED target=p{target.id} eta={eta:.1f}")
+            return False
+        return True
+    if int(target.production) >= 5 and world.can_hold_after_capture(target, eta, rough_need):
+        aim_ok, _ = world.aim_confidence_check(src, target, rough_need, "CAPTURE_NEUTRAL" if target.owner == -1 else "SYNC_ATTACK")
+        if aim_ok and _target_improves_control(world, target, getattr(world, "_active_chain_plan", [])):
+            world.add_debug(f"FAR_TARGET_ALLOWED_HIGH_VALUE target=p{target.id} eta={eta:.1f}")
+            return True
+    world.add_debug(f"FAR_TARGET_REJECTED_NEARER_EXISTS target=p{target.id} near=p{near[3].id}")
+    world.add_debug("LOCAL_EXPANSION_FIRST")
+    if eta > 22.0:
+        world.add_debug(f"FAR_EXPANSION_BLOCKED target=p{target.id} eta={eta:.1f}")
+    return False
+
+
+def run_nearest_useful_target_lock(world, states, chain_plan, moves, deadline):
+    if moves or time.perf_counter() > deadline:
+        return False
+    candidate = _nearest_useful_target_candidate(world, states, chain_plan, build_prop=True)
+    if candidate is None:
+        return False
+    _score, _d, _eta, target, prop = candidate
+    if prop is None:
+        return False
+    world.add_debug("NEAREST_USEFUL_TARGET_LOCK")
+    world.add_debug(f"NEAREST_TARGET_SELECTED p{target.id} d={_d:.1f} eta={_eta:.1f}")
+    if _commit_proposal(world, prop, moves):
+        return True
+    return False
 
 
 def main35_opening_tempo(world, states, chain_plan, moves, deadline):
@@ -9877,6 +10158,293 @@ def run_search_sequence_planner(world, states, chain_plan, moves, deadline):
     return False
 
 
+STRUCT_ANCHOR = "ANCHOR_LAUNCHPAD"
+STRUCT_FRONTLINE = "FRONTLINE"
+STRUCT_BRIDGE = "BRIDGE_CRITICAL"
+STRUCT_REAR = "REAR_SAFE"
+STRUCT_STORAGE = "STORAGE"
+STRUCT_VULNERABLE = "VULNERABLE_ISOLATED"
+STRUCT_RECENT = "RECENT_CAPTURE"
+STRUCT_RECOVERY = "RECOVERY_TARGET"
+
+
+def _owned_support_count(world, p, radius=42.0):
+    return sum(1 for q in world.my_planets if q.id != p.id and dp(p, q) <= radius)
+
+
+def _nearby_support_ships(world, p, radius=42.0):
+    return sum(int(q.ships) for q in world.my_planets if q.id != p.id and dp(p, q) <= radius)
+
+
+def _nearest_enemy_to_planet(world, p):
+    return min((dp(p, e) for e in world.enemy_planets), default=999.0)
+
+
+def classify_planet_structure(world, states, chain_plan):
+    structure = {}
+    chain_set = set(chain_plan[:16])
+    for p in world.my_planets:
+        labels = set()
+        st = states.get(p.id)
+        enemy_d = _nearest_enemy_to_planet(world, p)
+        support = _owned_support_count(world, p)
+        support_ships = _nearby_support_ships(world, p)
+        role = _planet_role(p)
+
+        anchor = (
+            role == ROLE_LAUNCHPAD
+            or is_static_planet(p)
+            or int(p.production) >= 4
+            or p.id in _primary_launchpads.get(world.player, {})
+        )
+        if anchor:
+            labels.add(STRUCT_ANCHOR)
+            world.add_debug(f"ANCHOR_LAUNCHPAD_IDENTIFIED p{p.id}")
+        if enemy_d <= FRONTLINE_DIST + 22:
+            labels.add(STRUCT_FRONTLINE)
+        if (
+            role == ROLE_BRIDGE
+            or p.id in chain_set
+            or (support >= 2 and enemy_d <= 80.0 and world.cluster_distance(p) <= CHAIN_RADIUS + 18)
+        ):
+            labels.add(STRUCT_BRIDGE)
+            world.add_debug(f"BRIDGE_CRITICAL_IDENTIFIED p{p.id}")
+        if enemy_d > 75.0 and support >= 2:
+            labels.add(STRUCT_REAR)
+        if role == ROLE_STORAGE and STRUCT_REAR in labels:
+            labels.add(STRUCT_STORAGE)
+        if _prev_owners and _prev_owners.get(p.id) != world.player:
+            labels.add(STRUCT_RECENT)
+
+        weak_for_role = False
+        if st is not None:
+            desired = _structure_desired_reserve(world, p, labels)
+            weak_for_role = int(p.ships) < desired
+        if (
+            support < 2
+            or (enemy_d <= 62.0 and support_ships < max(35, int(p.ships) * 0.7))
+            or weak_for_role
+        ) and (STRUCT_FRONTLINE in labels or STRUCT_BRIDGE in labels or STRUCT_RECENT in labels):
+            labels.add(STRUCT_VULNERABLE)
+            world.add_debug(f"VULNERABLE_ISOLATED_DETECTED p{p.id} support={support} enemy_d={enemy_d:.1f}")
+        structure[p.id] = labels
+
+    for lost in world.enemy_planets:
+        if world.is_comet(lost):
+            continue
+        if _prev_owners.get(lost.id) == world.player and _is_core_chain_planet(world, lost, chain_plan):
+            structure[lost.id] = {STRUCT_RECOVERY}
+            world.add_debug(f"TERRITORY_RECOVERY_TRIGGERED p{lost.id}")
+    return structure
+
+
+def _structure_desired_reserve(world, p, labels):
+    role = _planet_role(p)
+    reserve = STORAGE_RESERVE if role == ROLE_STORAGE else BRIDGE_RESERVE if role == ROLE_BRIDGE else LAUNCHPAD_RESERVE
+    if STRUCT_ANCHOR in labels:
+        reserve = max(reserve, 50 if role == ROLE_LAUNCHPAD else 30 if role == ROLE_BRIDGE else 18)
+    if STRUCT_BRIDGE in labels:
+        reserve = max(reserve, 30, int(p.production) * 6)
+    if STRUCT_FRONTLINE in labels:
+        reserve += 15
+    if STRUCT_RECENT in labels:
+        reserve = max(reserve, 25, int(p.production) * 5)
+    if STRUCT_VULNERABLE in labels:
+        reserve = max(reserve, 35, int(p.production) * 7)
+    return int(reserve)
+
+
+def _frontline_fragmented(world, structure):
+    frontline = [pid for pid, labels in structure.items() if STRUCT_FRONTLINE in labels]
+    if len(frontline) <= 1:
+        return False
+    weak_links = 0
+    for pid in frontline:
+        p = world.planet_by_id.get(pid)
+        if p is None:
+            continue
+        if _owned_support_count(world, p, radius=48.0) < 2:
+            weak_links += 1
+    fragmented = weak_links >= max(1, len(frontline) // 2)
+    if fragmented:
+        world.add_debug("FRONTLINE_FRAGMENTED")
+    return fragmented
+
+
+def _midgame_structure_context(world, states, chain_plan):
+    structure = classify_planet_structure(world, states, chain_plan)
+    vulnerable = [
+        world.planet_by_id[pid] for pid, labels in structure.items()
+        if pid in world.planet_by_id and STRUCT_VULNERABLE in labels
+    ]
+    weak_bridges = [
+        p for p in vulnerable
+        if STRUCT_BRIDGE in structure.get(p.id, set()) or STRUCT_ANCHOR in structure.get(p.id, set())
+    ]
+    recent = [
+        world.planet_by_id[pid] for pid, labels in structure.items()
+        if pid in world.planet_by_id and STRUCT_RECENT in labels
+    ]
+    fragmented = _frontline_fragmented(world, structure)
+    enemy_near = min((_nearest_enemy_to_planet(world, p) for p in world.my_planets), default=999.0) <= 95.0
+    active = (
+        80 <= world.step <= 320
+        and len(world.my_planets) >= 7
+        and enemy_near
+        and (recent or vulnerable or weak_bridges or fragmented)
+    )
+    return {
+        "active": active,
+        "structure": structure,
+        "vulnerable": vulnerable,
+        "weak_bridges": weak_bridges,
+        "recent": recent,
+        "fragmented": fragmented,
+    }
+
+
+def _structure_safe_for_deep_capture(world, states, chain_plan, target, mission_reason):
+    if not (80 <= world.step <= 320 and len(world.my_planets) >= 7):
+        return True
+    if any(tag in (mission_reason or "") for tag in ("recovery", "defense", "final", "collapse")):
+        return True
+    ctx = _midgame_structure_context(world, states, chain_plan)
+    if not ctx["active"]:
+        return True
+    nearest = min((dp(p, target) for p in world.my_planets), default=999.0)
+    allowed_connected = (
+        nearest <= 58.0
+        or target.id in set(chain_plan[:12])
+        or int(target.production) >= 4
+        or _planet_role(target) in (ROLE_BRIDGE, ROLE_LAUNCHPAD)
+        or (target.owner not in (-1, world.player) and is_local_enemy_opportunity(world, target))
+    )
+    if allowed_connected and len(_campaign_followup_options(world, target)) >= 1:
+        return True
+    if allowed_connected and nearest <= 50.0:
+        return True
+    world.add_debug(f"EXPANSION_BLOCKED_STRUCTURE_UNSAFE target=p{target.id} d={nearest:.1f}")
+    return False
+
+
+def _structure_source_spare(world, src, states, structure):
+    st = states.get(src.id)
+    if st is None or st.threatened:
+        return 0
+    labels = structure.get(src.id, set())
+    reserve = max(st.reserve, _structure_desired_reserve(world, src, labels))
+    spare = int(src.ships) - world.committed.get(src.id, 0) - reserve
+    if STRUCT_ANCHOR in labels and spare < MIN_SEND_SHIPS:
+        world.add_debug(f"ANCHOR_RESERVE_PRESERVED p{src.id} reserve={reserve}")
+    return max(0, spare)
+
+
+def _reinforce_structure_target(world, states, structure, target, moves, deadline):
+    labels = structure.get(target.id, set())
+    desired = _structure_desired_reserve(world, target, labels)
+    deficit = desired - int(target.ships) - world.incoming_to_targets.get(target.id, 0)
+    if deficit < MIN_SEND_SHIPS:
+        return False
+    sources = sorted(
+        [
+            p for p in world.my_planets
+            if p.id != target.id
+            and _structure_source_spare(world, p, states, structure) >= MIN_SEND_SHIPS
+            and dp(p, target) <= 55.0
+            and world.real_incoming_threat(p)["deficit"] <= 0
+        ],
+        key=lambda p: (dp(p, target), 0 if STRUCT_REAR in structure.get(p.id, set()) else 1, -_structure_source_spare(world, p, states, structure)),
+    )
+    if not sources:
+        return False
+    needed = round_up_to_granularity(deficit)
+    sent = 0
+    for src in sources[:4]:
+        if time.perf_counter() > deadline or sent >= needed:
+            break
+        spare = _structure_source_spare(world, src, states, structure)
+        send = round_down_to_granularity(min(spare, needed - sent))
+        if send < MIN_SEND_SHIPS:
+            continue
+        if world.commit(src, target, send, moves, mission_type="DEFEND_HOLD"):
+            sent += send
+    if sent >= MIN_SEND_SHIPS:
+        if STRUCT_BRIDGE in labels:
+            world.add_debug(f"BRIDGE_REINFORCED p{target.id} sent={sent}")
+        if STRUCT_RECOVERY in labels or STRUCT_BRIDGE in labels:
+            world.add_debug(f"CHAIN_STRUCTURE_RECONNECTED p{target.id}")
+        return True
+    return False
+
+
+def _run_grouped_front_pressure_if_stable(world, states, chain_plan, moves, deadline, structure):
+    idle = _midgame_dominance_surplus(world, states)
+    if idle < 120:
+        return False
+    targets = sorted(
+        [
+            t for t in world.enemy_planets + world.neutral_planets
+            if not world.is_comet(t)
+            and t.owner != world.player
+            and min((dp(p, t) for p in world.my_planets), default=999.0) <= 82.0
+            and _target_improves_control(world, t, chain_plan)
+        ],
+        key=lambda t: (
+            0 if t.owner not in (-1, world.player) else 1,
+            -int(t.production),
+            min((dp(p, t) for p in world.my_planets), default=999.0),
+            int(t.ships),
+        ),
+    )
+    for target in targets[:6]:
+        prop = _main35_make_capture_prop(
+            world,
+            states,
+            target,
+            "grouped_front_pressure",
+            142.0 + int(target.production) * 8,
+            max_sources=5,
+            source_radius=82.0,
+            hold_margin=3 if target.owner == -1 else max(12, int(target.production) * 5),
+        )
+        if prop is None:
+            continue
+        if _commit_proposal(world, prop, moves):
+            world.add_debug("GROUPED_FRONT_PRESSURE")
+            world.add_debug("IDLE_FORCE_CONVERTED")
+            return True
+    return False
+
+
+def run_midgame_stabilization_mode(world, states, chain_plan, moves, deadline):
+    if time.perf_counter() > deadline:
+        return False
+    ctx = _midgame_structure_context(world, states, chain_plan)
+    if not ctx["active"]:
+        return False
+    world.add_debug("MIDGAME_STABILIZATION_MODE")
+    if ctx["fragmented"] or ctx["vulnerable"] or ctx["weak_bridges"]:
+        world.add_debug("FRONT_STABILIZATION_TRIGGERED")
+    structure = ctx["structure"]
+    targets = sorted(
+        ctx["weak_bridges"] + [p for p in ctx["vulnerable"] if p not in ctx["weak_bridges"]],
+        key=lambda p: (
+            0 if STRUCT_ANCHOR in structure.get(p.id, set()) else 1,
+            0 if STRUCT_BRIDGE in structure.get(p.id, set()) else 1,
+            int(p.ships),
+        ),
+    )
+    for target in targets[:4]:
+        if time.perf_counter() > deadline:
+            break
+        if _reinforce_structure_target(world, states, structure, target, moves, deadline):
+            return True
+    if not ctx["vulnerable"] and not ctx["fragmented"]:
+        world.add_debug("STABILIZED_EMPIRE_READY_FOR_PUSH")
+        return _run_grouped_front_pressure_if_stable(world, states, chain_plan, moves, deadline, structure)
+    return False
+
+
 def log_missed_opportunities(world, states, chain_plan):
     parked = sum(int(p.ships) for p in world.my_planets)
     flying = sum(int(f.ships) for f in world.my_fleets)
@@ -9909,6 +10477,173 @@ def log_missed_opportunities(world, states, chain_plan):
             break
 
 
+def _midgame_dominance_surplus(world, states):
+    return sum(
+        max(0, min(st.safe_surplus, int(world.planet_by_id[pid].ships) - world.committed.get(pid, 0) - st.reserve))
+        for pid, st in states.items()
+        if pid in world.planet_by_id and not st.threatened
+    )
+
+
+def _midgame_dominance_eligible(world, states):
+    if not (160 <= world.step <= 440):
+        return False, 0
+    if not (world.my_total_ships > world.enemy_total_ships * 1.4 or world.my_prod >= world.enemy_prod):
+        return False, 0
+    if len(world.my_planets) < 8:
+        return False, 0
+    if any(world.real_incoming_threat(p)["deficit"] > 0 for p in world.my_planets):
+        return False, 0
+    surplus = _midgame_dominance_surplus(world, states)
+    if surplus < 150:
+        return False, surplus
+    return True, surplus
+
+
+def _midgame_dominance_category(world, target, chain_plan):
+    is_enemy = target.owner not in (-1, world.player)
+    prod = int(target.production)
+    weak = int(target.ships) <= max(45, prod * 8)
+    nearest = min((dp(p, target) for p in world.my_planets), default=999.0)
+    near_chain = target.id in set(chain_plan[:16]) or nearest <= 78.0
+    frontier = is_local_enemy_opportunity(world, target) or _planet_role(target) in (ROLE_BRIDGE, ROLE_LAUNCHPAD)
+    if is_enemy and weak and prod >= 3:
+        return 0
+    if is_enemy and near_chain:
+        return 1
+    if is_enemy and frontier:
+        return 2
+    if target.owner == -1 and prod >= 3:
+        return 3
+    if nearest <= 85.0 and _target_improves_control(world, target, chain_plan):
+        return 4
+    return 9
+
+
+def _midgame_dominance_score(world, target, chain_plan):
+    nearest = min((dp(p, target) for p in world.my_planets), default=999.0)
+    prod = int(target.production)
+    is_enemy = target.owner not in (-1, world.player)
+    score = 0.0
+    score += prod * (95.0 if is_enemy else 70.0)
+    score += max(0.0, 105.0 - nearest) * 2.0
+    score += len(_campaign_followup_options(world, target)) * 34.0
+    score -= int(target.ships) * (0.8 if is_enemy else 0.55)
+    if _planet_role(target) == ROLE_LAUNCHPAD:
+        score += 115.0
+    elif _planet_role(target) == ROLE_BRIDGE:
+        score += 70.0
+    if is_idle(target):
+        score += 45.0
+    if target.id in set(chain_plan[:16]):
+        score += 85.0
+    if is_enemy and is_local_enemy_opportunity(world, target):
+        score += 75.0
+    return score
+
+
+def _midgame_dominance_make_prop(world, states, chain_plan, target):
+    if target.owner == world.player or world.is_comet(target):
+        return None
+    category = _midgame_dominance_category(world, target, chain_plan)
+    if category >= 9:
+        return None
+    mission_type = "LOCAL_PRODUCTION_CAPTURE" if target.owner == -1 else "SYNC_ATTACK"
+    hold = max(5, int(target.production) * 2) if target.owner == -1 else max(18, int(target.production) * 6)
+    planned, total, ok = _fund_capture(
+        world,
+        target,
+        states,
+        max_sources=6,
+        mission_reason="midgame_dominance_attack",
+        hold_margin_override=hold,
+        source_radius=96.0,
+    )
+    if not ok:
+        return None
+    for _src_id, ships, _angle, _eta in planned:
+        if not valid_packet_size(mission_type, ships):
+            world.add_debug(f"INVALID_PACKET_REJECTED midgame_dominance target=p{target.id} ships={ships}")
+            return None
+    ok_grp, reason = validate_grouped_launch(world, target, planned)
+    if not ok_grp:
+        world.add_debug(f"MIDGAME_DOMINANCE_REJECT target=p{target.id} reason={reason}")
+        return None
+    eta_vals = [eta for _, _, _, eta in planned]
+    if not world.can_hold_after_capture(target, max(eta_vals), total):
+        world.add_debug(f"MIDGAME_DOMINANCE_REJECT target=p{target.id} reason=not_holdable")
+        return None
+    score = _midgame_dominance_score(world, target, chain_plan)
+    return MissionProposal(
+        kind=mission_type,
+        target_id=target.id,
+        priority=175.0 + score * 0.03,
+        required_ships=total,
+        planned_sources=planned,
+        eta_min=min(eta_vals),
+        eta_max=max(eta_vals),
+        reason=f"midgame_dominance category={category} score={score:.1f}",
+    )
+
+
+def midgame_dominance_attack_props(world, states, chain_plan, deadline, *, limit=2):
+    eligible, surplus = _midgame_dominance_eligible(world, states)
+    if not eligible:
+        return [], surplus
+    candidates = []
+    for target in world.enemy_planets + world.neutral_planets:
+        if time.perf_counter() > deadline:
+            break
+        if target.owner == world.player or world.is_comet(target):
+            continue
+        category = _midgame_dominance_category(world, target, chain_plan)
+        if category >= 9:
+            continue
+        nearest = min((dp(p, target) for p in world.my_planets), default=999.0)
+        if nearest > 105.0:
+            continue
+        candidates.append((category, -_midgame_dominance_score(world, target, chain_plan), nearest, int(target.ships), target))
+    candidates.sort()
+    props = []
+    seen = set()
+    for _category, _neg_score, _nearest, _ships, target in candidates[:14]:
+        if time.perf_counter() > deadline or len(props) >= limit:
+            break
+        if target.id in seen:
+            continue
+        prop = _midgame_dominance_make_prop(world, states, chain_plan, target)
+        if prop is None:
+            continue
+        props.append(prop)
+        seen.add(target.id)
+    return props, surplus
+
+
+def run_midgame_dominance_attack_mode(world, states, chain_plan, moves, deadline):
+    if time.perf_counter() > deadline:
+        return False
+    props, surplus = midgame_dominance_attack_props(world, states, chain_plan, deadline, limit=2)
+    if not props:
+        return False
+    world.add_debug("MIDGAME_DOMINANCE_ATTACK_TRIGGERED")
+    world.add_debug(f"MIDGAME_IDLE_ARMY_DETECTED surplus={surplus} total={world.my_total_ships}")
+    last = _midgame_dominance_last.get(world.player, -999)
+    if world.step - last < 10 and surplus < 650:
+        return False
+    max_missions = 2 if surplus >= 650 or world.step - last >= 25 else 1
+    launched = 0
+    for prop in props[:max_missions]:
+        if time.perf_counter() > deadline:
+            break
+        if _commit_proposal(world, prop, moves):
+            launched += 1
+            _midgame_dominance_last[world.player] = world.step
+            world.add_debug(f"MIDGAME_ATTACK_SELECTED target=p{prop.target_id} total={prop.required_ships}")
+            world.add_debug("MIDGAME_FORCE_CONVERTED_BEFORE_FINAL_DRAIN")
+            world.add_debug("NO_WAIT_UNTIL_FINAL_DRAIN")
+    return launched > 0
+
+
 # ── Source lock disabled ──────────────────────────────────────────────────────
 # The new strategy does not use backyard source locks.
 # world.backyard_locked_sources stays empty; no sources are locked by threat tracking.
@@ -9928,13 +10663,15 @@ def agent(obs, config=None):
       3. Small-start escape / chain-retrigger if needed
       4. Build launchpad chain plan
       5. Main33 opening/arbiter/HV-neutral/local attack tempo
-      6. Opponent model adaptive response / tempo override / sequence planner
-      7. Expansion obligation / campaign while neutrals or planet deficit remain
-      8. Idle army pressure / surplus conversion before banking
-      9. Production bank / rally only after useful chain is built
-      10. Rolling capture chain from staging
-      11. Expansion fallback campaign
-      12. Final drain (endgame only)
+      6. Midgame territory stabilization if structure is fragile
+      7. Opponent model adaptive response / tempo override / sequence planner
+      8. Expansion obligation / campaign while neutrals or planet deficit remain
+      9. Midgame dominance conversion before banking/final drain
+      10. Idle army pressure / surplus conversion before banking
+      11. Production bank / rally only after useful chain is built
+      12. Rolling capture chain from staging
+      13. Expansion fallback campaign
+      14. Final drain (endgame only)
 
     No random fallback trickle.  No micro-fleet exceptions.
     Every fleet >= 10 ships and a multiple of 5.
@@ -9962,6 +10699,9 @@ def agent(obs, config=None):
         _prev_owners.clear()
         _prev_ships.clear()
         _opponent_model_memory.clear()
+        _midgame_dominance_last.clear()
+        _shot_history.clear()
+        _bad_shot_patterns.clear()
         agent._chain_bank_turns = {}
 
     moves       = []
@@ -10006,12 +10746,20 @@ def agent(obs, config=None):
 
     # ── 4. Build chain plan ───────────────────────────────────────────────────
     chain_plan = build_launchpad_chain_plan(world, states)
+    world._active_chain_plan = chain_plan
+    world._active_structure = classify_planet_structure(world, states, chain_plan)
 
     # ── 5. Choose staging launchpad ───────────────────────────────────────────
     staging_id = choose_staging_launchpad(world, states, chain_plan)
     staging    = world.planet_by_id.get(staging_id) if staging_id else None
 
     # ── 5a. Main33 tempo layers, funded/committed by main34 packet rules ─────
+    if not moves and time.perf_counter() < deadline:
+        run_nearest_useful_target_lock(world, states, chain_plan, moves, deadline)
+
+    if not moves and time.perf_counter() < deadline:
+        run_midgame_stabilization_mode(world, states, chain_plan, moves, deadline)
+
     if not moves and time.perf_counter() < deadline:
         run_four_player_expand_first(world, moves, deadline)
 
@@ -10030,7 +10778,7 @@ def agent(obs, config=None):
     if not moves and time.perf_counter() < deadline:
         main35_opportunity_attack(world, states, moves, deadline)
 
-    # ── 6. Adaptive response, tempo override, and short sequence planner ─────
+    # ── 7. Adaptive response, tempo override, and short sequence planner ─────
     if not moves and time.perf_counter() < deadline:
         run_adaptive_strategy_mode(world, states, chain_plan, opponent_models, adaptive_mode, adaptive_model, moves, deadline)
 
@@ -10040,11 +10788,24 @@ def agent(obs, config=None):
     if not moves and time.perf_counter() < deadline:
         run_search_sequence_planner(world, states, chain_plan, moves, deadline)
 
-    # ── 7. Expansion campaign: keep converting affordable connected planets ──
+    # ── 8. Expansion campaign: keep converting affordable connected planets ──
     if not moves and time.perf_counter() < deadline:
         run_expansion_campaign(world, states, chain_plan, moves, deadline)
 
-    # ── 8. Idle army pressure: convert parked surplus before banking ─────────
+    # ── 9. Midgame dominance: convert large advantage before final drain ─────
+    if not moves and time.perf_counter() < deadline:
+        run_midgame_dominance_attack_mode(world, states, chain_plan, moves, deadline)
+
+    midgame_attack_blocked = False
+    if not moves and time.perf_counter() < deadline:
+        midgame_props, _midgame_surplus = midgame_dominance_attack_props(
+            world, states, chain_plan, deadline, limit=1
+        )
+        if midgame_props:
+            midgame_attack_blocked = True
+            world.add_debug("MIDGAME_BANKING_BLOCKED_BY_ATTACK")
+
+    # ── 10. Idle army pressure: convert parked surplus before banking ────────
     if not moves and time.perf_counter() < deadline:
         run_surplus_conversion_mode(world, states, chain_plan, staging_id, moves, deadline)
 
@@ -10057,21 +10818,25 @@ def agent(obs, config=None):
             parked_bank_blocked = True
             world.add_debug("PRODUCTION_BANK_BLOCKED_BY_PARKED_SURPLUS")
 
-    # ── 9. Production bank / rally ────────────────────────────────────────────
+    # ── 11. Production bank / rally ───────────────────────────────────────────
     affordable_expansion_exists = (not moves and has_affordable_campaign_capture(world, states))
     useful_capture_exists = (not moves and useful_capturable_target_exists(world, states, chain_plan))
+    small_escape_blocked = not moves and _small_start_escape_mode(world)
     expansion_need_blocked = affordable_expansion_exists and (
         len(world.my_planets) < 6
         or _nearby_neutral_exists(world)
         or _opponent_planet_lead(world) > 0
     )
+    if small_escape_blocked:
+        world.add_debug("SMALL_START_ESCAPE_MODE")
+        world.add_debug("BANKING_SKIPPED_USEFUL_CAPTURE_EXISTS")
     if expansion_need_blocked:
         world.add_debug("PRODUCTION_BANK_BLOCKED_BY_EXPANSION_NEED")
         world.add_debug("BANKING_SKIPPED_USEFUL_CAPTURE_EXISTS")
     if useful_capture_exists:
         world.add_debug("BANKING_BLOCKED_CAPTURE_EXISTS")
         world.add_debug("BANKING_SKIPPED_USEFUL_CAPTURE_EXISTS")
-    bank_blocked = parked_bank_blocked or expansion_need_blocked or useful_capture_exists or (
+    bank_blocked = small_escape_blocked or midgame_attack_blocked or parked_bank_blocked or expansion_need_blocked or useful_capture_exists or (
         not _campaign_chain_built_for_bank(world)
         and not moves
         and affordable_expansion_exists
@@ -10125,7 +10890,7 @@ def agent(obs, config=None):
         else:
             world.add_debug("PRODUCTION_BANK_WAIT_REJECTED")
 
-    # ── 10. Rolling capture chain ─────────────────────────────────────────────
+    # ── 12. Rolling capture chain ─────────────────────────────────────────────
     if (staging_id
             and not moves
             and fleet_ratio <= FLEET_RATIO_SOFT
@@ -10140,7 +10905,7 @@ def agent(obs, config=None):
                 world.add_debug("ROLLING_CHAIN_LAUNCH_APPROVED")
                 break
 
-    # ── 11. Fallback: expansion campaign only (no trickle) ───────────────────
+    # ── 13. Fallback: expansion campaign only (no trickle) ───────────────────
     if (not moves
             and (fleet_ratio <= FLEET_RATIO_SOFT or expansion_obligation_active(world))
             and time.perf_counter() < deadline):
@@ -10211,7 +10976,7 @@ def agent(obs, config=None):
     if not moves:
         log_missed_opportunities(world, states, chain_plan)
 
-    # ── 12. Final drain (endgame only) ────────────────────────────────────────
+    # ── 14. Final drain (endgame only) ────────────────────────────────────────
     if world.features.get("final") and time.perf_counter() < deadline:
         _final_drain_chain(world, moves, chain_plan)
 
