@@ -55,7 +55,7 @@ PROACTIVE_EXPANSION_MAX_SOURCES = 4
 STALL_FORCE_TURNS  = 6
 STALL_FORCE_SHIPS  = 180
 MAX_WAVE_WAIT      = 3
-MIN_WAVE_FRACTION  = 0.90
+MIN_WAVE_FRACTION  = 1.10
 
 # ── defense ───────────────────────────────────────────────────────────────────
 DEFEND_NET           = 8     # reinforce if net projected ships < this
@@ -86,7 +86,7 @@ SNIPE_LOOKAHEAD = 22
 SNIPE_ETA_SLACK = 2
 
 # ── mission coordinator ───────────────────────────────────────────────────────
-LOCAL_HUB_SHIPS  = 60      # planet with >= this many ships acts as a command hub
+LOCAL_HUB_SHIPS  = 75      # planet with >= this many ships acts as a command hub
 LOCAL_HUB_RADIUS = 40.0    # command hub targets within this distance first
 ETA_SYNC_WINDOW  = 8       # max turn spread for a sync attack to be valid
 SOURCE_COOLDOWN_TURNS = 8
@@ -187,7 +187,7 @@ STATE_FLEET_RATIO_PENALTY   = 120.0
 
 # ── SEARCH_ATTACK_PLANNER ─────────────────────────────────────────────────────
 SEARCH_MAX_CANDIDATES  = 10     # top proposals evaluated in the beam pass
-SEARCH_SELECT_LIMIT    = 2      # max offensive missions committed per turn
+SEARCH_SELECT_LIMIT    = 1      # max offensive missions committed per turn (hard cap; dynamic further below)
 SEARCH_MIN_SCORE       = -35.0  # reject proposals whose search score < this
 SEARCH_TIME_BUDGET     = 0.10   # seconds budget for the full search pass
 SEARCH_RELAY_HORIZON   = 20.0   # max ETA for relay capture to count toward relay value
@@ -822,6 +822,7 @@ _midgame_conversion_memory: dict = {}  # player -> planet-count growth/stall mem
 _recent_launch_history: dict = {}      # player -> recent launch destination/mode records
 _adaptive_meta_controllers: dict = {}  # player -> AdaptiveMetaController
 _pending_mission_launches: dict = {}   # player -> queued source launches awaiting JIT aim
+_expansion_obligation_cooldown: dict = {}  # player -> step when obligation cooldown expires
 
 
 def canonical_mission_type(kind):
@@ -7890,14 +7891,27 @@ def search_attack_planner(world, proposals, fleet_ratio, deadline):
 
     scored.sort(key=lambda x: -x[0])
 
+    # Dynamic cap: force single-mission focus when production parity is lost.
+    effective_limit = 1 if world.my_prod <= world.enemy_prod else SEARCH_SELECT_LIMIT
+    if effective_limit < SEARCH_SELECT_LIMIT:
+        world.add_debug(
+            f"SEARCH_MISSION_CAP limit=1 my_prod={world.my_prod} enemy_prod={world.enemy_prod}"
+        )
+
     selected: list = []
     for score, prop in scored:
         if score < SEARCH_MIN_SCORE:
             world.add_debug(
-                f"SEARCH_REJECT_NEGATIVE {prop.kind}->p{prop.target_id} score={score:.1f}"
+                f"SEARCH_REJECT_NEGATIVE {prop.kind}->p{prop.target_id} score={score:.1f} "
+                f"target_id={prop.target_id} required_ships={prop.required_ships} "
+                f"available_surplus={sum(world.surplus(p) for p in world.my_planets)}"
             )
             continue
-        if len(selected) >= SEARCH_SELECT_LIMIT:
+        if len(selected) >= effective_limit:
+            world.add_debug(
+                f"SEARCH_REJECT_CAP {prop.kind}->p{prop.target_id} score={score:.1f} "
+                f"limit={effective_limit} reason=not_top_{effective_limit}"
+            )
             break
         selected.append(prop)
 
@@ -7911,7 +7925,7 @@ def search_attack_planner(world, proposals, fleet_ratio, deadline):
         elif score >= SEARCH_MIN_SCORE:
             world.add_debug(
                 f"SEARCH_REJECT {prop.kind}->p{prop.target_id} "
-                f"score={score:.1f} reason=not_top_{SEARCH_SELECT_LIMIT}"
+                f"score={score:.1f} reason=not_top_{effective_limit}"
             )
 
     # Any candidates scored → block other offensive fallback this turn
@@ -8577,11 +8591,20 @@ def _commit_proposal(world, prop, moves):
     """Create ledger entry and queue all sources for JIT execution."""
     tgt = world.planet_by_id.get(prop.target_id)
     if tgt is None:
+        world.add_debug(
+            f"COMMIT_REJECTED_NO_TARGET mission={prop.kind} target_id={prop.target_id} "
+            f"required_ships={prop.required_ships}"
+        )
         return False
+    available_surplus = sum(world.surplus(p) for p in world.my_planets)
     for src_id, ships, launch_step, _eta in prop.planned_sources:
         src = world.planet_by_id.get(src_id)
         if src is None or not valid_packet_size(prop.kind, ships):
-            world.add_debug(f"INVALID_PACKET_REJECTED mission={prop.kind} src=p{src_id} ships={ships}")
+            world.add_debug(
+                f"INVALID_PACKET_REJECTED mission={prop.kind} src=p{src_id} ships={ships} "
+                f"target_id={prop.target_id} required_ships={prop.required_ships} "
+                f"available_surplus={available_surplus} tgt_ships={int(tgt.ships)}"
+            )
             return False
         ok, reason = world.valid_fleet_launch(
             src,
@@ -8593,7 +8616,11 @@ def _commit_proposal(world, prop, moves):
             validate_aim=False,
         )
         if not ok:
-            world.add_debug(f"MISSION_BLOCK {prop.kind} target=p{tgt.id} src=p{src.id} ships={ships} reason={reason}")
+            world.add_debug(
+                f"MISSION_BLOCK {prop.kind} target=p{tgt.id} src=p{src.id} ships={ships} "
+                f"required_ships={prop.required_ships} available_surplus={available_surplus} "
+                f"tgt_ships={int(tgt.ships)} tgt_prod={int(tgt.production)} reason={reason}"
+            )
             return False
     mid       = world.mission_ledger.create_from_proposal(prop)
     entry = world.mission_ledger.get(mid)
@@ -12468,6 +12495,20 @@ def run_expansion_obligation_force(world, states, moves, deadline):
     my_pct = len(world.my_planets) / max(1, len(world.normal_planets))
     if my_pct >= 0.22:
         return False
+
+    # Cooldown gate: when losing production and not in final steps, enforce a
+    # 20-turn wait between obligation attempts to avoid greedy overextension.
+    OBLIGATION_PROD_DEFICIT_COOLDOWN = 20
+    FINAL_STEPS_THRESHOLD = 80
+    if world.my_prod <= world.enemy_prod and world.remaining > FINAL_STEPS_THRESHOLD:
+        cooldown_until = _expansion_obligation_cooldown.get(world.player, 0)
+        if world.step < cooldown_until:
+            world.add_debug(
+                f"EXPANSION_OBLIGATION_COOLDOWN blocked step={world.step} "
+                f"cooldown_until={cooldown_until} my_prod={world.my_prod} enemy_prod={world.enemy_prod}"
+            )
+            return False
+
     last = _last_capture_step.get(world.player, 0)
     turns_idle = world.step - last
     threshold = 10 if world.step < 80 else 16
@@ -12477,6 +12518,14 @@ def run_expansion_obligation_force(world, states, moves, deadline):
         return False
 
     world.add_debug(f"EXPANSION_OBLIGATION_FORCE_CAPTURE idle={turns_idle} my_pct={my_pct:.2f}")
+    # Set the cooldown timestamp whenever we enter an obligation attempt so the
+    # next attempt is gated even if this one fails to commit.
+    if world.my_prod <= world.enemy_prod and world.remaining > FINAL_STEPS_THRESHOLD:
+        _expansion_obligation_cooldown[world.player] = world.step + OBLIGATION_PROD_DEFICIT_COOLDOWN
+        world.add_debug(
+            f"EXPANSION_OBLIGATION_COOLDOWN_SET until={world.step + OBLIGATION_PROD_DEFICIT_COOLDOWN} "
+            f"my_prod={world.my_prod} enemy_prod={world.enemy_prod}"
+        )
     fleet_ratio = compute_fleet_ratio(world)
     if fleet_ratio > FLEET_RATIO_HARD:
         return False
@@ -12539,10 +12588,23 @@ def run_expansion_obligation_force(world, states, moves, deadline):
             source_radius=72.0,
         )
         if not ok:
+            available = sum(world.surplus(p) for p in world.my_planets)
+            need_est = world.ships_needed_to_capture(
+                min(world.my_planets, key=lambda p: dp(p, target), default=None) or world.my_planets[0],
+                target, available,
+            )
+            world.add_debug(
+                f"OBLIGATION_FORCE_FUND_FAIL target=p{target.id} "
+                f"prod={int(target.production)} tgt_ships={int(target.ships)} "
+                f"required_ships={need_est} available_surplus={available}"
+            )
             continue
         ok_grp, grp_reason = validate_grouped_launch(world, target, plan)
         if not ok_grp:
-            world.add_debug(f"OBLIGATION_FORCE_SKIP p{target.id} reason={grp_reason}")
+            world.add_debug(
+                f"OBLIGATION_FORCE_SKIP p{target.id} reason={grp_reason} "
+                f"required_ships={total} available_surplus={sum(world.surplus(p) for p in world.my_planets)}"
+            )
             continue
         eta_vals = [e for _, _, _, e in plan]
         kind = "CAPTURE_NEUTRAL" if target.owner == -1 else "SYNC_ATTACK"
@@ -12631,6 +12693,7 @@ def _legacy_rule_agent(obs, config=None):
         _recent_launch_history.clear()
         _adaptive_meta_controllers.clear()
         _pending_mission_launches.clear()
+        _expansion_obligation_cooldown.clear()
         agent._chain_bank_turns = {}
 
     moves       = []
@@ -13050,19 +13113,33 @@ def _proposal_total_ships(prop):
 
 
 # Threshold below which a prod-4+ planet's surplus triggers hub-security mode.
-HUB_SECURITY_MIN_SURPLUS = LOCAL_HUB_SHIPS // 2   # default: 30 ships
+HUB_SECURITY_MIN_SURPLUS = LOCAL_HUB_SHIPS // 2   # baseline: 37 ships (LOCAL_HUB_SHIPS=75)
+
+
+def _hub_security_garrison(p):
+    """Conservative per-planet garrison floor.
+
+    A prod-4+ hub needs more than a flat surplus floor: it should hold at
+    least production*8 ships above its reserve so it can absorb an attack
+    before reinforcements arrive.  We take whichever is larger.
+    """
+    return max(HUB_SECURITY_MIN_SURPLUS, int(p.production) * 8)
 
 
 def _hub_security_violated(world):
     """Return (violated, details_str) — True when any prod-4+ friendly planet
-    has surplus below HUB_SECURITY_MIN_SURPLUS.  When violated, the agent must
-    prioritise reinforcement over any new offensive expansion.
+    has surplus below its garrison floor.  When violated, ALL OFFENSIVE_MISSIONS
+    are blocked until every hub is healthy again.
     """
     for p in world.my_planets:
         if int(p.production) >= 4:
             s = world.surplus(p)
-            if s < HUB_SECURITY_MIN_SURPLUS:
-                return True, f"p{p.id} prod={int(p.production)} surplus={s} threshold={HUB_SECURITY_MIN_SURPLUS}"
+            floor = _hub_security_garrison(p)
+            if s < floor:
+                return True, (
+                    f"p{p.id} prod={int(p.production)} surplus={s} "
+                    f"garrison_floor={floor} ships={int(p.ships)}"
+                )
     return False, ""
 
 
@@ -14044,6 +14121,7 @@ def agent(obs, config=None):
         _recent_launch_history.clear()
         _adaptive_meta_controllers.clear()
         _pending_mission_launches.clear()
+        _expansion_obligation_cooldown.clear()
 
     moves = []
     states = build_planet_states(world)
