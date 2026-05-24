@@ -47,7 +47,7 @@ FINAL_STEPS      = 460   # drain pass: send all idle ships to any reachable targ
 # ── opening / expansion ───────────────────────────────────────────────────────
 FORCED_OPENING_STEP     = 80    # launchpad-chain opening scoring window; no safety bypass
 FORCED_OPENING_PLANETS  = 3     # deprecated old-pipeline threshold kept for compatibility
-OPENING_STUCK_STEP      = 25    # if still 1 planet at this step: force-capture
+OPENING_STUCK_STEP      = 6     # if still 1 planet at this step: force-capture
 NEAREST_LOCK_DIST       = 28.0
 NEAREST_LOCK_ETA        = 18.0
 NEAREST_LOCK_MAX_SOURCES       = 3
@@ -163,7 +163,7 @@ SMALL_START_PROD_THRESH   = 1     # prod <= this → SMALL_START (primary)
 SMALL_START_RADIUS_THRESH = 1.1   # radius <= this → SMALL_START (tie-breaker; was 3.5)
 LARGE_START_STALL_STEP_1  = 15    # LARGE_START: force capture if still 1 planet here
 LARGE_START_STALL_STEP_3  = 35    # LARGE_START: force sweep if < 3 planets here
-SMALL_START_STALL_STEP    = 20    # SMALL_START: force escape if still 1 planet here
+SMALL_START_STALL_STEP    = 4     # SMALL_START: force escape if still 1 planet here
 
 # ── breach-kill ───────────────────────────────────────────────────────────────
 BREACH_KILL_DIST    = 45.0
@@ -190,7 +190,7 @@ STATE_FLEET_RATIO_PENALTY   = 120.0
 
 # ── SEARCH_ATTACK_PLANNER ─────────────────────────────────────────────────────
 SEARCH_MAX_CANDIDATES  = 10     # top proposals evaluated in the beam pass
-SEARCH_SELECT_LIMIT    = 1      # max offensive missions committed per turn (hard cap; dynamic further below)
+SEARCH_SELECT_LIMIT    = 1      # default cap; opening bundle logic relaxes this dynamically
 SEARCH_MIN_SCORE       = -35.0  # reject proposals whose search score < this
 SEARCH_TIME_BUDGET     = 0.10   # seconds budget for the full search pass
 SEARCH_RELAY_HORIZON   = 20.0   # max ETA for relay capture to count toward relay value
@@ -8048,7 +8048,14 @@ def search_attack_planner(world, proposals, fleet_ratio, deadline):
     scored.sort(key=lambda x: -x[0])
 
     # Dynamic cap: force single-mission focus when production parity is lost.
-    effective_limit = 1 if world.my_prod <= world.enemy_prod else SEARCH_SELECT_LIMIT
+    opening_limit = (
+        EARLY_NEAREST_SWEEP_BURST
+        if world.step <= EARLY_NEAREST_SWEEP_STEP_MAX and fleet_ratio <= FLEET_RATIO_SOFT
+        else SEARCH_SELECT_LIMIT
+    )
+    effective_limit = 1 if world.my_prod <= world.enemy_prod and opening_limit <= 1 else opening_limit
+    if opening_limit > SEARCH_SELECT_LIMIT:
+        world.add_debug(f"SEARCH_LIMIT_RELAXED_FOR_OPENING limit={opening_limit}")
     if effective_limit < SEARCH_SELECT_LIMIT:
         world.add_debug(
             f"SEARCH_MISSION_CAP limit=1 my_prod={world.my_prod} enemy_prod={world.enemy_prod}"
@@ -11595,24 +11602,35 @@ def _target_x_shape_bonus(world, src, target):
 def _nearest_sweep_target_score(world, target, src, chain_plan):
     d = dp(src, target)
     role = _planet_role(target)
+    radius_gain = max(0.0, float(target.radius) - float(src.radius))
+    prod = int(target.production)
     score = (
         max(0.0, EARLY_NEAREST_SWEEP_DIST + 8.0 - d) * 4.8
         - int(target.ships) * 1.15
-        + int(target.production) * 52.0
-        + float(target.radius) * 18.0
+        + prod * 58.0
+        + float(target.radius) * 26.0
+        + radius_gain * 145.0
         + _target_axis_width_bonus(world, target)
         + _target_l_shape_bonus(world, src, target)
         + _target_x_shape_bonus(world, src, target)
         + min(3, len(_campaign_followup_options(world, target))) * 28.0
     )
+    if prod >= 5:
+        score += 190.0
+    elif prod >= 4:
+        score += 145.0
+    elif prod >= 3:
+        score += 85.0
     if is_idle(target):
-        score += 48.0
+        score += 110.0
     if role == ROLE_LAUNCHPAD:
-        score += 50.0
+        score += 120.0
     elif role == ROLE_BRIDGE:
-        score += 42.0
+        score += 80.0
     elif role == ROLE_STORAGE and d <= 34.0 and _chain_small_has_value(world, target, src):
         score += 36.0
+    elif role == ROLE_STORAGE and prod <= 1:
+        score -= 120.0
     if target.id in set(chain_plan[:14]):
         score += 45.0
     if target.owner not in (-1, world.player):
@@ -11688,6 +11706,8 @@ def build_small_start_escape_props(world, states, chain_plan, deadline):
     if start is None or start.owner != world.player:
         return ()
     world.add_debug("SMALL_START_ESCAPE_ACTIVE")
+    if world.step <= SMALL_START_STALL_STEP:
+        world.add_debug("SMALL_START_ESCAPE_IMMEDIATE")
 
     candidates = []
     nearby_better_neutral = False
@@ -11728,6 +11748,8 @@ def build_small_start_escape_props(world, states, chain_plan, deadline):
             f"BIGGER_RADIUS_TARGET_SELECTED p{target.id} radius={float(target.radius):.1f} "
             f"prod={int(target.production)} d={d:.1f}"
         )
+        if float(target.radius) > float(start.radius) + 0.05:
+            world.add_debug(f"BIGGER_RADIUS_FIRST_SELECTED p{target.id}")
         kind = "CAPTURE_NEUTRAL" if target.owner == -1 else "SYNC_ATTACK"
         prop = _main35_make_capture_prop(
             world,
@@ -11773,6 +11795,24 @@ def build_early_nearest_sweep_props(world, states, chain_plan, deadline):
     if not world.my_planets or time.perf_counter() > deadline - BEAM_TIME_BUFFER:
         return ()
     world.add_debug("EARLY_NEAREST_SWEEP_ACTIVE")
+    better_nearby_ids = set()
+    for target in world.normal_planets:
+        if target.owner == world.player or world.is_comet(target):
+            continue
+        nearest_src = min(
+            (p for p in world.my_planets if p.id in states and not states[p.id].threatened),
+            key=lambda p: dp(p, target),
+            default=None,
+        )
+        if nearest_src is None or dp(nearest_src, target) > EARLY_NEAREST_SWEEP_DIST + 8.0:
+            continue
+        if (
+            _planet_role(target) in (ROLE_BRIDGE, ROLE_LAUNCHPAD)
+            or int(target.production) >= 3
+            or is_static_planet(target)
+            or float(target.radius) > float(nearest_src.radius) + 0.05
+        ):
+            better_nearby_ids.add(target.id)
     candidates = []
     for target in world.normal_planets:
         if time.perf_counter() > deadline - BEAM_TIME_BUFFER:
@@ -11794,6 +11834,15 @@ def build_early_nearest_sweep_props(world, states, chain_plan, deadline):
                 world.add_debug(f"OPENING_FAR_TARGET_REJECTED p{target.id} d={nearest:.1f}")
             continue
         role = _planet_role(target)
+        if (
+            better_nearby_ids
+            and target.id not in better_nearby_ids
+            and role == ROLE_STORAGE
+            and int(target.production) <= 1
+            and not (_chain_small_has_value(world, target, nearest_src) and nearest <= 24.0)
+        ):
+            world.add_debug(f"LOW_PROD_SMALL_TARGET_DEFERRED p{target.id}")
+            continue
         useful_small = (
             role != ROLE_STORAGE
             or int(target.production) >= 1
@@ -11831,6 +11880,10 @@ def build_early_nearest_sweep_props(world, states, chain_plan, deadline):
         )
         if prop is None:
             continue
+        if world.step < 10:
+            world.add_debug(f"OPENING_ATTACK_STARTED_BEFORE_STEP_10 target=p{target.id}")
+        if _planet_role(target) in (ROLE_BRIDGE, ROLE_LAUNCHPAD) or int(target.production) >= 3 or float(target.radius) > float(nearest_src.radius) + 0.05:
+            world.add_debug(f"BIGGER_RADIUS_FIRST_SELECTED p{target.id}")
         prop.reason = f"{prop.reason} nearest_sweep_axis={_axis_bucket_from(_owned_centroid(world), target)}"
         props.append(prop)
         seen_targets.add(target.id)
@@ -13172,11 +13225,14 @@ def run_early_direct_expansion_mode(world, states, moves, deadline):
         prod = int(target.production)
         my_eta, enemy_eta = world.reaction_times(target)
         conv = capture_conversion_score(world, target, src, need_norm)
+        radius_gain = max(0.0, float(target.radius) - float(src.radius))
         score = (
             conv * 110.0
-            + prod * 52.0
-            + (95.0 if is_idle(target) else 0.0)
-            + (75.0 if _planet_role(target) in (ROLE_LAUNCHPAD, ROLE_BRIDGE) else 0.0)
+            + prod * 60.0
+            + radius_gain * 140.0
+            + (190.0 if prod >= 5 else 145.0 if prod >= 4 else 85.0 if prod >= 3 else 0.0)
+            + (110.0 if is_idle(target) else 0.0)
+            + (120.0 if _planet_role(target) == ROLE_LAUNCHPAD else 80.0 if _planet_role(target) == ROLE_BRIDGE else 0.0)
             + (32.0 if target.owner not in (-1, world.player) and int(target.ships) <= ENEMY_GATE_WEAK_LOCAL else 0.0)
             + max(0.0, 32.0 - d) * 5.0
             + min(4, len(_campaign_followup_options(world, target))) * 22.0
@@ -13234,6 +13290,10 @@ def run_early_direct_expansion_mode(world, states, moves, deadline):
                 f"EARLY_DIRECT_EXPANSION_MODE_ACTIVE target=p{target.id} "
                 f"prod={int(target.production)} d={d:.1f} conv={capture_conversion_score(world, target, primary_src, total):.2f}"
             )
+            if world.step < 10:
+                world.add_debug("OPENING_ATTACK_STARTED_BEFORE_STEP_10")
+            if float(target.radius) > float(primary_src.radius) + 0.05:
+                world.add_debug(f"BIGGER_RADIUS_FIRST_SELECTED p{target.id}")
             world.add_debug("EARLY_NEAREST_EXPANSION_ACTIVE")
             world.add_debug("FIRST_CAPTURE_360_ACTIVE")
             _last_capture_step[world.player] = world.step
@@ -13661,9 +13721,13 @@ def _legacy_rule_agent(obs, config=None):
     if expansion_need_blocked:
         world.add_debug("PRODUCTION_BANK_BLOCKED_BY_EXPANSION_NEED")
         world.add_debug("BANKING_SKIPPED_USEFUL_CAPTURE_EXISTS")
+        if world.step <= EARLY_NEAREST_SWEEP_STEP_MAX:
+            world.add_debug("EARLY_BANKING_BLOCKED_CAPTURE_EXISTS")
     if useful_capture_exists:
         world.add_debug("BANKING_BLOCKED_CAPTURE_EXISTS")
         world.add_debug("BANKING_SKIPPED_USEFUL_CAPTURE_EXISTS")
+        if world.step <= EARLY_NEAREST_SWEEP_STEP_MAX:
+            world.add_debug("EARLY_BANKING_BLOCKED_CAPTURE_EXISTS")
     if over_rotation_blocked:
         world.add_debug("OVER_ROTATION_CORRECTION_ACTIVE")
         world.add_debug("BANKING_BLOCKED_OVER_ROTATION")
@@ -14969,6 +15033,7 @@ def build_same_step_attack_bundle(world, states=None, proposal_groups=None, dead
     axes = [_proposal_front_axis(world, p) for p in bundle]
     if any("early_nearest_sweep" in (p.reason or "") for p in bundle):
         world.add_debug(f"SAME_STEP_OPENING_BURST n={len(bundle)}")
+        world.add_debug(f"OPENING_BURST_MULTI_CAPTURE n={len(bundle)}")
     if len(set(axes)) >= 2:
         world.add_debug(f"MULTI_AXIS_FRONT_CREATED axes={sorted(set(axes))}")
     if any("multi_axis_front" in (p.reason or "") or "early_nearest_sweep" in (p.reason or "") for p in bundle):
@@ -15000,6 +15065,10 @@ def commit_attack_bundle(world, missions, moves, states=None, deadline=None):
         world.add_debug(
             f"MULTI_FRONT_ATTACK_COMMITTED n={committed} targets={[p.target_id for p in missions[:committed]]}"
         )
+        if any("early_nearest_sweep" in (p.reason or "") for p in missions[:committed]):
+            world.add_debug(f"SAME_STEP_OPENING_ATTACKS_COMMITTED n={committed}")
+            if world.step < 10:
+                world.add_debug("OPENING_ATTACK_STARTED_BEFORE_STEP_10")
         return True
     return committed > 0
 
@@ -15049,6 +15118,7 @@ def priority_arbiter(world, states, proposal_groups, deadline):
     chosen_limit = 2 if getattr(world, "aggressiveness_mode", "BALANCED") in ("AGGRESSIVE", "COLLAPSE") else 1
     if opening_burst_available:
         chosen_limit = max(chosen_limit, EARLY_NEAREST_SWEEP_BURST)
+        world.add_debug(f"SEARCH_LIMIT_RELAXED_FOR_OPENING limit={chosen_limit}")
     elif multi_axis_available:
         chosen_limit = max(chosen_limit, 2)
     for prop in scored:
@@ -16378,6 +16448,12 @@ def agent(obs, config=None):
             if _commit_proposal(world, prop, moves):
                 if prop.kind in OFFENSIVE_MISSIONS:
                     _last_capture_step[world.player] = world.step
+                    if world.step < 10 and (
+                        "early_nearest_sweep" in (prop.reason or "")
+                        or "small_start_escape" in (prop.reason or "")
+                        or "early_direct_expansion" in (prop.reason or "")
+                    ):
+                        world.add_debug("OPENING_ATTACK_STARTED_BEFORE_STEP_10")
             else:
                 world.add_debug(f"BEAM_COMMIT_REJECTED {prop.kind}->p{prop.target_id}")
 
