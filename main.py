@@ -15771,6 +15771,253 @@ def _dynamic_hold_margin(world, target, base):
     return adjusted
 
 
+def build_pressure_map(world):
+    """Per-turn planet graph influence map."""
+    pressure = {
+        p.id: {
+            "my_pressure": 0.0,
+            "enemy_pressure": 0.0,
+            "net_pressure": 0.0,
+            "contested": False,
+            "enemy_dominant": False,
+            "my_dominant": False,
+        }
+        for p in world.normal_planets
+    }
+    for source in world.normal_planets:
+        if source.owner == -1:
+            continue
+        strength = int(source.ships) + int(source.production) * 5
+        if strength <= 0:
+            continue
+        for target in world.normal_planets:
+            if target.id == source.id:
+                continue
+            decay = strength / (dp(source, target) + 8.0)
+            if source.owner == world.player:
+                pressure[target.id]["my_pressure"] += decay
+            else:
+                pressure[target.id]["enemy_pressure"] += decay
+    for target in world.normal_planets:
+        entry = pressure[target.id]
+        for eta, owner, ships in world.arrivals_by_target.get(target.id, []):
+            incoming = int(ships) * 0.35
+            if owner == world.player:
+                entry["my_pressure"] += incoming
+            elif owner != -1:
+                entry["enemy_pressure"] += incoming
+        entry["net_pressure"] = entry["my_pressure"] - entry["enemy_pressure"]
+        total = entry["my_pressure"] + entry["enemy_pressure"]
+        entry["contested"] = total > 0 and abs(entry["net_pressure"]) <= max(6.0, total * 0.22)
+        entry["enemy_dominant"] = entry["enemy_pressure"] > entry["my_pressure"] * 1.30 + 8.0
+        entry["my_dominant"] = entry["my_pressure"] > entry["enemy_pressure"] * 1.25 + 6.0
+    world.add_debug(f"PRESSURE_MAP_BUILT planets={len(pressure)}")
+    return pressure
+
+
+def _pressure_entry(world, target):
+    return getattr(world, "pressure_map", {}).get(
+        target.id,
+        {
+            "my_pressure": 0.0,
+            "enemy_pressure": 0.0,
+            "net_pressure": 0.0,
+            "contested": False,
+            "enemy_dominant": False,
+            "my_dominant": False,
+        },
+    )
+
+
+def _target_connected_to_pressure(world, target):
+    if target is None:
+        return False
+    if min((dp(p, target) for p in world.my_planets), default=999.0) <= 48.0:
+        return True
+    if any(
+        dp(p, target) <= 60.0
+        and (_planet_role(p) in (ROLE_BRIDGE, ROLE_LAUNCHPAD) or is_static_planet(p) or int(p.production) >= 3)
+        for p in world.my_planets
+    ):
+        return True
+    if len(_campaign_followup_options(world, target)) >= 1:
+        return True
+    return False
+
+
+def pressure_score_bonus(world, prop, states=None, chain_plan=None):
+    if prop.kind not in OFFENSIVE_MISSIONS:
+        return 0.0
+    target = world.planet_by_id.get(prop.target_id)
+    if target is None or target.owner == world.player or world.is_comet(target):
+        return 0.0
+    states = states or {}
+    chain_plan = chain_plan or getattr(world, "_active_chain_plan", [])
+    entry = _pressure_entry(world, target)
+    adj = 0.0
+    nearest = min((dp(p, target) for p in world.my_planets), default=999.0)
+
+    if entry["contested"] or (entry["my_pressure"] > 0 and entry["enemy_pressure"] > 0 and nearest <= 72.0):
+        adj += 18.0
+        world.add_debug(
+            f"PRESSURE_TARGET_BONUS target=p{target.id} contested={entry['contested']} net={entry['net_pressure']:.1f}"
+        )
+    if _planet_role(target) in (ROLE_BRIDGE, ROLE_LAUNCHPAD) or is_bridge_planet(world, target):
+        adj += 18.0
+        world.add_debug(f"PRESSURE_BRIDGE_TARGET_SELECTED target=p{target.id}")
+    if target.owner not in (-1, world.player) and int(target.ships) <= max(22, int(target.production) * 6):
+        if entry["my_pressure"] >= entry["enemy_pressure"] * 0.65:
+            adj += 22.0
+            world.add_debug(
+                f"PRESSURE_TARGET_BONUS target=p{target.id} weak_enemy_zone my={entry['my_pressure']:.1f} enemy={entry['enemy_pressure']:.1f}"
+            )
+    isolated = nearest > 78.0 and not _target_connected_to_pressure(world, target)
+    if isolated and entry["enemy_dominant"]:
+        adj -= 35.0
+        world.add_debug(
+            f"PRESSURE_ISOLATED_TARGET_PENALTY target=p{target.id} nearest={nearest:.1f} enemy_pressure={entry['enemy_pressure']:.1f}"
+        )
+    if nearest > _local_direct_limit(world):
+        bridge = _select_bridge_route_target(world, states, target, chain_plan)
+        if bridge is None:
+            adj -= 28.0
+            world.add_debug(f"PRESSURE_ISOLATED_TARGET_PENALTY target=p{target.id} reason=no_bridge_route")
+    return max(-50.0, min(50.0, adj))
+
+
+def hold_continue_check(world, prop):
+    target = world.planet_by_id.get(prop.target_id)
+    if target is None or prop.kind not in OFFENSIVE_MISSIONS:
+        return True, 0.0
+    adjusted_sources = _planned_sources_as_arrival_offsets(world, prop.planned_sources)
+    total = sum(int(s) for _sid, s, _ls, _eta in adjusted_sources)
+    if not adjusted_sources:
+        return True, 0.0
+    arrival = max(1, int(math.ceil(max(eta for _sid, _s, _ls, eta in adjusted_sources))))
+    extra = tuple((max(1, int(math.ceil(eta))), world.player, int(ships)) for _sid, ships, _ls, eta in adjusted_sources)
+    owner_after, _ships_after = world.projected_state(target.id, arrival, extra_arrivals=extra)
+    if owner_after != world.player:
+        world.add_debug(f"HOLD_CONTINUE_FAIL target=p{target.id} reason=no_flip")
+        return False, -50.0
+    owner_5, _ships_5 = world.projected_state(target.id, min(SIM_HORIZON, arrival + 5), extra_arrivals=extra)
+    owner_10, _ships_10 = world.projected_state(target.id, min(SIM_HORIZON, arrival + 10), extra_arrivals=extra)
+    hold_5 = owner_5 == world.player
+    hold_10 = owner_10 == world.player
+    connected = _target_connected_to_pressure(world, target)
+    supports_next = (
+        len(_campaign_followup_options(world, target)) >= 1
+        or _planet_role(target) in (ROLE_BRIDGE, ROLE_LAUNCHPAD)
+        or int(target.production) >= 3
+        or is_static_planet(target)
+    )
+    if hold_5 and connected and supports_next:
+        world.add_debug(f"HOLD_CONTINUE_PASS target=p{target.id} horizon=5 connected={connected}")
+        return True, 12.0 if hold_10 else 4.0
+    penalty = 0.0
+    if not hold_5:
+        penalty -= 25.0
+    if not connected:
+        penalty -= 15.0
+    if not supports_next:
+        penalty -= 10.0
+    world.add_debug(
+        f"HOLD_CONTINUE_FAIL target=p{target.id} hold5={hold_5} hold10={hold_10} connected={connected} supports_next={supports_next}"
+    )
+    return True, max(-50.0, penalty)
+
+
+def adversarial_candidate_adjustment(world, prop, states=None, chain_plan=None):
+    if prop.kind not in OFFENSIVE_MISSIONS:
+        return 0.0, False
+    target = world.planet_by_id.get(prop.target_id)
+    if target is None or target.owner == world.player or world.is_comet(target):
+        return 0.0, True
+    states = states or {}
+    chain_plan = chain_plan or getattr(world, "_active_chain_plan", [])
+    entry = _pressure_entry(world, target)
+    adjusted_sources = _planned_sources_as_arrival_offsets(world, prop.planned_sources)
+    arrival = max((eta for _sid, _s, _ls, eta in adjusted_sources), default=prop.eta_max)
+    nearest_src = min(world.my_planets, key=lambda p: dp(p, target), default=None)
+    if target.owner not in (-1, world.player):
+        enemy_eta = min(
+            (world.eta(e, target, max(1, int(e.ships) // 2)) for e in world.enemy_planets if e.id != target.id),
+            default=999.0,
+        )
+    else:
+        enemy_eta = enemy_earliest_capture_turn(world, target)
+    adjustment = 0.0
+
+    if enemy_eta <= arrival + 3.0:
+        adjustment -= 18.0
+        world.add_debug(f"ENEMY_RESPONSE_PREDICTED target=p{target.id} enemy_eta={enemy_eta:.1f} my_arrival={arrival:.1f}")
+        world.add_debug(f"ENEMY_REINFORCEMENT_PENALTY target=p{target.id} penalty=18")
+
+    ok_hold, hold_adj = hold_continue_check(world, prop)
+    adjustment += hold_adj
+
+    for src_id, ships, _ls, _eta in prop.planned_sources:
+        src = world.planet_by_id.get(src_id)
+        if src is None:
+            continue
+        role = _planet_role(src)
+        launchpad_like = (
+            role == ROLE_LAUNCHPAD
+            or src.id in _primary_launchpads.get(world.player, {})
+            or int(src.production) >= HUB_SECURITY_PROD_THRESHOLD
+        )
+        if not launchpad_like:
+            continue
+        reserve = world.reserve_for(src)
+        remaining = int(src.ships) - world.committed.get(src.id, 0) - int(ships)
+        if remaining < reserve:
+            penalty = min(24.0, (reserve - remaining) * 1.2)
+            adjustment -= penalty
+            world.add_debug(
+                f"DRAINED_LAUNCHPAD_PENALTY src=p{src.id} target=p{target.id} remaining={remaining} reserve={reserve}"
+            )
+
+    isolated = not _target_connected_to_pressure(world, target)
+    enemy_faster = nearest_src is not None and enemy_eta <= arrival + 2.0
+    if isolated and entry["enemy_dominant"]:
+        adjustment -= 22.0
+        world.add_debug(f"PRESSURE_ISOLATED_TARGET_PENALTY target=p{target.id} reason=enemy_dominant")
+    if not ok_hold or (isolated and entry["enemy_dominant"] and enemy_faster):
+        world.add_debug(
+            f"SUICIDE_CAPTURE_REJECTED target=p{target.id} isolated={isolated} enemy_dominant={entry['enemy_dominant']} enemy_eta={enemy_eta:.1f}"
+        )
+        return -50.0, True
+
+    world.add_debug(f"ADVERSARIAL_FILTER_APPLIED target=p{target.id} adjustment={adjustment:.1f}")
+    return max(-50.0, min(50.0, adjustment)), False
+
+
+def apply_pressure_adversarial_adjustments(world, proposals, states=None, chain_plan=None):
+    adjusted = []
+    for prop in list(proposals or ()):
+        if prop is None:
+            continue
+        if getattr(prop, "_pressure_adversarial_applied", False):
+            adjusted.append(prop)
+            continue
+        target = world.planet_by_id.get(prop.target_id)
+        if target is None:
+            continue
+        if prop.kind in OFFENSIVE_MISSIONS:
+            pressure_adj = pressure_score_bonus(world, prop, states, chain_plan)
+            adv_adj, reject = adversarial_candidate_adjustment(world, prop, states, chain_plan)
+            total_adj = max(-50.0, min(50.0, pressure_adj + adv_adj))
+            prop.priority += total_adj
+            prop._pressure_adversarial_applied = True
+            if reject:
+                continue
+            if abs(total_adj) > 0.01:
+                world.add_debug(
+                    f"PRESSURE_TARGET_BONUS target=p{target.id} total_adjustment={total_adj:.1f} priority={prop.priority:.1f}"
+                )
+        adjusted.append(prop)
+    return tuple(adjusted)
+
+
 def run_tactical_interrupt_layer(world, states=None, chain_plan=None, enemy_actions=None, conversion_pressure=None, deadline=None):
     states = states or {}
     chain_plan = chain_plan or []
@@ -16394,6 +16641,12 @@ def build_same_step_attack_bundle(world, states=None, proposal_groups=None, dead
     for group in proposal_groups or ():
         proposals.extend(list(group or ()))
     proposals = [p for p in proposals if p is not None]
+    proposals = list(apply_pressure_adversarial_adjustments(
+        world,
+        proposals,
+        states,
+        getattr(world, "_active_chain_plan", []),
+    ))
     if len(proposals) < SAME_STEP_BUNDLE_MIN:
         return ()
 
@@ -16510,6 +16763,12 @@ def priority_arbiter(world, states, proposal_groups, deadline):
     for group in proposal_groups:
         proposals.extend(list(group or ()))
     proposals = [p for p in proposals if p is not None]
+    proposals = list(apply_pressure_adversarial_adjustments(
+        world,
+        proposals,
+        states,
+        getattr(world, "_active_chain_plan", []),
+    ))
     if not proposals:
         return ()
 
@@ -16601,6 +16860,10 @@ def fast_heuristic_fallback(world, states, chain_plan, enemy_actions, deadline):
     for _score, target in candidates[:6]:
         prop = _build_immediate_capture_prop(world, states, chain_plan, target, "fast_heuristic_fallback", 190.0)
         if prop is not None:
+            adjusted = apply_pressure_adversarial_adjustments(world, (prop,), states, chain_plan)
+            if not adjusted:
+                continue
+            prop = adjusted[0]
             world.add_debug("FAST_HEURISTIC_FALLBACK_USED")
             return (prop,)
     return ()
@@ -17404,6 +17667,7 @@ def generate_atomic_component_moves(world, states, chain_plan, enemy_actions, co
         for prop in components
     ]
     components = [prop for prop in components if _proposal_passes_capture_constraints(world, prop)]
+    components = list(apply_pressure_adversarial_adjustments(world, components, states, chain_plan))
     components.sort(key=lambda prop: -_component_move_sort_score(world, prop))
     world.add_debug(f"BEAM_COMPONENT_MOVES_GENERATED n={len(components)}")
     return components[:BEAM_ROOT_COMPONENT_LIMIT]
@@ -17889,6 +18153,7 @@ def agent(obs, config=None):
 
     moves = []
     states = build_planet_states(world)
+    world.pressure_map = build_pressure_map(world)
     update_rotational_hubs(world)
     prediction = build_prediction_timeline(world, horizons=(5, 10, 15, 20, 30, 40))
     enemy_actions = forecast_enemy_actions(world, horizons=(5, 10, 15, 20))
