@@ -158,8 +158,8 @@ ROTATIONAL_HUB_TTL        = 30    # turns a newly captured planet stays marked a
 ROTATIONAL_HUB_REINFORCE_THRESH = 8  # min ships below reserve before hub reinforce fires
 
 # ── planet radius roles ───────────────────────────────────────────────────────
-SMALL_RADIUS  = 1.2
-LARGE_RADIUS  = 2.3
+SMALL_RADIUS  = 1.2  # fallback only; dynamic_radius_profile is primary
+LARGE_RADIUS  = 2.3  # fallback only; dynamic_radius_profile is primary
 
 # ── start-type-aware opening ──────────────────────────────────────────────────
 LARGE_START_PROD_THRESH   = 4     # prod >= this → LARGE_START (primary)
@@ -241,8 +241,8 @@ CAPTURE_OPP_4P_EARLY_PEN  = 18.0  # 4-player + early + non-local enemy
 CAPTURE_OPP_NEUTRAL_PEN   = 15.0  # many neutrals remain + enemy + not urgent
 
 # ── launchpad-chain strategy ───────────────────────────────────────────────────
-RADIUS_SMALL         = 1.2    # radius <= this → STORAGE role
-RADIUS_LARGE         = 2.3    # radius >= this → LAUNCHPAD role (BRIDGE otherwise)
+RADIUS_SMALL         = 1.2    # fallback only; dynamic map profile is primary
+RADIUS_LARGE         = 2.3    # fallback only; dynamic map profile is primary
 LAUNCHPAD_RESERVE    = 45     # ships kept on large launchpad planets
 LAUNCHPAD_GUARD_SUPPORT_RADIUS = 72.0
 FRONT_ATTACKER_FLOW_RADIUS = 58.0
@@ -355,6 +355,9 @@ _prev_ships: dict = {}            # planet_id -> ship count at start of previous
 _rotational_hubs: dict = {}           # player -> {planet_id -> step when marked as hub}
 _primary_launchpads: dict = {}        # player -> {planet_id -> step when marked as launchpad}
 _start_type_cache: dict = {}          # player -> "LARGE" | "SMALL" | "MEDIUM"
+_start_type_profile_cache: dict = {}  # player -> dynamic radius profile key
+_dynamic_radius_class_by_pid: dict = {}
+_dynamic_radius_detail_by_pid: dict = {}
 
 
 # ── geometry ──────────────────────────────────────────────────────────────────
@@ -482,12 +485,132 @@ def estimate_capture_window_bonus(world, src, target, ships):
     return (safe_count / 13.0) * 8.0
 
 
-def radius_class(p):
+def _percentile(sorted_vals, pct):
+    if not sorted_vals:
+        return 0.0
+    if len(sorted_vals) == 1:
+        return float(sorted_vals[0])
+    pos = (len(sorted_vals) - 1) * pct
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return float(sorted_vals[lo])
+    frac = pos - lo
+    return float(sorted_vals[lo]) * (1.0 - frac) + float(sorted_vals[hi]) * frac
+
+
+def _fallback_radius_class(p):
     if p.radius <= SMALL_RADIUS:
         return "SMALL"
     if p.radius >= LARGE_RADIUS:
         return "LARGE"
     return "MEDIUM"
+
+
+def dynamic_radius_profile(world):
+    radii = sorted(float(p.radius) for p in world.normal_planets)
+    if not radii:
+        world.radius_classes = {}
+        world.radius_role_details = {}
+        world.radius_profile = {
+            "min": 0.0, "max": 0.0, "median": 0.0,
+            "low_cutoff": SMALL_RADIUS, "high_cutoff": LARGE_RADIUS,
+        }
+        return world.radius_profile
+
+    min_radius = radii[0]
+    max_radius = radii[-1]
+    median_radius = _percentile(radii, 0.50)
+    low_cutoff = _percentile(radii, 0.33)
+    high_cutoff = _percentile(radii, 0.66)
+    use_ranking = len(radii) < 6 or max_radius - min_radius <= 0.15 or high_cutoff <= low_cutoff + 0.05
+    classes = {}
+    details = {}
+
+    if use_ranking:
+        ranked = sorted(world.normal_planets, key=lambda p: (float(p.radius), int(p.production), p.id))
+        n = len(ranked)
+        band = max(1, int(math.ceil(n * 0.30)))
+        for idx, p in enumerate(ranked):
+            if idx < band:
+                classes[p.id] = "SMALL"
+            elif idx >= n - band:
+                classes[p.id] = "LARGE"
+            else:
+                classes[p.id] = "MEDIUM"
+    else:
+        for p in world.normal_planets:
+            if float(p.radius) >= high_cutoff:
+                classes[p.id] = "LARGE"
+            elif float(p.radius) <= low_cutoff:
+                classes[p.id] = "SMALL"
+            else:
+                classes[p.id] = "MEDIUM"
+
+    high_prod = max(4, int(math.ceil(_percentile(sorted(int(p.production) for p in world.normal_planets), 0.70))))
+    for p in world.normal_planets:
+        base = classes.get(p.id, _fallback_radius_class(p))
+        detail = base
+        if base == "MEDIUM" and is_static_planet(p) and int(p.production) >= high_prod:
+            classes[p.id] = "LARGE"
+            detail = "STATIC_PROD_LAUNCHPAD"
+            world.add_debug(f"STATIC_PROD_UPGRADED_TO_LAUNCHPAD p{p.id} prod={int(p.production)} radius={p.radius:.2f}")
+        elif base == "SMALL" and int(p.production) >= max(2, high_prod - 1):
+            classes[p.id] = "MEDIUM"
+            detail = "BRIDGE_STORAGE"
+            world.add_debug(f"DYNAMIC_BRIDGE_SELECTED p{p.id} detail=BRIDGE_STORAGE prod={int(p.production)} radius={p.radius:.2f}")
+        elif base == "LARGE" and not is_static_planet(p):
+            detail = "SECONDARY_LAUNCHPAD"
+            world.add_debug(f"ROTATING_LARGE_SECONDARY_LAUNCHPAD p{p.id} radius={p.radius:.2f}")
+        elif base == "SMALL" and int(p.production) <= 1:
+            detail = "LOW_PROD_STORAGE"
+        details[p.id] = detail
+
+    _dynamic_radius_class_by_pid.clear()
+    _dynamic_radius_class_by_pid.update(classes)
+    _dynamic_radius_detail_by_pid.clear()
+    _dynamic_radius_detail_by_pid.update(details)
+    world.radius_classes = dict(classes)
+    world.radius_role_details = dict(details)
+    world.radius_profile = {
+        "min": min_radius,
+        "max": max_radius,
+        "median": median_radius,
+        "low_cutoff": low_cutoff,
+        "high_cutoff": high_cutoff,
+        "ranking": use_ranking,
+    }
+    world.add_debug(
+        f"DYNAMIC_RADIUS_PROFILE_BUILT min={min_radius:.2f} max={max_radius:.2f} "
+        f"median={median_radius:.2f} low={low_cutoff:.2f} high={high_cutoff:.2f} ranking={int(use_ranking)}"
+    )
+    for p in world.normal_planets:
+        cls = classes.get(p.id, _fallback_radius_class(p))
+        detail = details.get(p.id, cls)
+        world.add_debug(f"DYNAMIC_ROLE_CLASSIFIED p{p.id} class={cls} detail={detail} radius={p.radius:.2f}")
+        if cls == "LARGE":
+            world.add_debug(f"DYNAMIC_LAUNCHPAD_SELECTED p{p.id} radius={p.radius:.2f}")
+        elif cls == "SMALL":
+            world.add_debug(f"DYNAMIC_STORAGE_SELECTED p{p.id} radius={p.radius:.2f}")
+        else:
+            world.add_debug(f"DYNAMIC_BRIDGE_SELECTED p{p.id} radius={p.radius:.2f}")
+    return world.radius_profile
+
+
+def radius_class(p, world=None):
+    if p is None:
+        return "MEDIUM"
+    if world is not None:
+        profile = getattr(world, "radius_profile", None)
+        if profile is not None:
+            return getattr(world, "radius_classes", {}).get(p.id, _fallback_radius_class(p))
+    return _dynamic_radius_class_by_pid.get(p.id, _fallback_radius_class(p))
+
+
+def dynamic_radius_detail(p):
+    if p is None:
+        return "MEDIUM"
+    return _dynamic_radius_detail_by_pid.get(p.id, radius_class(p))
 
 
 def is_static_planet(p):
@@ -794,7 +917,11 @@ def board_phase_selected(world):
         phase = BoardPhase.PRESSURE_MODE
     else:
         phase = BoardPhase.BUILD_CHAIN_MODE
-    world.add_debug(f"BOARD_PHASE {phase} occ={len(world.my_planets)}/{max(1, len(world.normal_planets))}")
+    occ = len(world.my_planets) / max(1, len(world.normal_planets))
+    world.add_debug(
+        f"BOARD_PHASE_SELECTED {phase} occ={occ:.2f} "
+        f"prod={world.my_prod}/{world.enemy_prod}"
+    )
     return phase
 
 
@@ -1252,6 +1379,8 @@ class WorldModel:
         self.incoming_to_targets = {}
         self.enemy_incoming_to_targets = {}
         self.debug_events = []
+        self.radius_profile = {}
+        dynamic_radius_profile(self)
         self._build_arrivals()
 
         self.leader = None
@@ -1392,13 +1521,17 @@ class WorldModel:
         """Marco/824-style per-turn policy state: reserves, attack budgets, and reaction ETAs."""
         for p in self.my_planets:
             tl = self.simulate_planet_timeline(p, min(SIM_HORIZON, DEFENSE_ETA_HORIZON))
-            if zero_capital_backline_safe(self, p):
-                keep = 0
-                self.add_debug(f"ZERO_CAPITAL_BACKLINE_DRAIN p{p.id} reserve=0")
+            threat = self.real_incoming_threat(p)
+            keep = max(self.reserve_for(p), tl.get("keep_needed", 0))
+            if threat["deficit"] <= 0:
+                cap = max(0, int(math.ceil(int(p.ships) * 0.60)))
+                if keep > cap:
+                    self.add_debug(f"RESERVE_CAPPED_AT_60_PERCENT p{p.id} reserve={int(keep)} cap={cap}")
+                keep = min(int(keep), cap)
             else:
-                keep = max(self.reserve_for(p), tl.get("keep_needed", 0))
-                cap = max(20, int(p.ships * 0.55))
-                keep = min(int(p.ships), min(int(keep), cap))
+                keep = max(int(keep), threat["deficit"] + 5)
+                self.add_debug(f"THREAT_RESERVE_ESCALATED p{p.id} deficit={threat['deficit']} reserve={keep}")
+            keep = min(int(p.ships), int(keep))
             self.keep_needed_map[p.id] = keep
             self.attack_budget_map[p.id] = max(0, int(p.ships) - keep)
         for tgt in self.normal_planets:
@@ -1608,41 +1741,73 @@ class WorldModel:
         return sum(top) / len(top)
 
     def reserve_for(self, p):
-        if zero_capital_backline_safe(self, p):
-            self.add_debug(f"ZERO_CAPITAL_BACKLINE_DRAIN p{p.id} reserve=0")
+        ships = int(p.ships)
+        if ships <= 0:
             return 0
-        if hasattr(self, "keep_needed_map") and p.id in self.keep_needed_map:
-            cap = max(20, int(p.ships * 0.55))
-            keep = int(self.keep_needed_map[p.id])
-            if is_storage_planet(p):
-                keep = max(keep, int(p.ships * 0.65), 6 + int(p.production) * 2)
-                self.add_debug(f"SMALL_STORAGE_RESERVE_HELD p{p.id} reserve={keep}")
-                return keep
-            return min(keep, cap)
-        if _is_low_control(self):
-            base = min(3, 1 + int(p.production))
-        elif not _is_pressure_mode(self):
-            base = 4 + int(p.production)
-        else:
-            base = 6 + int(p.production)
+        role = _planet_role(p)
         threat = self.real_incoming_threat(p)
-        raw = base
+        nearest_enemy = self.nearest_enemy_distance(p)
+        pressure_mode = _is_pressure_mode(self) or self.features.get("late", False)
+        collapse_mode = self.features.get("final", False) or (
+            len(self.normal_planets) > 0
+            and (
+                len(self.my_planets) / max(1, len(self.normal_planets)) >= PHASE_COLLAPSE_MIN
+                or len(self.enemy_planets) <= 6
+                or self.my_prod > self.enemy_prod * 1.6
+                or self.my_total_ships > self.enemy_total_ships * 1.7
+            )
+        )
+        grouped_attack_mode = (
+            len(self.my_planets) >= 2
+            and any(
+                tgt.owner not in (-1, self.player)
+                and not self.is_comet(tgt)
+                and min((dp(src, tgt) for src in self.my_planets), default=999.0) <= BREACH_KILL_DIST + 18
+                and int(tgt.ships) <= max(18, self.my_total_ships // max(3, len(self.my_planets) * 2))
+                for tgt in self.enemy_planets
+            )
+        )
+        aggressive_mode = pressure_mode or collapse_mode or grouped_attack_mode
+
+        if role == ROLE_LAUNCHPAD:
+            raw = max(10, min(35, int(math.ceil(ships * 0.20))))
+        elif role == ROLE_BRIDGE:
+            raw = max(5, min(20, int(math.ceil(ships * 0.15))))
+        else:
+            storage_ratio = 0.10 if aggressive_mode else 0.20
+            raw = max(3, min(15, int(math.ceil(ships * storage_ratio))))
+
+        if aggressive_mode and role in (ROLE_LAUNCHPAD, ROLE_BRIDGE):
+            raw = int(math.ceil(raw * 0.75))
+        if pressure_mode:
+            self.add_debug(f"PRESSURE_MODE_RESERVE_RELAXED p{p.id} reserve={raw}")
+        if collapse_mode:
+            self.add_debug(f"COLLAPSE_MODE_RESERVE_RELAXED p{p.id} reserve={raw}")
+
+        if _small_start_escape_mode(self, p):
+            raw = min(raw, 3)
+            self.add_debug(f"SMALL_START_RESERVE_RELAXED p{p.id} reserve={raw}")
+
+        friendly_support = sum(1 for q in self.my_planets if q.id != p.id and dp(p, q) <= 48.0)
+        critical_launchpad = role == ROLE_LAUNCHPAD and (is_idle(p) or int(p.production) >= 4)
+        if threat["deficit"] <= 0 and nearest_enemy > FRONTLINE_DIST + 45 and friendly_support >= 2:
+            if not critical_launchpad:
+                self.add_debug(f"BACKLINE_ZERO_RESERVE_ALLOWED p{p.id}")
+                return 0
+            raw = min(raw, int(math.ceil(ships * 0.10)))
+
         if threat["deficit"] > 0:
-            raw += threat["deficit"] + 3
-        elif self.nearest_enemy_distance(p) < FRONTLINE_DIST:
-            raw += max(2, int(p.production))
-        if is_storage_planet(p):
-            raw += max(4, int(p.production) * 2)
-            raw = max(raw, int(p.ships * 0.60))
-            self.add_debug(f"SMALL_STORAGE_RESERVE_HELD p{p.id} reserve={raw}")
-        cap = max(20, int(p.ships * (0.45 if _is_low_control(self) else 0.55)))
-        if is_storage_planet(p):
-            cap = max(cap, int(p.ships * 0.80))
-        return min(int(raw), cap)
+            raw = max(raw, threat["deficit"] + 5)
+            self.add_debug(f"THREAT_RESERVE_ESCALATED p{p.id} deficit={threat['deficit']} reserve={raw}")
+            return min(ships, int(raw))
+
+        cap = int(math.ceil(ships * 0.60))
+        if raw > cap:
+            self.add_debug(f"RESERVE_CAPPED_AT_60_PERCENT p{p.id} reserve={raw} cap={cap}")
+            raw = cap
+        return min(ships, max(0, int(raw)))
 
     def surplus(self, p):
-        if hasattr(self, "attack_budget_map") and p.id in self.attack_budget_map:
-            return max(0, self.attack_budget_map[p.id] - self.committed.get(p.id, 0))
         return max(0, int(p.ships) - self.committed.get(p.id, 0) - self.reserve_for(p))
 
     def target_need_now(self, tgt):
@@ -1805,6 +1970,19 @@ class WorldModel:
                 and dp(src, tgt) <= CAPTURE_OPP_MAX_DIST
             )
             local_support = tgt is not None and dp(src, tgt) <= CHEAP_RECAPTURE_LOCAL_DIST
+            grouped_pressure_release = (
+                mission_type in ("SYNC_ATTACK", "BREACH_KILL", "COLLAPSE", "FINAL_DRAIN")
+                and tgt is not None
+                and (
+                    _is_pressure_mode(self)
+                    or self.features.get("final", False)
+                    or "sync" in (mission_reason or "")
+                    or "pressure" in (mission_reason or "")
+                    or "collapse" in (mission_reason or "")
+                    or "chain" in (mission_reason or "")
+                    or dp(src, tgt) <= BREACH_KILL_DIST + 18
+                )
+            )
             if allowed_storage_release:
                 if mission_type in ("CORE_CHAIN_RECOVERY", "RECAPTURE_LOST"):
                     self.add_debug(f"SMALL_STORAGE_RELEASE_RECAPTURE src=p{src.id} target=p{getattr(tgt, 'id', '?')}")
@@ -1812,6 +1990,8 @@ class WorldModel:
                 pass
             elif local_support and mission_type in ("CAPTURE_NEUTRAL", "LOCAL_PRODUCTION_CAPTURE"):
                 pass
+            elif grouped_pressure_release:
+                self.add_debug(f"SMALL_STORAGE_RELEASE_GROUPED_PRESSURE src=p{src.id} target=p{getattr(tgt, 'id', '?')}")
             else:
                 self.add_debug(
                     f"SMALL_STORAGE_SKIP_FAR_ATTACK src=p{src.id} target=p{getattr(tgt, 'id', '?')} mission={mission_type}"
@@ -2526,7 +2706,15 @@ def control_phase_selected(world):
     else:
         phase = ControlPhase.INITIAL_EXPANSION
         world.add_debug("INITIAL_EXPANSION_PHASE")
-    world.add_debug(f"CONTROL_PHASE_SELECTED {phase}")
+    world.add_debug(f"CONTROL_PHASE_DIAGNOSTIC_ONLY {phase}")
+    return phase, control_ratio
+
+
+def control_phase_diagnostic(world):
+    """Legacy phase label for debug only; BoardPhase owns macro decisions."""
+    control_ratio = len(world.my_planets) / max(1, len(world.normal_planets))
+    phase = classify_strategic_phase(world)
+    world.add_debug(f"CONTROL_PHASE_DIAGNOSTIC_ONLY {phase}")
     return phase, control_ratio
 
 
@@ -4598,9 +4786,17 @@ def classify_start_type(world):
 
 def get_start_type(world):
     """Cached start-type. Logs classification once per game."""
-    if _start_type_cache.get(world.player) is None:
+    profile = getattr(world, "radius_profile", {})
+    profile_key = (
+        round(profile.get("min", 0.0), 3),
+        round(profile.get("max", 0.0), 3),
+        round(profile.get("low_cutoff", 0.0), 3),
+        round(profile.get("high_cutoff", 0.0), 3),
+    )
+    if _start_type_cache.get(world.player) is None or _start_type_profile_cache.get(world.player) != profile_key:
         st = classify_start_type(world)
         _start_type_cache[world.player] = st
+        _start_type_profile_cache[world.player] = profile_key
         world.add_debug(f"START_RADIUS_CLASSIFIED_{st}")
         world.add_debug(f"OPENING_CLASS_{st}_START prod={world.my_planets[0].production if world.my_planets else '?'} step={world.step}")
         start_planet = next((p for p in world.initial_planets.values() if p.owner == world.player), None)
@@ -7848,6 +8044,11 @@ def is_bridge_planet(world, planet):
     """
     if not world.my_planets or not (world.neutral_planets + world.enemy_planets):
         return False
+    role = _planet_role(planet)
+    detail = dynamic_radius_detail(planet)
+    if role == ROLE_BRIDGE or detail == "BRIDGE_STORAGE":
+        if any(not world.is_comet(tgt) and dp(planet, tgt) <= BRIDGE_RELAY_DIST for tgt in world.neutral_planets + world.enemy_planets):
+            return True
     cx = sum(p.x for p in world.my_planets) / len(world.my_planets)
     cy = sum(p.y for p in world.my_planets) / len(world.my_planets)
     for tgt in world.neutral_planets + world.enemy_planets:
@@ -8264,9 +8465,10 @@ ROLE_STORAGE   = "STORAGE"
 
 
 def _planet_role(p):
-    if p.radius >= RADIUS_LARGE:
+    cls = radius_class(p)
+    if cls == "LARGE":
         return ROLE_LAUNCHPAD
-    if p.radius > RADIUS_SMALL:
+    if cls == "MEDIUM":
         return ROLE_BRIDGE
     return ROLE_STORAGE
 
@@ -8284,7 +8486,7 @@ def _small_start_escape_mode(world, src=None):
         return False
     if src is not None and src.id != start.id:
         return False
-    small_or_low = start.radius <= RADIUS_SMALL or int(start.production) <= 2
+    small_or_low = radius_class(start) == "SMALL" or int(start.production) <= 2
     if not small_or_low:
         return False
     anchor_owned = any(
@@ -8361,17 +8563,9 @@ def build_planet_states(world):
     for p in world.my_planets:
         role      = _planet_role(p)
         static    = is_idle(p)
-        front     = world.nearest_enemy_distance(p) < FRONTLINE_DIST
-        reserve   = _role_reserve(role, front)
-        if zero_capital_backline_safe(world, p):
-            reserve = 0
-            world.add_debug(f"ZERO_CAPITAL_BACKLINE_DRAIN p{p.id} reserve=0")
-        elif _small_start_escape_mode(world, p):
-            reserve = min(3, max(0, int(p.production)))
+        reserve   = world.reserve_for(p)
+        if _small_start_escape_mode(world, p):
             world.add_debug(f"SMALL_START_ESCAPE_MODE p{p.id}")
-            world.add_debug(f"SMALL_START_RESERVE_RELAXED p{p.id} reserve={reserve}")
-        elif (len(world.my_planets) < 4 or world.step < 50) and not front:
-            reserve = min(reserve, max(3, int(p.production) * 2 + 3))
         elif len(world.my_planets) > 1:
             start = _start_planet_current(world)
             if start is not None and p.id == start.id and role == ROLE_STORAGE:
@@ -8432,6 +8626,7 @@ def _chain_planet_score(world, planet):
     """
     prod     = int(planet.production)
     role     = _planet_role(planet)
+    detail   = dynamic_radius_detail(planet)
     static   = is_idle(planet)
     cd       = world.cluster_distance(planet)
     ships    = int(planet.ships)
@@ -8442,8 +8637,12 @@ def _chain_planet_score(world, planet):
     # Role / radius
     if role == ROLE_LAUNCHPAD:
         s += 80.0
+        if detail == "SECONDARY_LAUNCHPAD":
+            s += 35.0
     elif role == ROLE_BRIDGE:
         s += 30.0
+        if detail == "BRIDGE_STORAGE":
+            s += 20.0
 
     # Non-orbiting bonus (huge asset)
     if static:
@@ -8540,6 +8739,7 @@ def _opening_chain_bonus(world, planet):
 
 def _route_node_score(world, planet, anchor, selected, rotating_launchpad_used):
     role = _planet_role(planet)
+    detail = dynamic_radius_detail(planet)
     if role == ROLE_STORAGE and not _chain_small_has_value(world, planet, anchor):
         world.add_debug(f"CHAIN_REJECT_ISOLATED_SMALL p{planet.id}")
         return -1e9
@@ -8553,7 +8753,14 @@ def _route_node_score(world, planet, anchor, selected, rotating_launchpad_used):
     elif role == ROLE_BRIDGE and is_idle(planet):
         score += 145.0
     elif role == ROLE_LAUNCHPAD and not is_idle(planet):
-        score += 70.0 if not rotating_launchpad_used else -110.0
+        if rotating_launchpad_used:
+            score -= 110.0
+        elif detail == "SECONDARY_LAUNCHPAD":
+            score += 95.0
+        else:
+            score += 70.0
+    if detail == "BRIDGE_STORAGE":
+        score += 35.0
     if int(planet.production) >= 4:
         score += 120.0
     if role == ROLE_BRIDGE:
@@ -9905,7 +10112,7 @@ def _beam_small_start_active(world):
         and start.owner == world.player
         and len(world.my_planets) <= 2
         and _is_low_control(world)
-        and (float(start.radius) <= RADIUS_SMALL or int(start.production) <= 1)
+        and (radius_class(start) == "SMALL" or int(start.production) <= 1)
     )
 
 
@@ -12544,7 +12751,6 @@ def _low_increment_start_detected(world):
         return False
     low = (
         radius_class(start) == "SMALL"
-        or float(start.radius) <= RADIUS_SMALL
         or int(start.production) <= 2
     )
     if low:
@@ -13003,6 +13209,44 @@ def build_parallel_opening_sweep_props(world, states, chain_plan, deadline):
         seen.add(target.id)
     if props:
         world.add_debug(f"ATTACK_BUNDLE_CANDIDATES_BUILT parallel_opening={len(props)}")
+    return tuple(props)
+
+
+def opening_nearest_sweep(world, states, chain_plan, deadline):
+    """LOW_CONTROL_MODE submode: nearest useful opening captures."""
+    world.add_debug("OPENING_SWEEP_AS_BOARD_SUBMODE")
+    return build_early_nearest_sweep_props(world, states, chain_plan, deadline)
+
+
+def parallel_opening_sweep(world, states, chain_plan, deadline):
+    """LOW_CONTROL_MODE submode: parallel opening captures when safe."""
+    world.add_debug("OPENING_SWEEP_AS_BOARD_SUBMODE")
+    return build_parallel_opening_sweep_props(world, states, chain_plan, deadline)
+
+
+def low_control_opening_expansion(world, states, chain_plan, deadline):
+    """BoardPhase.LOW_CONTROL_MODE expansion toolkit."""
+    world.add_debug("LOW_CONTROL_OPENING_EXPANSION_ACTIVE")
+    props = []
+    props.extend(build_small_start_escape_props(world, states, chain_plan, deadline))
+    props.extend(opening_nearest_sweep(world, states, chain_plan, deadline))
+    props.extend(parallel_opening_sweep(world, states, chain_plan, deadline))
+
+    chain_prop = opening_chain_plan(world, deadline)
+    if chain_prop is not None:
+        target = world.planet_by_id.get(chain_prop.target_id)
+        strong_route = (
+            target is not None
+            and (
+                is_static_planet(target)
+                or radius_class(target) == "LARGE"
+                or int(target.production) >= 3
+                or _planet_role(target) in (ROLE_LAUNCHPAD, ROLE_BRIDGE)
+            )
+        )
+        if strong_route:
+            chain_prop.reason = f"{chain_prop.reason} low_control_launchpad_chain_opening"
+            props.append(chain_prop)
     return tuple(props)
 
 
@@ -14699,7 +14943,11 @@ def _legacy_rule_agent(obs, config=None):
     chain_plan = build_launchpad_chain_plan(world, states)
     world._active_chain_plan = chain_plan
     world._active_structure = classify_planet_structure(world, states, chain_plan)
-    control_phase, control_ratio = control_phase_selected(world)
+    board_phase = board_phase_selected(world)
+    world._board_phase = board_phase
+    world.add_debug("NORAD_VALIDATION_ONLY")
+    world.add_debug("PHASE_CONFLICT_REMOVED")
+    control_phase, control_ratio = control_phase_diagnostic(world)
     midgame_conversion = midgame_conversion_context(world, control_ratio)
     world.midgame_conversion_active = bool(midgame_conversion.get("active"))
 
@@ -14730,16 +14978,17 @@ def _legacy_rule_agent(obs, config=None):
     # ── 5b. Main33 tempo layers, funded/committed by main34 packet rules ─────
     if not moves and not small_start_escape_pending and time.perf_counter() < deadline:
         run_nearest_useful_target_lock(world, states, chain_plan, moves, deadline)
-        if moves and control_phase == ControlPhase.INITIAL_EXPANSION:
+        if moves and board_phase == BoardPhase.LOW_CONTROL_MODE:
             world.add_debug("INITIAL_EXPANSION_NEAREST_TARGET")
 
     if not moves and not small_start_escape_pending and time.perf_counter() < deadline:
         run_midgame_stabilization_mode(world, states, chain_plan, moves, deadline)
-        if moves and control_phase == ControlPhase.MIDGAME_CONTROL:
+        if moves and board_phase == BoardPhase.BUILD_CHAIN_MODE:
             world.add_debug("MIDGAME_STRUCTURE_STABILIZE")
 
     if not moves and not small_start_escape_pending and time.perf_counter() < deadline:
-        run_small_opponent_planet_capture_mode(world, states, chain_plan, control_phase, moves, deadline)
+        legacy_attack_label = ControlPhase.COLLAPSE_PHASE if board_phase == BoardPhase.PRESSURE_MODE else ControlPhase.MIDGAME_CONTROL
+        run_small_opponent_planet_capture_mode(world, states, chain_plan, legacy_attack_label, moves, deadline)
 
     if not moves and not small_start_escape_pending and time.perf_counter() < deadline:
         run_four_player_expand_first(world, moves, deadline)
@@ -14784,7 +15033,9 @@ def _legacy_rule_agent(obs, config=None):
 
     # ── 9. Midgame dominance: convert large advantage before final drain ─────
     if not moves and not small_start_escape_pending and time.perf_counter() < deadline:
-        run_control_phase_attack_mode(world, states, chain_plan, control_phase, control_ratio, moves, deadline)
+        if board_phase == BoardPhase.PRESSURE_MODE:
+            legacy_attack_label = ControlPhase.COLLAPSE_PHASE if enemy_planets_total(world) <= 6 else ControlPhase.DOMINANCE_PHASE
+            run_control_phase_attack_mode(world, states, chain_plan, legacy_attack_label, control_ratio, moves, deadline)
 
     if not moves and not small_start_escape_pending and time.perf_counter() < deadline:
         run_midgame_dominance_attack_mode(world, states, chain_plan, moves, deadline)
@@ -14997,12 +15248,14 @@ def _legacy_rule_agent(obs, config=None):
         log_missed_opportunities(world, states, chain_plan)
 
     # ── 14. Final drain (endgame only) ────────────────────────────────────────
-    if control_based_final_phase(world, control_phase, control_ratio) and time.perf_counter() < deadline:
+    if (board_phase == BoardPhase.PRESSURE_MODE or world.remaining < 45) and time.perf_counter() < deadline:
         if world.remaining >= 45:
             world.add_debug("FINAL_DRAIN_STARTED_EARLY_BY_CONTROL")
             world.add_debug("CONTROL_BASED_FINAL_PHASE")
             world.add_debug("CONTROL_BASED_FINAL_DRAIN")
         _final_drain_chain(world, moves, chain_plan)
+
+    world.add_debug(f"BOARD_PHASE_DECISION_FINAL phase={board_phase} moves={len(moves)}")
 
     if DEBUG:
         for event in world.debug_events:
@@ -15845,6 +16098,116 @@ def _target_connected_to_pressure(world, target):
     return False
 
 
+def _advantage_flags(world):
+    return {
+        "fleet_adv": world.my_total_ships > world.enemy_total_ships * 1.10,
+        "prod_adv": world.my_prod > world.enemy_prod * 1.10,
+        "control_adv": len(world.my_planets) > len(world.enemy_planets),
+    }
+
+
+def _target_recently_drained_or_weak(world, target):
+    if target is None:
+        return False
+    if int(target.ships) <= ENEMY_GATE_WEAK_LOCAL:
+        return True
+    prev = _prev_ships.get(target.id)
+    if prev is None:
+        return False
+    drop = (int(prev) + int(target.production)) - int(target.ships)
+    return drop >= CAPTURE_OPP_DRAINED_DROP
+
+
+def _target_near_launchpad_or_frontier(world, target):
+    if target is None:
+        return False
+    if world.cluster_distance(target) <= MIDGAME_FRONT_RADIUS:
+        return True
+    launchpads = owned_launchpads(world)
+    if min((dp(p, target) for p in launchpads), default=999.0) <= FRONT_ATTACKER_FLOW_RADIUS:
+        return True
+    return min((dp(p, target) for p in world.my_planets), default=999.0) <= FRONTLINE_FAR_ATTACK_DIST
+
+
+def _grouped_attack_flips_target(world, target, prop):
+    planned = getattr(prop, "planned_sources", []) or []
+    if len(planned) < 2:
+        return False
+    ok_grp, _reason = validate_grouped_launch(world, target, planned)
+    return ok_grp
+
+
+def _aggression_override_pressure_cap(world, target, prop):
+    if target is None or target.owner in (-1, world.player) or world.is_comet(target):
+        return False
+    flags = _advantage_flags(world)
+    override = (
+        flags["fleet_adv"]
+        or flags["prod_adv"]
+        or flags["control_adv"]
+        or int(target.ships) <= ENEMY_GATE_WEAK_LOCAL
+        or int(target.production) >= 4
+        or _target_near_launchpad_or_frontier(world, target)
+        or _grouped_attack_flips_target(world, target, prop)
+        or _target_recently_drained_or_weak(world, target)
+    )
+    if override:
+        world.add_debug(
+            f"AGGRESSION_OVERRIDE_PRESSURE_PENALTY target=p{target.id} "
+            f"fleet={int(flags['fleet_adv'])} prod={int(flags['prod_adv'])} control={int(flags['control_adv'])}"
+        )
+    return override
+
+
+def _good_capture_after_pressure(world, target, prop):
+    if target is None or target.owner == world.player or world.is_comet(target):
+        return False
+    if world.cluster_distance(target) > MIDGAME_FRONT_RADIUS and not _target_near_launchpad_or_frontier(world, target):
+        return False
+    if not validate_grouped_launch(world, target, getattr(prop, "planned_sources", []) or [])[0]:
+        return False
+    total = _proposal_total_ships(prop)
+    if total <= 0:
+        return False
+    arrival = max(1.0, getattr(prop, "eta_max", 1.0))
+    return world.can_hold_after_capture(target, arrival, total)
+
+
+def _launchpad_critical_drain_without_backup(world, prop, target):
+    planned = getattr(prop, "planned_sources", []) or []
+    planned_ids = {src_id for src_id, _ships, _ls, _eta in planned}
+    for src_id, ships, _ls, _eta in planned:
+        src = world.planet_by_id.get(src_id)
+        if src is None:
+            continue
+        launchpad_like = (
+            _planet_role(src) == ROLE_LAUNCHPAD
+            or src.id in _primary_launchpads.get(world.player, {})
+            or int(src.production) >= HUB_SECURITY_PROD_THRESHOLD
+        )
+        if not launchpad_like:
+            continue
+        reserve = world.reserve_for(src)
+        critical_reserve = max(8, int(reserve * 0.45))
+        remaining = int(src.ships) - world.committed.get(src.id, 0) - int(ships)
+        if remaining >= critical_reserve:
+            continue
+        backup = any(
+            p.id not in planned_ids
+            and p.id != src.id
+            and world.surplus(p) >= MIN_SEND_SHIPS
+            and dp(p, src) <= LAUNCHPAD_GUARD_SUPPORT_RADIUS
+            and world.real_incoming_threat(p)["deficit"] <= 0
+            for p in world.my_planets
+        )
+        if not backup:
+            world.add_debug(
+                f"HARD_REJECT_ONLY_IMPOSSIBLE target=p{target.id} reason=launchpad_critical_drain src=p{src.id} remaining={remaining} critical={critical_reserve}"
+            )
+            return True
+    return False
+
+
 def pressure_score_bonus(world, prop, states=None, chain_plan=None):
     if prop.kind not in OFFENSIVE_MISSIONS:
         return 0.0
@@ -15858,29 +16221,37 @@ def pressure_score_bonus(world, prop, states=None, chain_plan=None):
     nearest = min((dp(p, target) for p in world.my_planets), default=999.0)
 
     if entry["contested"] or (entry["my_pressure"] > 0 and entry["enemy_pressure"] > 0 and nearest <= 72.0):
-        adj += 18.0
+        adj += 20.0
         world.add_debug(
             f"PRESSURE_TARGET_BONUS target=p{target.id} contested={entry['contested']} net={entry['net_pressure']:.1f}"
         )
     if _planet_role(target) in (ROLE_BRIDGE, ROLE_LAUNCHPAD) or is_bridge_planet(world, target):
-        adj += 18.0
+        adj += 15.0
         world.add_debug(f"PRESSURE_BRIDGE_TARGET_SELECTED target=p{target.id}")
+    if nearest <= MIDGAME_FRONT_RADIUS and validate_grouped_launch(world, target, prop.planned_sources)[0]:
+        adj += 20.0
+        world.add_debug(f"PRESSURE_TARGET_BONUS target=p{target.id} nearby_achievable=1")
+    if _planet_role(target) == ROLE_STORAGE and (
+        _chain_small_has_value(world, target) or len(_campaign_followup_options(world, target)) >= 1
+    ):
+        adj += 10.0
+        world.add_debug(f"PRESSURE_TARGET_BONUS target=p{target.id} useful_small_bridge=1")
     if target.owner not in (-1, world.player) and int(target.ships) <= max(22, int(target.production) * 6):
         if entry["my_pressure"] >= entry["enemy_pressure"] * 0.65:
-            adj += 22.0
+            adj += 25.0
             world.add_debug(
                 f"PRESSURE_TARGET_BONUS target=p{target.id} weak_enemy_zone my={entry['my_pressure']:.1f} enemy={entry['enemy_pressure']:.1f}"
             )
     isolated = nearest > 78.0 and not _target_connected_to_pressure(world, target)
     if isolated and entry["enemy_dominant"]:
-        adj -= 35.0
+        adj -= 20.0
         world.add_debug(
             f"PRESSURE_ISOLATED_TARGET_PENALTY target=p{target.id} nearest={nearest:.1f} enemy_pressure={entry['enemy_pressure']:.1f}"
         )
     if nearest > _local_direct_limit(world):
         bridge = _select_bridge_route_target(world, states, target, chain_plan)
         if bridge is None:
-            adj -= 28.0
+            adj -= 20.0
             world.add_debug(f"PRESSURE_ISOLATED_TARGET_PENALTY target=p{target.id} reason=no_bridge_route")
     return max(-50.0, min(50.0, adj))
 
@@ -15923,7 +16294,8 @@ def hold_continue_check(world, prop):
     world.add_debug(
         f"HOLD_CONTINUE_FAIL target=p{target.id} hold5={hold_5} hold10={hold_10} connected={connected} supports_next={supports_next}"
     )
-    return True, max(-50.0, penalty)
+    world.add_debug(f"HOLD_CONTINUE_FAIL_SOFT target=p{target.id} penalty={max(-25.0, penalty):.1f}")
+    return True, max(-25.0, penalty)
 
 
 def adversarial_candidate_adjustment(world, prop, states=None, chain_plan=None):
@@ -15948,12 +16320,15 @@ def adversarial_candidate_adjustment(world, prop, states=None, chain_plan=None):
     adjustment = 0.0
 
     if enemy_eta <= arrival + 3.0:
-        adjustment -= 18.0
+        adjustment -= 20.0
         world.add_debug(f"ENEMY_RESPONSE_PREDICTED target=p{target.id} enemy_eta={enemy_eta:.1f} my_arrival={arrival:.1f}")
-        world.add_debug(f"ENEMY_REINFORCEMENT_PENALTY target=p{target.id} penalty=18")
+        world.add_debug(f"ENEMY_REINFORCEMENT_PENALTY target=p{target.id} penalty=20")
 
     ok_hold, hold_adj = hold_continue_check(world, prop)
     adjustment += hold_adj
+
+    if _launchpad_critical_drain_without_backup(world, prop, target):
+        return -50.0, True
 
     for src_id, ships, _ls, _eta in prop.planned_sources:
         src = world.planet_by_id.get(src_id)
@@ -15979,12 +16354,20 @@ def adversarial_candidate_adjustment(world, prop, states=None, chain_plan=None):
     isolated = not _target_connected_to_pressure(world, target)
     enemy_faster = nearest_src is not None and enemy_eta <= arrival + 2.0
     if isolated and entry["enemy_dominant"]:
-        adjustment -= 22.0
+        adjustment -= 15.0
         world.add_debug(f"PRESSURE_ISOLATED_TARGET_PENALTY target=p{target.id} reason=enemy_dominant")
-    if not ok_hold or (isolated and entry["enemy_dominant"] and enemy_faster):
+    no_support = isolated and not _target_near_launchpad_or_frontier(world, target)
+    can_hold = world.can_hold_after_capture(target, arrival, _proposal_total_ships(prop))
+    if not ok_hold:
         world.add_debug(
-            f"SUICIDE_CAPTURE_REJECTED target=p{target.id} isolated={isolated} enemy_dominant={entry['enemy_dominant']} enemy_eta={enemy_eta:.1f}"
+            f"HARD_REJECT_ONLY_IMPOSSIBLE target=p{target.id} reason=no_flip"
         )
+        return -50.0, True
+    if no_support and entry["enemy_dominant"] and enemy_faster and not can_hold:
+        world.add_debug(
+            f"SUICIDE_CAPTURE_REJECTED target=p{target.id} no_support={no_support} enemy_dominant={entry['enemy_dominant']} enemy_eta={enemy_eta:.1f}"
+        )
+        world.add_debug(f"HARD_REJECT_ONLY_IMPOSSIBLE target=p{target.id} reason=suicidal_hold_continue")
         return -50.0, True
 
     world.add_debug(f"ADVERSARIAL_FILTER_APPLIED target=p{target.id} adjustment={adjustment:.1f}")
@@ -16006,10 +16389,24 @@ def apply_pressure_adversarial_adjustments(world, proposals, states=None, chain_
             pressure_adj = pressure_score_bonus(world, prop, states, chain_plan)
             adv_adj, reject = adversarial_candidate_adjustment(world, prop, states, chain_plan)
             total_adj = max(-50.0, min(50.0, pressure_adj + adv_adj))
+            if total_adj < -10.0 and _aggression_override_pressure_cap(world, target, prop):
+                world.add_debug(
+                    f"PRESSURE_PENALTY_CAPPED target=p{target.id} from={total_adj:.1f} to=-10.0"
+                )
+                total_adj = -10.0
+            if total_adj < 0.0 and _good_capture_after_pressure(world, target, prop):
+                restored = max(total_adj, -5.0)
+                if restored > total_adj:
+                    world.add_debug(
+                        f"GOOD_CAPTURE_RESTORED_AFTER_PRESSURE_PENALTY target=p{target.id} "
+                        f"from={total_adj:.1f} to={restored:.1f}"
+                    )
+                    total_adj = restored
             prop.priority += total_adj
             prop._pressure_adversarial_applied = True
             if reject:
                 continue
+            world.add_debug(f"PRESSURE_SOFT_GUIDANCE_ONLY target=p{target.id} adjustment={total_adj:.1f}")
             if abs(total_adj) > 0.01:
                 world.add_debug(
                     f"PRESSURE_TARGET_BONUS target=p{target.id} total_adjustment={total_adj:.1f} priority={prop.priority:.1f}"
@@ -16390,7 +16787,7 @@ def build_front_attacker_flow_props(world, states, chain_plan, deadline):
             front_guards,
             key=lambda g: (world.nearest_enemy_distance(g), -int(g.production), dp(pad, g)),
         )
-        reserve = max(st.reserve, LAUNCHPAD_RESERVE if _planet_role(pad) == ROLE_LAUNCHPAD else st.reserve)
+        reserve = st.reserve
         send = round_down_to_granularity(min(st.safe_surplus, max(0, int(pad.ships) - world.committed.get(pad.id, 0) - reserve)))
         if send < MIN_SEND_SHIPS:
             world.add_debug(f"LAUNCHPAD_NOT_LEFT_EMPTY launchpad=p{pad.id}")
@@ -17544,6 +17941,55 @@ def build_zero_capital_backline_rally_props(world, states, chain_plan, deadline)
     return props[:8]
 
 
+def _board_phase_component_allowed(world, prop):
+    phase = getattr(world, "_board_phase", BoardPhase.BUILD_CHAIN_MODE)
+    reason = (getattr(prop, "reason", "") or "").lower()
+    target = world.planet_by_id.get(prop.target_id)
+
+    if prop.kind in REINFORCEMENT_MISSIONS or getattr(prop, "priority_tier", "") == "CRITICAL":
+        return True
+    if target is None or prop.kind not in OFFENSIVE_MISSIONS:
+        return True
+
+    if phase == BoardPhase.LOW_CONTROL_MODE:
+        return (
+            target.owner == -1
+            or any(token in reason for token in (
+                "small_start_escape",
+                "opening",
+                "nearest_sweep",
+                "parallel_opening_sweep",
+                "chain_plan",
+                "beam_atomic_small_start_escape",
+                "early_direct_expansion",
+                "tactical_neutral_conversion",
+                "tactical_chain_conversion",
+            ))
+            or is_local_enemy_opportunity(world, target)
+            or _small_radius_target_allowed(world, target, chain_plan=getattr(world, "_active_chain_plan", []))
+        )
+
+    if phase == BoardPhase.BUILD_CHAIN_MODE:
+        return (
+            target.owner == -1
+            or target.id in set(getattr(world, "_active_chain_plan", [])[:18])
+            or _planet_role(target) in (ROLE_LAUNCHPAD, ROLE_BRIDGE)
+            or is_local_enemy_opportunity(world, target)
+            or int(target.production) >= 3
+            or _small_radius_target_allowed(world, target, chain_plan=getattr(world, "_active_chain_plan", []))
+            or any(token in reason for token in (
+                "rolling_chain",
+                "front_attacker",
+                "bridge_route",
+                "tactical_chain",
+                "counterattack",
+                "game_winning",
+            ))
+        )
+
+    return True
+
+
 def generate_atomic_component_moves(world, states, chain_plan, enemy_actions, control_ratio, deadline, staging_id=None):
     components = []
     components.extend(_build_defense_component_proposals(world, states, deadline))
@@ -17667,6 +18113,7 @@ def generate_atomic_component_moves(world, states, chain_plan, enemy_actions, co
         for prop in components
     ]
     components = [prop for prop in components if _proposal_passes_capture_constraints(world, prop)]
+    components = [prop for prop in components if _board_phase_component_allowed(world, prop)]
     components = list(apply_pressure_adversarial_adjustments(world, components, states, chain_plan))
     components.sort(key=lambda prop: -_component_move_sort_score(world, prop))
     world.add_debug(f"BEAM_COMPONENT_MOVES_GENERATED n={len(components)}")
@@ -18159,9 +18606,13 @@ def agent(obs, config=None):
     enemy_actions = forecast_enemy_actions(world, horizons=(5, 10, 15, 20))
     chain_plan = build_launchpad_chain_plan(world, states)
     world._active_chain_plan = chain_plan
+    board_phase = board_phase_selected(world)
+    world._board_phase = board_phase
+    world.add_debug("NORAD_VALIDATION_ONLY")
+    world.add_debug("PHASE_CONFLICT_REMOVED")
     activate_offense_first_objective(world)
     world._active_structure = classify_planet_structure(world, states, chain_plan)
-    _control_phase, control_ratio = control_phase_selected(world)
+    _control_phase, control_ratio = control_phase_diagnostic(world)
     update_territory_conversion_history(world)
     conversion_pressure = territory_conversion_score(world)
     configure_aggressiveness_controller(world, control_ratio, conversion_pressure)
@@ -18184,16 +18635,11 @@ def agent(obs, config=None):
         update_ownership_memory(world)
         return moves
 
-    # Phase Transition Lock: classify the current strategic phase and attach a
-    # flag the beam and target-selection can read to restrict risky expansion.
-    _strategic_phase = classify_strategic_phase(world)
+    # Legacy ControlPhase is diagnostic only. BoardPhase owns macro routing, so
+    # the old transition lock is kept disabled and cannot veto captures.
+    _strategic_phase = _control_phase
     world._strategic_phase = _strategic_phase
-    world._phase_transition_locked = (_strategic_phase == ControlPhase.CONSOLIDATE)
-    if world._phase_transition_locked:
-        world.add_debug(
-            f"PHASE_TRANSITION_LOCKED strategic_phase={_strategic_phase} "
-            f"step={world.step} my_prod={world.my_prod} enemy_prod={world.enemy_prod}"
-        )
+    world._phase_transition_locked = False
 
     # Cache midgame state on world so _active_offensive_limit() can read it
     # without recomputing fleet_ratio a second time.
@@ -18211,21 +18657,61 @@ def agent(obs, config=None):
     else:
         emergency_props = tuple(_build_defense_component_proposals(world, states, deadline))
         launchpad_guard_props = reinforce_launchpad_from_surroundings(world, states, deadline)
-        game_winning_props = detect_game_winning_opportunities(world, states, chain_plan, enemy_actions, deadline)
-        small_escape_props = build_small_start_escape_props(world, states, chain_plan, deadline)
-        parallel_sweep_props = build_parallel_opening_sweep_props(world, states, chain_plan, deadline)
-        if world.step <= 70 and parallel_sweep_props:
-            world.add_debug("EARLY_WAIT_FORBIDDEN_CAPTURE_EXISTS")
-            world.add_debug("OPENING_IDLE_REJECTED")
-        early_sweep_props = build_early_nearest_sweep_props(world, states, chain_plan, deadline)
-        multi_axis_props = build_multi_axis_expansion_props(world, states, chain_plan, deadline)
-        front_push_props = build_front_attacker_push_props(world, states, chain_plan, deadline)
-        counter_after_defense_props = build_counterattack_after_defense_props(world, states, enemy_actions, deadline)
-        front_flow_props = build_front_attacker_flow_props(world, states, chain_plan, deadline)
-        tactical_combo = run_tactical_interrupt_layer(
-            world, states, chain_plan, enemy_actions, conversion_pressure, deadline
-        )
-        nuisance_props = build_nuisance_interrupt_props(world, states, enemy_actions, deadline)
+        recent_lost = [
+            p for p in world.enemy_planets
+            if not world.is_comet(p)
+            and _prev_owners.get(p.id) == world.player
+        ]
+        lost_chain_props = ()
+        if recent_lost and time.perf_counter() < deadline - BEAM_TIME_BUFFER:
+            prop = build_chain_retrigger_response(
+                world, recent_lost[0], states, chain_plan, prediction, forecasts=None
+            )
+            if prop is not None:
+                lost_chain_props = (prop,)
+
+        game_winning_props = ()
+        low_control_props = ()
+        build_chain_props = ()
+        pressure_props = ()
+
+        if board_phase == BoardPhase.LOW_CONTROL_MODE:
+            low_control_props = low_control_opening_expansion(world, states, chain_plan, deadline)
+            if world.step <= 70 and any("parallel_opening_sweep" in (p.reason or "") for p in low_control_props):
+                world.add_debug("EARLY_WAIT_FORBIDDEN_CAPTURE_EXISTS")
+                world.add_debug("OPENING_IDLE_REJECTED")
+        elif board_phase == BoardPhase.BUILD_CHAIN_MODE:
+            build_chain_props = (
+                tuple(build_multi_axis_expansion_props(world, states, chain_plan, deadline))
+                + tuple(build_front_attacker_flow_props(world, states, chain_plan, deadline))
+                + tuple(build_front_attacker_push_props(world, states, chain_plan, deadline))
+                + tuple(build_counterattack_after_defense_props(world, states, enemy_actions, deadline))
+                + tuple(run_tactical_interrupt_layer(
+                    world, states, chain_plan, enemy_actions, conversion_pressure, deadline
+                ))
+            )
+        elif board_phase == BoardPhase.PRESSURE_MODE:
+            game_winning_props = detect_game_winning_opportunities(world, states, chain_plan, enemy_actions, deadline)
+            staging_for_chain = choose_staging_launchpad(world, states, chain_plan)
+            rolling_props = tuple(build_rolling_capture_chain(
+                world, staging_for_chain, states, chain_plan, compute_fleet_ratio(world), prediction, forecasts=None
+            )) if staging_for_chain else ()
+            dominance_props = tuple(midgame_dominance_attack_props(
+                world, states, chain_plan, deadline, limit=3
+            )[0])
+            final_drain_props = tuple(generate_final_drain_missions(world)) if world.remaining < 45 else ()
+            pressure_props = (
+                game_winning_props
+                + tuple(build_front_attacker_push_props(world, states, chain_plan, deadline))
+                + tuple(build_counterattack_after_defense_props(world, states, enemy_actions, deadline))
+                + tuple(run_tactical_interrupt_layer(
+                    world, states, chain_plan, enemy_actions, conversion_pressure, deadline
+                ))
+                + tuple(build_nuisance_interrupt_props(world, states, enemy_actions, deadline))
+                + rolling_props
+                + dominance_props
+                + final_drain_props
+            )
         beam_combo = ()
         if deadline - time.perf_counter() > 0.07:
             beam_combo = beam_search_orchestrator(
@@ -18236,16 +18722,10 @@ def agent(obs, config=None):
         proposal_groups = (
             emergency_props,
             launchpad_guard_props,
-            game_winning_props,
-            small_escape_props,
-            parallel_sweep_props,
-            early_sweep_props,
-            multi_axis_props,
-            front_push_props,
-            counter_after_defense_props,
-            front_flow_props,
-            tactical_combo,
-            nuisance_props,
+            lost_chain_props,
+            low_control_props,
+            build_chain_props,
+            pressure_props,
             beam_combo,
         )
         emergency_must_win = any(
@@ -18272,6 +18752,10 @@ def agent(obs, config=None):
             )
         if not combo:
             combo = fast_heuristic_fallback(world, states, chain_plan, enemy_actions, deadline)
+        world.add_debug(
+            f"BOARD_PHASE_DECISION_FINAL phase={board_phase} "
+            f"combo={[f'{p.kind}->p{p.target_id}' for p in combo]}"
+        )
 
     if bundle_selected:
         commit_attack_bundle(world, combo, moves, states, deadline)
