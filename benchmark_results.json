@@ -1,0 +1,115 @@
+{
+  "current_sha": "25c60859",
+  "current_subject": "Add pressure map candidate filtering",
+  "games_per_side": 1,
+  "matchups": [
+    {
+      "sha": "7e7a3a0e",
+      "subject": "Add synchronized delayed launch controller",
+      "games": 2,
+      "wins": 1,
+      "draws": 0,
+      "losses": 1,
+      "win_pct": 50.0
+    },
+    {
+      "sha": "3d1ecea0",
+      "subject": "Improve offense-first strategy",
+      "games": 2,
+      "wins": 0,
+      "draws": 0,
+      "losses": 2,
+      "win_pct": 0.0
+    },
+    {
+      "sha": "9dd542e8",
+      "subject": "Tune opening aggression",
+      "games": 2,
+      "wins": 2,
+      "draws": 0,
+      "losses": 0,
+      "win_pct": 100.0
+    },
+    {
+      "sha": "83ddb776",
+      "subject": "Add multi-front expansion and same-step bundles",
+      "games": 2,
+      "wins": 0,
+      "draws": 0,
+      "losses": 2,
+      "win_pct": 0.0
+    },
+    {
+      "sha": "dde3b7e6",
+      "subject": "Tune tactical Orbit Wars agent behavior",
+      "games": 2,
+      "wins": 0,
+      "draws": 0,
+      "losses": 2,
+      "win_pct": 0.0
+    },
+    {
+      "sha": "ce8a2f81",
+      "subject": "Tighten hub security, wave fraction, mission cap, and obligation cooldown",
+      "games": 2,
+      "wins": 0,
+      "draws": 0,
+      "losses": 2,
+      "win_pct": 0.0
+    },
+    {
+      "sha": "b5434d66",
+      "subject": "Add fleet clustering, hub security, dynamic mission cap, and phase lock",
+      "games": 2,
+      "wins": 0,
+      "draws": 0,
+      "losses": 2,
+      "win_pct": 0.0
+    },
+    {
+      "sha": "2fe69f1b",
+      "subject": "Add rolling horizon beam search agent",
+      "games": 2,
+      "wins": 0,
+      "draws": 0,
+      "losses": 2,
+      "win_pct": 0.0
+    },
+    {
+      "sha": "9601a9d4",
+      "subject": "Add midgame conversion mode and expansion tempo improvements",
+      "games": 2,
+      "wins": 0,
+      "draws": 0,
+      "losses": 2,
+      "win_pct": 0.0
+    },
+    {
+      "sha": "2349c9ce",
+      "subject": "Add control-based phase pressure",
+      "games": 2,
+      "wins": 0,
+      "draws": 0,
+      "losses": 2,
+      "win_pct": 0.0
+    },
+    {
+      "sha": "0c62fd68",
+      "subject": "Improve local expansion and aim reliability",
+      "games": 2,
+      "wins": 0,
+      "draws": 0,
+      "losses": 2,
+      "win_pct": 0.0
+    },
+    {
+      "sha": "add8d2a3",
+      "subject": "Add adaptive rating climb strategy",
+      "games": 2,
+      "wins": 0,
+      "draws": 0,
+      "losses": 2,
+      "win_pct": 0.0
+    }
+  ]
+}

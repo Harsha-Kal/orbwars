@@ -844,8 +844,22 @@ def _sync_managed_group(prop):
     if _sync_release_exempt(getattr(prop, "kind", ""), getattr(prop, "reason", "")):
         return False
     reason_l = (getattr(prop, "reason", "") or "").lower()
-    return prop.kind in OFFENSIVE_MISSIONS or any(
-        token in reason_l for token in ("staging", "two_stage", "relay", "backup_to_staging")
+    return any(
+        token in reason_l
+        for token in (
+            "staging",
+            "two_stage",
+            "relay",
+            "backup_to_staging",
+            "coordinated_same_frame_attack",
+            "sync p",
+            "sync_attack",
+            "grouped",
+            "major",
+            "game_winning",
+            "launchpad_attack",
+            "high_value_launchpad",
+        )
     )
 
 
@@ -1932,10 +1946,19 @@ class WorldModel:
             and tgt is not None
             and _small_start_escape_target_value(self, tgt)
         )
+        opening_failsafe = (
+            ("opening_failsafe" in (mission_reason or "") or "stall_recovery" in (mission_reason or ""))
+            and len(self.my_planets) <= 2
+            and self.step <= 90
+            and threat["deficit"] <= 0
+        )
         early_neutral_capture = _early_neutral_reserve_relaxation_allowed(self, src, tgt, mission_reason)
         if small_start_escape:
             reserve = min(reserve, 3)
             self.add_debug(f"SMALL_START_RESERVE_RELAXED p{src.id} reserve={reserve}")
+        elif opening_failsafe:
+            reserve = min(reserve, 0 if len(self.my_planets) <= 1 else 2)
+            self.add_debug(f"OPENING_FAILSAFE_RESERVE_RELAXED src=p{src.id} reserve={reserve}")
         elif early_neutral_capture:
             reserve = min(reserve, _early_neutral_min_source_reserve(self, src))
             self.add_debug(
@@ -1956,9 +1979,9 @@ class WorldModel:
             self.add_debug(f"EARLY_RESERVE_RELAXED_FOR_EXPANSION src=p{src.id} reserve={reserve}")
         if remaining < reserve and not critical and not evacuating:
             return False, f"source unsafe: below reserve {remaining}<{reserve}"
-        if self.is_recently_reinforced(src) and mission_type in OFFENSIVE_MISSIONS and not evacuating:
+        if self.is_recently_reinforced(src) and mission_type in OFFENSIVE_MISSIONS and not evacuating and not opening_failsafe:
             return False, "source unsafe: recently reinforced cooldown"
-        if is_storage_planet(src) and mission_type in OFFENSIVE_MISSIONS and not evacuating and not small_start_escape and not early_neutral_capture:
+        if is_storage_planet(src) and mission_type in OFFENSIVE_MISSIONS and not evacuating and not small_start_escape and not early_neutral_capture and not opening_failsafe:
             allowed_storage_release = mission_type in (
                 "CORE_CHAIN_RECOVERY", "RECAPTURE_LOST", "FINISH_ZERO_CAPTURE", "FINAL_DRAIN"
             )
@@ -7879,16 +7902,15 @@ def find_capture_opportunities(world, fleet_ratio, deadline):
     if not world.my_planets:
         return proposals
     if getattr(world, "aggressiveness_mode", "BALANCED") != "AGGRESSIVE" and _staging_controller_active(world):
-        world.add_debug("STAGING_CONTROLLER_BLOCK find_capture_opportunities suppressed")
-        return proposals
+        world.add_debug("STAGING_CONTROLLER_SOFT_PRIORITY find_capture_opportunities still available")
 
-    # Hub Security: block all offensive proposals if any prod-3+ hub is under-garrisoned.
+    # Hub security is handled by source safety and scoring; do not freeze the
+    # capture scanner before proposals can compete.
     hub_violated, hub_detail = _hub_security_violated(world)
     if hub_violated:
         world.add_debug(
-            f"HUB_SECURITY_BLOCK find_capture_opportunities suppressed - {hub_detail}"
+            f"HUB_SECURITY_SOFT_PRIORITY find_capture_opportunities still available - {hub_detail}"
         )
-        return proposals
 
     world.add_debug(
         f"CAPTURE_OPPORTUNITY_SCAN step={world.step} "
@@ -8882,6 +8904,9 @@ def _is_opening_capture_reason(reason):
         "parallel_opening_sweep",
         "early_nearest_sweep",
         "small_start_escape",
+        "opening_failsafe",
+        "opening_emergency",
+        "stall_recovery",
         "early_direct_expansion",
         "expansion_campaign",
         "expansion_obligation",
@@ -9575,10 +9600,30 @@ def execute_pending_missions(world, moves):
             )
             cancelled_missions.add(mission_id)
             continue
+        reason_l = (rec.get("reason", "") or "").lower()
         sync_managed_record = (
-            mission_type in OFFENSIVE_MISSIONS
-            or any(token in (rec.get("reason", "") or "").lower() for token in ("staging", "two_stage", "relay", "backup_to_staging"))
-        ) and not _sync_release_exempt(mission_type, rec.get("reason", ""))
+            any(
+                token in reason_l
+                for token in (
+                    "staging",
+                    "two_stage",
+                    "relay",
+                    "backup_to_staging",
+                    "coordinated_same_frame_attack",
+                    "grouped",
+                    "major",
+                    "game_winning",
+                    "launchpad_attack",
+                    "high_value_launchpad",
+                )
+            )
+            and not _sync_release_exempt(mission_type, rec.get("reason", ""))
+        )
+        if mission_type in OFFENSIVE_MISSIONS and not sync_managed_record and (
+            "opening" in reason_l or "nearest_sweep" in reason_l or "stall_recovery" in reason_l
+        ):
+            world.add_debug("IMMEDIATE_OPENING_CAPTURE_ALLOWED")
+            world.add_debug("DELAYED_SYNC_MAJOR_ONLY")
         if sync_managed_record and mission_type in OFFENSIVE_MISSIONS:
             group_records = _pending_records_for_mission(world, pending, mission_id)
             ok_group, group_reason = _pending_group_still_flips(world, tgt, group_records)
@@ -9754,11 +9799,10 @@ def _commit_proposal(world, prop, moves):
             and not same_step_bundle
         ):
             world.add_debug(
-                f"MISSION_BLOCK {prop.kind} target=p{tgt.id} reason=active_capture_concentration "
+                f"MISSION_SOFT_ACTIVE_CAPTURE_CONCENTRATION {prop.kind} target=p{tgt.id} "
                 f"active={[(e.mission_type, e.target_id) for e in active_offense]} "
                 f"my_prod={world.my_prod} enemy_prod={world.enemy_prod}"
             )
-            return False
         if not _proposal_passes_capture_constraints(world, prop):
             world.add_debug(f"MISSION_BLOCK {prop.kind} target=p{tgt.id} reason=critical_mass_or_cluster")
             return False
@@ -11571,6 +11615,204 @@ def _main35_make_capture_prop(
     )
 
 
+def _last_own_launch_step(world):
+    steps = []
+    for rec in _recent_launch_history.get(world.player, []):
+        steps.append(int(rec.get("step", -999)))
+    for rec in _shot_history.get(world.player, []):
+        steps.append(int(rec.get("launch_step", -999)))
+    return max(steps) if steps else None
+
+
+def _no_own_launch_ever(world):
+    return (
+        not _recent_launch_history.get(world.player)
+        and not _shot_history.get(world.player)
+        and not world.my_fleets
+    )
+
+
+def _no_recent_own_launch(world, turns=15):
+    if world.my_fleets:
+        return False
+    last = _last_own_launch_step(world)
+    return last is None or world.step - last >= turns
+
+
+def _opening_stall_recovery_needed(world):
+    return world.step >= 8 and len(world.my_planets) <= 2 and _no_recent_own_launch(world, 15)
+
+
+def passive_rally_blocked_by_economic_expansion(world, states=None, chain_plan=()):
+    blocked = (
+        len(world.my_planets) <= 3
+        or world.my_prod < world.enemy_prod
+        or economic_continue_expanding(world, states, chain_plan)
+        or _opening_stall_recovery_needed(world)
+    )
+    if blocked:
+        world.add_debug("RALLY_BLOCKED_BY_ECONOMIC_EXPANSION")
+        world.add_debug("BANK_MODE_DELAYED_FOR_EXPANSION")
+    return blocked
+
+
+def _opening_failsafe_states(world, states):
+    relaxed = dict(states or {})
+    for p in world.my_planets:
+        st = relaxed.get(p.id)
+        if st is None:
+            continue
+        reserve = 0 if len(world.my_planets) <= 1 else min(st.reserve, 2)
+        safe_surplus = max(0, int(p.ships) - world.committed.get(p.id, 0) - reserve)
+        if safe_surplus > st.safe_surplus or reserve < st.reserve:
+            relaxed[p.id] = PlanetState(
+                planet_id=st.planet_id,
+                role=st.role,
+                is_static=st.is_static,
+                ships=st.ships,
+                production=st.production,
+                radius=st.radius,
+                reserve=reserve,
+                safe_surplus=safe_surplus,
+                threatened=st.threatened,
+                cluster_d=st.cluster_d,
+            )
+    return relaxed
+
+
+def _opening_failsafe_target_score(world, target, src, chain_plan):
+    d = dp(src, target)
+    prod = int(target.production)
+    role = _planet_role(target)
+    prod_gain = max(0, prod - int(src.production))
+    useful_bridge = role in (ROLE_BRIDGE, ROLE_LAUNCHPAD) or _chain_small_has_value(world, target, src)
+    escape_gain = float(target.radius) > float(src.radius) + 0.05 or useful_bridge or is_static_planet(target)
+    low_ship = max(0.0, 28.0 - int(target.ships))
+    score = (
+        max(0.0, 120.0 - d) * 5.2
+        + prod * 120.0
+        + prod_gain * 95.0
+        + low_ship * 4.5
+        + (260.0 if prod >= 5 else 170.0 if prod >= 4 else 0.0)
+        + (150.0 if escape_gain else 0.0)
+        + (120.0 if role == ROLE_LAUNCHPAD else 85.0 if role == ROLE_BRIDGE else 0.0)
+        + (85.0 if is_static_planet(target) else 0.0)
+        + (70.0 if target.id in set((chain_plan or [])[:18]) else 0.0)
+        + min(4, len(_campaign_followup_options(world, target))) * 36.0
+        - int(target.ships) * 1.3
+    )
+    if role == ROLE_STORAGE and prod <= 1 and not useful_bridge and not escape_gain:
+        score -= 160.0
+    if target.owner not in (-1, world.player):
+        score += 55.0 if is_local_enemy_opportunity(world, target) else -140.0
+    return score
+
+
+def build_opening_emergency_fallback_props(world, states, chain_plan, deadline, hard=False):
+    if time.perf_counter() > deadline - BEAM_TIME_BUFFER or not world.my_planets:
+        return ()
+    if hard:
+        world.add_debug("OPENING_FAILSAFE_TRIGGERED")
+        world.add_debug("NO_LAUNCH_STALL_BROKEN")
+    else:
+        world.add_debug("EARLY_STALL_FORCE_EXPANSION")
+        world.add_debug("LOW_CONTROL_NO_LAUNCH_RECOVERY")
+    local_states = _opening_failsafe_states(world, states)
+    candidates = []
+    for target in world.normal_planets:
+        if target.owner == world.player or world.is_comet(target):
+            continue
+        src = min(world.my_planets, key=lambda p: dp(p, target), default=None)
+        if src is None or src.id not in local_states or local_states[src.id].threatened:
+            continue
+        if target.owner not in (-1, world.player) and not (
+            is_local_enemy_opportunity(world, target)
+            or int(target.production) >= 4
+            or _small_radius_target_allowed(world, target, src, chain_plan)
+        ):
+            continue
+        if dp(src, target) > (126.0 if hard else 108.0):
+            continue
+        improves = (
+            int(target.production) > int(src.production)
+            or int(target.production) >= 3
+            or int(target.ships) <= 18
+            or is_static_planet(target)
+            or _planet_role(target) in (ROLE_BRIDGE, ROLE_LAUNCHPAD)
+            or _chain_small_has_value(world, target, src)
+            or len(_campaign_followup_options(world, target)) >= 1
+        )
+        if not improves:
+            continue
+        candidates.append((-_opening_failsafe_target_score(world, target, src, chain_plan), dp(src, target), int(target.ships), target.id, target))
+    candidates.sort()
+    props = []
+    for _score, d, _ships, _tid, target in candidates[:12]:
+        if time.perf_counter() > deadline - BEAM_TIME_BUFFER:
+            break
+        kind = "CAPTURE_NEUTRAL" if target.owner == -1 else "SYNC_ATTACK"
+        plan, total, ok = _fund_capture(
+            world,
+            target,
+            local_states,
+            max_sources=4,
+            mission_reason="opening_failsafe" if hard else "stall_recovery_opening_emergency",
+            hold_margin_override=0 if target.owner == -1 else max(5, int(target.production) * 2),
+            source_radius=max(126.0 if hard else 108.0, d + 2.0),
+        )
+        if not ok:
+            continue
+        plan = _top_up_capture_to_critical_mass(
+            world,
+            target,
+            local_states,
+            plan,
+            kind,
+            "opening_failsafe" if hard else "stall_recovery_opening_emergency",
+            max(126.0 if hard else 108.0, d + 2.0),
+            4,
+        )
+        total = sum(int(s) for _sid, s, _ls, _eta in plan)
+        if total < MIN_SEND_SHIPS or not plan:
+            continue
+        if not all(valid_packet_size(kind, ships) for _sid, ships, _ls, _eta in plan):
+            continue
+        ok_grp, reason = validate_grouped_launch(world, target, plan)
+        if not ok_grp:
+            world.add_debug(f"OPENING_FAILSAFE_REJECT p{target.id} reason={reason}")
+            continue
+        aim_ok = True
+        for src_id, ships, _ls, _eta in plan:
+            src = world.planet_by_id.get(src_id)
+            if src is None:
+                aim_ok = False
+                break
+            ok_aim, aim_reason = world.aim_confidence_check(src, target, ships, kind)
+            if not ok_aim:
+                world.add_debug(f"OPENING_FAILSAFE_REJECT p{target.id} reason={aim_reason}")
+                aim_ok = False
+                break
+        if not aim_ok:
+            continue
+        prop = MissionProposal(
+            kind=kind,
+            target_id=target.id,
+            priority=320.0 if hard else 280.0,
+            required_ships=total,
+            planned_sources=plan,
+            eta_min=min(e for _sid, _s, _ls, e in plan),
+            eta_max=max(e for _sid, _s, _ls, e in plan),
+            reason=("opening_failsafe emergency" if hard else "stall_recovery_opening_emergency") + f" p{target.id}",
+            priority_tier="CRITICAL" if hard else "IMPORTANT",
+        )
+        props.append(prop)
+        world.add_debug(
+            f"LOW_CONTROL_EMPTY_PLAN_FIXED target=p{target.id} prod={int(target.production)} d={d:.1f} total={total}"
+        )
+        break
+    return tuple(props)
+
+
 def _useful_target_value(world, target, anchor=None):
     if target is None or target.owner == world.player or world.is_comet(target):
         return False
@@ -12700,6 +12942,170 @@ def _target_x_shape_bonus(world, src, target):
     return bonus
 
 
+def _economic_snowball_phase_active(world):
+    phase = getattr(world, "_board_phase", BoardPhase.BUILD_CHAIN_MODE)
+    if phase == BoardPhase.LOW_CONTROL_MODE:
+        return True
+    if phase == BoardPhase.BUILD_CHAIN_MODE:
+        return (
+            world.step <= 150
+            or world.my_prod < world.enemy_prod
+            or len(world.my_planets) < max(5, int(len(world.normal_planets) * 0.42))
+        )
+    return world.my_prod < world.enemy_prod
+
+
+def _nearest_owned_distance(world, target, sources=None):
+    pool = sources if sources is not None else world.my_planets
+    return min((dp(src, target) for src in pool), default=999.0)
+
+
+def _strong_economic_target(world, target, src=None, chain_plan=()):
+    if target is None or target.owner == world.player or world.is_comet(target):
+        return False
+    prod = int(target.production)
+    nearest = dp(src, target) if src is not None else _nearest_owned_distance(world, target)
+    role = _planet_role(target)
+    high_static = is_static_planet(target) and (float(target.radius) >= 2.0 or role in (ROLE_LAUNCHPAD, ROLE_BRIDGE))
+    chain_value = target.id in set((chain_plan or ())[:20])
+    local_enemy = target.owner not in (-1, world.player) and (
+        is_local_enemy_opportunity(world, target)
+        or prod >= 4
+        or int(target.ships) <= max(22, prod * 6)
+    )
+    return (
+        (prod >= 5 and nearest <= 116.0)
+        or (prod >= 4 and nearest <= 104.0)
+        or (high_static and nearest <= 96.0)
+        or (chain_value and prod >= 3 and nearest <= 98.0)
+        or (local_enemy and nearest <= 82.0)
+    )
+
+
+def economic_snowball_priority_bonus(world, target, src=None, chain_plan=(), emit=False):
+    if target is None or target.owner == world.player or world.is_comet(target):
+        return 0.0
+    if not _economic_snowball_phase_active(world) and world.my_prod >= world.enemy_prod:
+        return 0.0
+    prod = int(target.production)
+    role = _planet_role(target)
+    nearest = dp(src, target) if src is not None else _nearest_owned_distance(world, target)
+    bonus = 0.0
+    if prod >= 5:
+        bonus += 520.0
+    elif prod >= 4:
+        bonus += 380.0
+    elif prod >= 3 and world.my_prod < world.enemy_prod:
+        bonus += 180.0
+    if is_static_planet(target) and float(target.radius) >= 2.0:
+        bonus += 210.0
+    if role == ROLE_LAUNCHPAD:
+        bonus += 150.0
+    elif role == ROLE_BRIDGE:
+        bonus += 95.0
+    if target.id in set((chain_plan or ())[:20]):
+        bonus += 105.0
+    if target.owner not in (-1, world.player):
+        bonus += 90.0 if is_local_enemy_opportunity(world, target) else -45.0
+    if world.my_prod < world.enemy_prod:
+        bonus += min(260.0, (world.enemy_prod - world.my_prod) * 30.0)
+    bonus += max(0.0, 100.0 - nearest) * 2.7
+    if bonus > 0.0 and emit:
+        world.add_debug("ECONOMIC_SNOWBALL_MODE")
+        if prod >= 4 or (is_static_planet(target) and float(target.radius) >= 2.0):
+            world.add_debug(
+                f"HIGH_PRODUCTION_TARGET_PRIORITY p{target.id} prod={prod} radius={float(target.radius):.1f} d={nearest:.1f}"
+            )
+        if world.my_prod < world.enemy_prod:
+            world.add_debug(
+                f"PRODUCTION_RACE_RESPONSE_ACTIVE my_prod={world.my_prod} enemy_prod={world.enemy_prod}"
+            )
+    return bonus
+
+
+def nearby_strong_economic_targets(world, states=None, chain_plan=(), limit=14):
+    scored = []
+    viable_sources = [
+        p for p in world.my_planets
+        if states is None or (p.id in states and not states[p.id].threatened)
+    ]
+    for target in world.normal_planets:
+        if target.owner == world.player or world.is_comet(target):
+            continue
+        src = min(viable_sources, key=lambda p: dp(p, target), default=None)
+        if src is None:
+            continue
+        if not _strong_economic_target(world, target, src, chain_plan):
+            continue
+        if target.owner not in (-1, world.player) and not (
+            is_local_enemy_opportunity(world, target)
+            or int(target.production) >= 4
+            or _small_radius_target_allowed(world, target, src, chain_plan)
+        ):
+            continue
+        bonus = economic_snowball_priority_bonus(world, target, src, chain_plan, emit=False)
+        if bonus <= 0.0:
+            continue
+        scored.append((bonus, dp(src, target), int(target.ships), target.id, target, src))
+    scored.sort(key=lambda item: (-item[0], item[1], item[2], item[3]))
+    return scored[:limit]
+
+
+def economic_continue_expanding(world, states=None, chain_plan=(), emit=False):
+    active = bool(nearby_strong_economic_targets(world, states, chain_plan, limit=1))
+    if active and emit:
+        world.add_debug("ECONOMIC_CONTINUE_EXPANDING")
+        world.add_debug("PRESSURE_CONTROL_DELAYED")
+        if getattr(world, "_board_phase", BoardPhase.BUILD_CHAIN_MODE) == BoardPhase.BUILD_CHAIN_MODE:
+            world.add_debug("BUILD_CHAIN_AGGRESSIVE_EXPANSION")
+        if world.my_prod < world.enemy_prod:
+            world.add_debug("PRODUCTION_RACE_RESPONSE_ACTIVE")
+    return active
+
+
+def build_economic_snowball_expansion_props(world, states, chain_plan, deadline):
+    if time.perf_counter() > deadline - BEAM_TIME_BUFFER:
+        return ()
+    if not _economic_snowball_phase_active(world) and not economic_continue_expanding(world, states, chain_plan):
+        return ()
+    world.add_debug("MAIN3_STYLE_EXPANSION_ACTIVE")
+    world.add_debug("ECONOMIC_SNOWBALL_MODE")
+    scored = nearby_strong_economic_targets(world, states, chain_plan, limit=12)
+    props = []
+    seen = set()
+    for bonus, nearest, _ships, _tid, target, _src in scored:
+        if len(props) >= 5 or time.perf_counter() > deadline - BEAM_TIME_BUFFER:
+            break
+        if target.id in seen:
+            continue
+        economic_snowball_priority_bonus(world, target, chain_plan=chain_plan, emit=True)
+        kind = "CAPTURE_NEUTRAL" if target.owner == -1 else "SYNC_ATTACK"
+        hold = 1 if target.owner == -1 else max(8, int(target.production) * 3)
+        prop = _main35_make_capture_prop(
+            world,
+            states,
+            target,
+            "economic_snowball_priority",
+            250.0 + bonus * 0.055 + max(0.0, 90.0 - nearest),
+            mission_kind=kind,
+            max_sources=5,
+            source_radius=118.0,
+            hold_margin=hold,
+            require_hold=target.owner != -1,
+        )
+        if prop is None:
+            continue
+        prop.reason = f"{prop.reason} economic_snowball prod={int(target.production)}"
+        props.append(prop)
+        seen.add(target.id)
+        world.add_debug(
+            f"ECONOMIC_SNOWBALL_TARGET_SELECTED p{target.id} prod={int(target.production)} d={nearest:.1f}"
+        )
+    if props:
+        world.add_debug(f"EXPANSION_TEMPO_RESTORED economic_props={len(props)}")
+    return tuple(props)
+
+
 def _nearest_sweep_target_score(world, target, src, chain_plan):
     d = dp(src, target)
     role = _planet_role(target)
@@ -12716,6 +13122,7 @@ def _nearest_sweep_target_score(world, target, src, chain_plan):
         + _target_x_shape_bonus(world, src, target)
         + _rotating_source_static_target_bonus(world, src, target)
         + min(3, len(_campaign_followup_options(world, target))) * 28.0
+        + economic_snowball_priority_bonus(world, target, src, chain_plan)
     )
     if prod >= 5:
         score += 190.0
@@ -12935,7 +13342,8 @@ def build_early_nearest_sweep_props(world, states, chain_plan, deadline):
     """Opening-only burst of nearest useful captures, still through proposals."""
     if _small_start_escape_needed(world):
         return ()
-    if world.step > EARLY_NEAREST_SWEEP_STEP_MAX and len(world.my_planets) >= 5:
+    econ_active = economic_continue_expanding(world, states, chain_plan)
+    if world.step > EARLY_NEAREST_SWEEP_STEP_MAX and len(world.my_planets) >= 5 and not econ_active:
         return ()
     if not world.my_planets or time.perf_counter() > deadline - BEAM_TIME_BUFFER:
         return ()
@@ -12977,7 +13385,10 @@ def build_early_nearest_sweep_props(world, states, chain_plan, deadline):
         ):
             continue
         nearest = dp(nearest_src, target)
-        if nearest > EARLY_NEAREST_SWEEP_DIST:
+        max_sweep_dist = EARLY_NEAREST_SWEEP_DIST
+        if _strong_economic_target(world, target, nearest_src, chain_plan):
+            max_sweep_dist = max(max_sweep_dist, 104.0)
+        if nearest > max_sweep_dist:
             if nearest <= EARLY_NEAREST_SWEEP_DIST + 24.0:
                 world.add_debug(f"OPENING_FAR_TARGET_REJECTED p{target.id} d={nearest:.1f}")
             continue
@@ -13077,6 +13488,7 @@ def _parallel_opening_target_score(world, target, src, chain_plan, deficit_mode=
         + _target_x_shape_bonus(world, src, target)
         + _rotating_source_static_target_bonus(world, src, target)
         + min(4, len(_campaign_followup_options(world, target))) * 34.0
+        + economic_snowball_priority_bonus(world, target, src, chain_plan)
     )
     if prod >= 5:
         score += 190.0
@@ -13111,6 +13523,7 @@ def _make_parallel_opening_capture_prop(world, states, chain_plan, target, score
         return None
     kind = "CAPTURE_NEUTRAL" if target.owner == -1 else "SYNC_ATTACK"
     hold = 0 if target.owner == -1 and world.step <= 70 else (1 if target.owner == -1 else max(6, int(target.production) * 2))
+    source_radius = 108.0 if _strong_economic_target(world, target, chain_plan=chain_plan) else PARALLEL_OPENING_SWEEP_DIST
     prop = _main35_make_capture_prop(
         world,
         states,
@@ -13119,7 +13532,7 @@ def _make_parallel_opening_capture_prop(world, states, chain_plan, target, score
         PRIORITY_PARALLEL_OPENING_SWEEP + score * 0.035,
         mission_kind=kind,
         max_sources=1,
-        source_radius=PARALLEL_OPENING_SWEEP_DIST,
+        source_radius=source_radius,
         hold_margin=hold,
         require_hold=target.owner != -1,
     )
@@ -13132,7 +13545,7 @@ def _make_parallel_opening_capture_prop(world, states, chain_plan, target, score
             PRIORITY_PARALLEL_OPENING_SWEEP + score * 0.03 - 6.0,
             mission_kind=kind,
             max_sources=3,
-            source_radius=PARALLEL_OPENING_SWEEP_DIST,
+            source_radius=source_radius,
             hold_margin=hold,
             require_hold=target.owner != -1,
         )
@@ -13147,7 +13560,8 @@ def _make_parallel_opening_capture_prop(world, states, chain_plan, target, score
 
 
 def build_parallel_opening_sweep_props(world, states, chain_plan, deadline):
-    if world.step > 70 or time.perf_counter() > deadline - BEAM_TIME_BUFFER:
+    econ_active = economic_continue_expanding(world, states, chain_plan)
+    if (world.step > 70 and not econ_active) or time.perf_counter() > deadline - BEAM_TIME_BUFFER:
         return ()
     if not world.my_planets:
         return ()
@@ -13164,7 +13578,10 @@ def build_parallel_opening_sweep_props(world, states, chain_plan, deadline):
             continue
         nearby_sources = []
         for p in world.my_planets:
-            if p.id not in states or states[p.id].threatened or dp(p, target) > PARALLEL_OPENING_SWEEP_DIST:
+            max_parallel_dist = PARALLEL_OPENING_SWEEP_DIST
+            if _strong_economic_target(world, target, p, chain_plan):
+                max_parallel_dist = max(max_parallel_dist, 108.0)
+            if p.id not in states or states[p.id].threatened or dp(p, target) > max_parallel_dist:
                 continue
             if target.owner == -1 and _early_neutral_reserve_relaxation_allowed(world, p, target, "parallel_opening_sweep"):
                 avail = int(p.ships) - world.committed.get(p.id, 0) - _early_neutral_min_source_reserve(world, p)
@@ -13227,7 +13644,9 @@ def parallel_opening_sweep(world, states, chain_plan, deadline):
 def low_control_opening_expansion(world, states, chain_plan, deadline):
     """BoardPhase.LOW_CONTROL_MODE expansion toolkit."""
     world.add_debug("LOW_CONTROL_OPENING_EXPANSION_ACTIVE")
+    world.add_debug("LOW_CONTROL_CANDIDATES_REQUIRED")
     props = []
+    props.extend(build_economic_snowball_expansion_props(world, states, chain_plan, deadline))
     props.extend(build_small_start_escape_props(world, states, chain_plan, deadline))
     props.extend(opening_nearest_sweep(world, states, chain_plan, deadline))
     props.extend(parallel_opening_sweep(world, states, chain_plan, deadline))
@@ -13247,6 +13666,17 @@ def low_control_opening_expansion(world, states, chain_plan, deadline):
         if strong_route:
             chain_prop.reason = f"{chain_prop.reason} low_control_launchpad_chain_opening"
             props.append(chain_prop)
+    if not props:
+        emergency = build_opening_emergency_fallback_props(
+            world,
+            states,
+            chain_plan,
+            deadline,
+            hard=world.step >= 8 and len(world.my_planets) <= 1 and _no_own_launch_ever(world),
+        )
+        if emergency:
+            world.add_debug("LOW_CONTROL_EMPTY_PLAN_FIXED")
+            props.extend(emergency)
     return tuple(props)
 
 
@@ -15491,6 +15921,12 @@ def _staging_fleet_ratio(world):
 def _staging_controller_active(world):
     if world.enemy_total_ships <= 0 or not world.enemy_planets:
         return False
+    if passive_rally_blocked_by_economic_expansion(world, chain_plan=getattr(world, "_active_chain_plan", ())):
+        return False
+    if getattr(world, "_economic_continue_expanding", False) and world.my_prod < max(world.enemy_prod, int(world.enemy_prod * 1.05)):
+        world.add_debug("RALLY_DELAYED_FOR_EXPANSION")
+        world.add_debug("PRESSURE_CONTROL_DELAYED")
+        return False
     ratio = _staging_fleet_ratio(world)
     rec = _staging_controller_memory.setdefault(
         world.player,
@@ -15842,9 +16278,13 @@ def configure_aggressiveness_controller(world, control_ratio, conversion_pressur
         len(world.neutral_planets) >= max(3, len(world.normal_planets) * 0.20)
         and world.my_prod < max(1, world.enemy_prod)
     )
+    production_race_deficit = world.enemy_prod >= world.my_prod + max(3, int(world.my_prod * 0.25))
     if control_ratio >= PHASE_COLLAPSE_MIN or world.features.get("final"):
         mode = "COLLAPSE"
     elif (
+        production_race_deficit
+        or economic_continue_expanding(world)
+        or
         world.my_prod < avg_enemy_prod
         or enemy_growing_faster
         or neutral_high_while_behind
@@ -15859,6 +16299,10 @@ def configure_aggressiveness_controller(world, control_ratio, conversion_pressur
     if mode == "AGGRESSIVE":
         world.add_debug("AGGRESSIVENESS_MODE_AGGRESSIVE")
         world.add_debug("EARLY_CAPTURE_PRIORITY_ACTIVE" if world.step < 100 else "TACTICAL_CAPTURE_PRIORITY_ACTIVE")
+    if production_race_deficit:
+        world.add_debug(
+            f"PRODUCTION_RACE_RESPONSE_ACTIVE my_prod={world.my_prod} enemy_prod={world.enemy_prod}"
+        )
     return mode
 
 
@@ -16375,6 +16819,11 @@ def adversarial_candidate_adjustment(world, prop, states=None, chain_plan=None):
 
 
 def apply_pressure_adversarial_adjustments(world, proposals, states=None, chain_plan=None):
+    world.add_debug("PRESSURE_MAP_SOFTENED")
+    opening_soft_only = world.step < 80 or len(world.my_planets) < 3
+    if opening_soft_only:
+        world.add_debug("PRESSURE_MAP_OPENING_SOFT_ONLY")
+        world.add_debug("ADVERSARIAL_FILTER_OPENING_SOFT_ONLY")
     adjusted = []
     for prop in list(proposals or ()):
         if prop is None:
@@ -16389,6 +16838,8 @@ def apply_pressure_adversarial_adjustments(world, proposals, states=None, chain_
             pressure_adj = pressure_score_bonus(world, prop, states, chain_plan)
             adv_adj, reject = adversarial_candidate_adjustment(world, prop, states, chain_plan)
             total_adj = max(-50.0, min(50.0, pressure_adj + adv_adj))
+            if opening_soft_only and total_adj < 0.0 and not reject:
+                total_adj = max(total_adj, -5.0)
             if total_adj < -10.0 and _aggression_override_pressure_cap(world, target, prop):
                 world.add_debug(
                     f"PRESSURE_PENALTY_CAPPED target=p{target.id} from={total_adj:.1f} to=-10.0"
@@ -16405,6 +16856,8 @@ def apply_pressure_adversarial_adjustments(world, proposals, states=None, chain_
             prop.priority += total_adj
             prop._pressure_adversarial_applied = True
             if reject:
+                if opening_soft_only:
+                    world.add_debug(f"ADVERSARIAL_OPENING_HARD_REJECT_ONLY target=p{target.id}")
                 continue
             world.add_debug(f"PRESSURE_SOFT_GUIDANCE_ONLY target=p{target.id} adjustment={total_adj:.1f}")
             if abs(total_adj) > 0.01:
@@ -17296,11 +17749,42 @@ def _component_move_sort_score(world, prop):
     enemy_bonus = 70.0 if target.owner not in (-1, world.player) else 0.0
     weak_bonus = max(0.0, 35.0 - int(target.ships)) * (1.5 if target.owner not in (-1, world.player) else 0.8)
     momentum_bonus = _conversion_momentum_bonus(world, target) * 0.45
+    snowball_bonus = economic_snowball_priority_bonus(
+        world, target, chain_plan=getattr(world, "_active_chain_plan", ())
+    )
     aggro_bonus = 0.0
     if getattr(world, "aggressiveness_mode", "BALANCED") == "AGGRESSIVE":
         aggro_bonus += 55.0 if target.owner == -1 else 75.0
         if int(target.ships) <= max(18, int(target.production) * 5):
             aggro_bonus += 45.0
+    phase_bonus = 0.0
+    phase = getattr(world, "_board_phase", BoardPhase.BUILD_CHAIN_MODE)
+    reason_l = (prop.reason or "").lower()
+    if phase == BoardPhase.LOW_CONTROL_MODE:
+        if target.owner == -1:
+            phase_bonus += 90.0
+        if any(token in reason_l for token in ("small_start_escape", "nearest_sweep", "parallel_opening_sweep", "multi_axis_front")):
+            phase_bonus += 95.0
+        if target.owner not in (-1, world.player) and is_local_enemy_opportunity(world, target):
+            phase_bonus += 70.0
+    elif phase == BoardPhase.BUILD_CHAIN_MODE:
+        if any(token in reason_l for token in ("chain", "bridge", "multi_axis_front", "rolling_chain", "front_attacker")):
+            phase_bonus += 65.0
+    elif phase == BoardPhase.PRESSURE_MODE:
+        if target.owner not in (-1, world.player):
+            phase_bonus += 85.0
+        if any(token in reason_l for token in ("game_winning", "dominance", "counterattack", "weak_enemy", "nuisance")):
+            phase_bonus += 80.0
+    if getattr(world, "_active_capture_concentration_soft", False) and prop.kind in OFFENSIVE_MISSIONS:
+        if not (
+            target.owner not in (-1, world.player)
+            and (
+                is_local_enemy_opportunity(world, target)
+                or int(target.production) >= 3
+                or int(target.ships) <= max(18, int(target.production) * 5)
+            )
+        ):
+            phase_bonus -= 35.0
     early_bonus = 0.0
     if world.step < 100:
         early_bonus += int(target.production) * 35.0
@@ -17312,7 +17796,9 @@ def _component_move_sort_score(world, prop):
         + enemy_bonus
         + weak_bonus
         + momentum_bonus
+        + snowball_bonus
         + aggro_bonus
+        + phase_bonus
         + early_bonus
         + max(0.0, 72.0 - nearest) * 2.0
         - _proposal_total_ships(prop) * 0.8
@@ -17454,7 +17940,9 @@ def _candidate_targets_for_beam(world, chain_plan, enemy_actions, control_ratio)
         if target.owner == world.player or world.is_comet(target):
             continue
         nearest = min((dp(m, target) for m in world.my_planets), default=999.0)
-        if nearest > (94.0 if control_ratio >= PHASE_MIDGAME_MAX else 76.0):
+        strong_econ = _strong_economic_target(world, target, chain_plan=chain_plan)
+        max_target_distance = 116.0 if strong_econ else (94.0 if control_ratio >= PHASE_MIDGAME_MAX else 76.0)
+        if nearest > max_target_distance:
             if small_start:
                 world.add_debug(f"SMALL_START_FAR_TARGET_REJECTED p{target.id} d={nearest:.1f}")
             continue
@@ -17478,12 +17966,14 @@ def _candidate_targets_for_beam(world, chain_plan, enemy_actions, control_ratio)
             or int(target.production) >= 3
             or _small_radius_target_allowed(world, target, chain_plan=chain_plan)
         ):
-            continue
+            if nearest > 88.0 or int(target.ships) > max(70, int(target.production) * 12):
+                continue
         if target.owner == -1 and _planet_role(target) == ROLE_STORAGE and not (
             _small_radius_target_allowed(world, target, chain_plan=chain_plan)
             or control_ratio >= PHASE_MIDGAME_MAX
         ):
-            continue
+            if nearest > 58.0 and not _target_improves_control(world, target, chain_plan):
+                continue
         small_allowed_bonus = 0.0
         if _planet_role(target) == ROLE_STORAGE and _small_radius_target_allowed(world, target, chain_plan=chain_plan):
             small_allowed_bonus = 70.0 if target.owner not in (-1, world.player) else 35.0
@@ -17497,6 +17987,7 @@ def _candidate_targets_for_beam(world, chain_plan, enemy_actions, control_ratio)
             + small_allowed_bonus
             + (70.0 if target.id in set(chain_plan[:18]) else 0.0)
             + min(4, len(_campaign_followup_options(world, target))) * 32.0
+            + economic_snowball_priority_bonus(world, target, chain_plan=chain_plan)
             - int(target.ships) * 1.1
         )
         if not is_static_planet(target):
@@ -17942,51 +18433,9 @@ def build_zero_capital_backline_rally_props(world, states, chain_plan, deadline)
 
 
 def _board_phase_component_allowed(world, prop):
-    phase = getattr(world, "_board_phase", BoardPhase.BUILD_CHAIN_MODE)
-    reason = (getattr(prop, "reason", "") or "").lower()
-    target = world.planet_by_id.get(prop.target_id)
-
-    if prop.kind in REINFORCEMENT_MISSIONS or getattr(prop, "priority_tier", "") == "CRITICAL":
-        return True
-    if target is None or prop.kind not in OFFENSIVE_MISSIONS:
-        return True
-
-    if phase == BoardPhase.LOW_CONTROL_MODE:
-        return (
-            target.owner == -1
-            or any(token in reason for token in (
-                "small_start_escape",
-                "opening",
-                "nearest_sweep",
-                "parallel_opening_sweep",
-                "chain_plan",
-                "beam_atomic_small_start_escape",
-                "early_direct_expansion",
-                "tactical_neutral_conversion",
-                "tactical_chain_conversion",
-            ))
-            or is_local_enemy_opportunity(world, target)
-            or _small_radius_target_allowed(world, target, chain_plan=getattr(world, "_active_chain_plan", []))
-        )
-
-    if phase == BoardPhase.BUILD_CHAIN_MODE:
-        return (
-            target.owner == -1
-            or target.id in set(getattr(world, "_active_chain_plan", [])[:18])
-            or _planet_role(target) in (ROLE_LAUNCHPAD, ROLE_BRIDGE)
-            or is_local_enemy_opportunity(world, target)
-            or int(target.production) >= 3
-            or _small_radius_target_allowed(world, target, chain_plan=getattr(world, "_active_chain_plan", []))
-            or any(token in reason for token in (
-                "rolling_chain",
-                "front_attacker",
-                "bridge_route",
-                "tactical_chain",
-                "counterattack",
-                "game_winning",
-            ))
-        )
-
+    """BoardPhase is a scoring signal only; it cannot suppress generation."""
+    world.add_debug("BOARD_PHASE_PRIORITY_ONLY")
+    world.add_debug("PROPOSAL_GENERATION_NOT_SUPPRESSED")
     return True
 
 
@@ -17995,9 +18444,11 @@ def generate_atomic_component_moves(world, states, chain_plan, enemy_actions, co
     components.extend(_build_defense_component_proposals(world, states, deadline))
     components.extend(reinforce_launchpad_from_surroundings(world, states, deadline))
     components.extend(_build_hub_security_reinforce_props(world, states, deadline))
+    components.extend(build_economic_snowball_expansion_props(world, states, chain_plan, deadline))
     staging_active = (
         getattr(world, "aggressiveness_mode", "BALANCED") != "AGGRESSIVE"
         and not getattr(world, "_reinforcement_loop_active", False)
+        and not getattr(world, "_economic_continue_expanding", False)
         and not (world.step <= 70 and opening_capture_deficit_active(world))
         and _staging_controller_active(world)
     )
@@ -18010,26 +18461,28 @@ def generate_atomic_component_moves(world, states, chain_plan, enemy_actions, co
     components.extend(build_coordinated_launch_props(world, states, chain_plan, deadline))
     components.extend(build_bridge_route_required_props(world, states, chain_plan, deadline))
     components.extend(build_front_attacker_flow_props(world, states, chain_plan, deadline))
-    components.extend(build_zero_capital_backline_rally_props(world, states, chain_plan, deadline))
+    if getattr(world, "_economic_continue_expanding", False) or passive_rally_blocked_by_economic_expansion(world, states, chain_plan):
+        world.add_debug("RALLY_DELAYED_FOR_EXPANSION")
+    else:
+        components.extend(build_zero_capital_backline_rally_props(world, states, chain_plan, deadline))
 
-    # Hub Security: if any prod-3+ friendly planet is below minimum garrison,
-    # skip all new offensive proposals so ships stay home to reinforce.
+    # Hub security is validation and prioritization, not macro suppression.
+    # Defense proposals compete at high priority while normal captures remain
+    # available if their own source safety/grouped validation holds.
     hub_violated, hub_detail = _hub_security_violated(world)
     if hub_violated:
         world.add_debug(
-            f"HUB_SECURITY_BLOCK offensive expansion suppressed - {hub_detail}"
+            f"HUB_SECURITY_SOFT_PRIORITY offensive expansion still available - {hub_detail}"
         )
-        components = [prop for prop in components if prop.kind not in OFFENSIVE_MISSIONS]
-        components.sort(key=lambda prop: -_component_move_sort_score(world, prop))
-        world.add_debug(f"BEAM_COMPONENT_MOVES_GENERATED n={len(components)} (hub_security_active)")
-        return components[:BEAM_ROOT_COMPONENT_LIMIT]
+        for prop in components:
+            if prop.kind in REINFORCEMENT_MISSIONS:
+                prop.priority += 80.0
 
     if staging_active:
-        world.add_debug("STAGING_CONTROLLER_BLOCK offensive proposals suppressed")
-        components = [prop for prop in components if prop.kind not in OFFENSIVE_MISSIONS]
-        components.sort(key=lambda prop: -_component_move_sort_score(world, prop))
-        world.add_debug(f"BEAM_COMPONENT_MOVES_GENERATED n={len(components)} (staging_controller_active)")
-        return components[:BEAM_ROOT_COMPONENT_LIMIT]
+        world.add_debug("STAGING_CONTROLLER_SOFT_PRIORITY offensive proposals still available")
+        for prop in components:
+            if prop.kind in REINFORCEMENT_MISSIONS and "staging_controller" in (prop.reason or ""):
+                prop.priority += 45.0
     if getattr(world, "_reinforcement_loop_active", False):
         components = [
             prop for prop in components
@@ -18041,13 +18494,10 @@ def generate_atomic_component_moves(world, states, chain_plan, enemy_actions, co
     active_offense = _active_offensive_capture_missions(world)
     if active_offense and not _has_significant_production_lead(world):
         world.add_debug(
-            f"FLEET_CONCENTRATION_BLOCK active_offense={[(e.mission_type, e.target_id) for e in active_offense]} "
+            f"FLEET_CONCENTRATION_SOFT_PRIORITY active_offense={[(e.mission_type, e.target_id) for e in active_offense]} "
             f"my_prod={world.my_prod} enemy_prod={world.enemy_prod} lead_mult={SIGNIFICANT_PROD_LEAD_MULT:.2f}"
         )
-        components = [prop for prop in components if prop.kind not in OFFENSIVE_MISSIONS]
-        components.sort(key=lambda prop: -_component_move_sort_score(world, prop))
-        world.add_debug(f"BEAM_COMPONENT_MOVES_GENERATED n={len(components)} (active_capture_concentrating)")
-        return components[:BEAM_ROOT_COMPONENT_LIMIT]
+        world._active_capture_concentration_soft = True
 
     targets = _candidate_targets_for_beam(world, chain_plan, enemy_actions, control_ratio)
     seen = {(p.kind, p.target_id, tuple(src_id for src_id, _s, _a, _e in p.planned_sources)) for p in components}
@@ -18058,14 +18508,15 @@ def generate_atomic_component_moves(world, states, chain_plan, enemy_actions, co
         reason = "beam_atomic_capture"
         if _beam_small_start_active(world):
             reason = "beam_atomic_small_start_escape"
+        strong_econ = _strong_economic_target(world, target, chain_plan=chain_plan)
         prop = _main35_make_capture_prop(
             world,
             states,
             target,
             reason,
-            150.0,
+            210.0 if strong_econ else 150.0,
             max_sources=5,
-            source_radius=90.0,
+            source_radius=118.0 if strong_econ else 90.0,
             hold_margin=hold,
             require_hold=target.owner != -1,
         )
@@ -18169,11 +18620,14 @@ def _active_offensive_limit(world):
     capture rather than splitting fleets across two lower-value ones.
     Returns 2 (the default) otherwise.
     """
+    phase = getattr(world, "_board_phase", BoardPhase.BUILD_CHAIN_MODE)
+    if phase == BoardPhase.LOW_CONTROL_MODE or getattr(world, "aggressiveness_mode", "BALANCED") == "AGGRESSIVE":
+        return 3
     if not _has_significant_production_lead(world):
-        return 1
+        return 2
     mg_state = getattr(world, "_cached_midgame_state", None)
     if mg_state is not None and mg_state not in (MidgameState.STABLE_EXPAND,):
-        return 1
+        return 2
     return 2
 
 
@@ -18579,6 +19033,36 @@ def agent(obs, config=None):
     world.add_debug("MAIN34_CHAIN_ENGINE_PRESERVED")
     world.add_debug("TACTICAL_CONSTANT_TUNING_APPLIED")
     world.add_debug("PACKET_DISCIPLINE_PRESERVED")
+    world.add_debug("MAIN3_TEMPO_RESTORED")
+    world.add_debug("BOARD_PHASE_PRIORITY_ONLY")
+    world.add_debug("PRESSURE_MAP_SOFTENED")
+    world.add_debug("AGGRESSIVE_PROPOSAL_BREADTH_ACTIVE")
+    world.add_debug("LOW_CONTROL_PARALLEL_SWEEP_ACTIVE")
+    world.add_debug("MULTI_AXIS_ALWAYS_AVAILABLE")
+    world.add_debug("IMMEDIATE_LOCAL_CAPTURE_ALLOWED")
+    world.add_debug("DELAYED_SYNC_MAJOR_ONLY")
+    world.add_debug("EXPANSION_TEMPO_RECOVERED")
+    world.add_debug("PROPOSAL_GENERATION_NOT_SUPPRESSED")
+    world.add_debug("ECONOMIC_SNOWBALL_MODE")
+    world.add_debug("HIGH_PRODUCTION_TARGET_PRIORITY")
+    world.add_debug("EXPANSION_TEMPO_RESTORED")
+    world.add_debug("MAIN3_STYLE_EXPANSION_ACTIVE")
+    world.add_debug("PRESSURE_CONTROL_DELAYED")
+    world.add_debug("ECONOMIC_CONTINUE_EXPANDING")
+    world.add_debug("BUILD_CHAIN_AGGRESSIVE_EXPANSION")
+    world.add_debug("RALLY_DELAYED_FOR_EXPANSION")
+    world.add_debug("PRODUCTION_RACE_RESPONSE_ACTIVE")
+    world.add_debug("OPENING_FAILSAFE_TRIGGERED")
+    world.add_debug("NO_LAUNCH_STALL_BROKEN")
+    world.add_debug("EARLY_STALL_FORCE_EXPANSION")
+    world.add_debug("LOW_CONTROL_NO_LAUNCH_RECOVERY")
+    world.add_debug("LOW_CONTROL_CANDIDATES_REQUIRED")
+    world.add_debug("LOW_CONTROL_EMPTY_PLAN_FIXED")
+    world.add_debug("PRESSURE_MAP_OPENING_SOFT_ONLY")
+    world.add_debug("ADVERSARIAL_FILTER_OPENING_SOFT_ONLY")
+    world.add_debug("RALLY_BLOCKED_BY_ECONOMIC_EXPANSION")
+    world.add_debug("BANK_MODE_DELAYED_FOR_EXPANSION")
+    world.add_debug("IMMEDIATE_OPENING_CAPTURE_ALLOWED")
 
     if world.step <= 1:
         _prev_owners.clear()
@@ -18610,6 +19094,12 @@ def agent(obs, config=None):
     world._board_phase = board_phase
     world.add_debug("NORAD_VALIDATION_ONLY")
     world.add_debug("PHASE_CONFLICT_REMOVED")
+    world._economic_continue_expanding = economic_continue_expanding(world, states, chain_plan, emit=True)
+    hard_opening_failsafe = world.step >= 8 and len(world.my_planets) <= 1 and _no_own_launch_ever(world)
+    early_stall_recovery = _opening_stall_recovery_needed(world)
+    if early_stall_recovery:
+        world.add_debug("EARLY_STALL_FORCE_EXPANSION")
+        world.add_debug("LOW_CONTROL_NO_LAUNCH_RECOVERY")
     activate_offense_first_objective(world)
     world._active_structure = classify_planet_structure(world, states, chain_plan)
     _control_phase, control_ratio = control_phase_diagnostic(world)
@@ -18670,48 +19160,44 @@ def agent(obs, config=None):
             if prop is not None:
                 lost_chain_props = (prop,)
 
-        game_winning_props = ()
-        low_control_props = ()
-        build_chain_props = ()
-        pressure_props = ()
-
-        if board_phase == BoardPhase.LOW_CONTROL_MODE:
-            low_control_props = low_control_opening_expansion(world, states, chain_plan, deadline)
-            if world.step <= 70 and any("parallel_opening_sweep" in (p.reason or "") for p in low_control_props):
-                world.add_debug("EARLY_WAIT_FORBIDDEN_CAPTURE_EXISTS")
-                world.add_debug("OPENING_IDLE_REJECTED")
-        elif board_phase == BoardPhase.BUILD_CHAIN_MODE:
-            build_chain_props = (
-                tuple(build_multi_axis_expansion_props(world, states, chain_plan, deadline))
-                + tuple(build_front_attacker_flow_props(world, states, chain_plan, deadline))
-                + tuple(build_front_attacker_push_props(world, states, chain_plan, deadline))
-                + tuple(build_counterattack_after_defense_props(world, states, enemy_actions, deadline))
-                + tuple(run_tactical_interrupt_layer(
-                    world, states, chain_plan, enemy_actions, conversion_pressure, deadline
-                ))
-            )
-        elif board_phase == BoardPhase.PRESSURE_MODE:
-            game_winning_props = detect_game_winning_opportunities(world, states, chain_plan, enemy_actions, deadline)
-            staging_for_chain = choose_staging_launchpad(world, states, chain_plan)
-            rolling_props = tuple(build_rolling_capture_chain(
-                world, staging_for_chain, states, chain_plan, compute_fleet_ratio(world), prediction, forecasts=None
-            )) if staging_for_chain else ()
-            dominance_props = tuple(midgame_dominance_attack_props(
-                world, states, chain_plan, deadline, limit=3
-            )[0])
-            final_drain_props = tuple(generate_final_drain_missions(world)) if world.remaining < 45 else ()
-            pressure_props = (
-                game_winning_props
-                + tuple(build_front_attacker_push_props(world, states, chain_plan, deadline))
-                + tuple(build_counterattack_after_defense_props(world, states, enemy_actions, deadline))
-                + tuple(run_tactical_interrupt_layer(
-                    world, states, chain_plan, enemy_actions, conversion_pressure, deadline
-                ))
-                + tuple(build_nuisance_interrupt_props(world, states, enemy_actions, deadline))
-                + rolling_props
-                + dominance_props
-                + final_drain_props
-            )
+        opening_recovery_props = tuple(build_opening_emergency_fallback_props(
+            world,
+            states,
+            chain_plan,
+            deadline,
+            hard=hard_opening_failsafe,
+        )) if (hard_opening_failsafe or early_stall_recovery) else ()
+        economic_snowball_props = tuple(build_economic_snowball_expansion_props(world, states, chain_plan, deadline))
+        low_control_props = tuple(low_control_opening_expansion(world, states, chain_plan, deadline))
+        if world.step <= 70 and any("parallel_opening_sweep" in (p.reason or "") for p in low_control_props):
+            world.add_debug("EARLY_WAIT_FORBIDDEN_CAPTURE_EXISTS")
+            world.add_debug("OPENING_IDLE_REJECTED")
+        tactical_props = tuple(run_tactical_interrupt_layer(
+            world, states, chain_plan, enemy_actions, conversion_pressure, deadline
+        ))
+        build_chain_props = (
+            tuple(build_multi_axis_expansion_props(world, states, chain_plan, deadline))
+            + tuple(build_front_attacker_flow_props(world, states, chain_plan, deadline))
+            + tuple(build_front_attacker_push_props(world, states, chain_plan, deadline))
+            + tuple(build_counterattack_after_defense_props(world, states, enemy_actions, deadline))
+            + tactical_props
+        )
+        game_winning_props = tuple(detect_game_winning_opportunities(world, states, chain_plan, enemy_actions, deadline))
+        staging_for_chain = choose_staging_launchpad(world, states, chain_plan)
+        rolling_props = tuple(build_rolling_capture_chain(
+            world, staging_for_chain, states, chain_plan, compute_fleet_ratio(world), prediction, forecasts=None
+        )) if staging_for_chain else ()
+        dominance_props = tuple(midgame_dominance_attack_props(
+            world, states, chain_plan, deadline, limit=3
+        )[0])
+        final_drain_props = tuple(generate_final_drain_missions(world)) if world.remaining < 45 else ()
+        pressure_props = (
+            game_winning_props
+            + tuple(build_nuisance_interrupt_props(world, states, enemy_actions, deadline))
+            + rolling_props
+            + dominance_props
+            + final_drain_props
+        )
         beam_combo = ()
         if deadline - time.perf_counter() > 0.07:
             beam_combo = beam_search_orchestrator(
@@ -18722,7 +19208,9 @@ def agent(obs, config=None):
         proposal_groups = (
             emergency_props,
             launchpad_guard_props,
+            opening_recovery_props,
             lost_chain_props,
+            economic_snowball_props,
             low_control_props,
             build_chain_props,
             pressure_props,
@@ -18751,7 +19239,7 @@ def agent(obs, config=None):
                 deadline,
             )
         if not combo:
-            combo = fast_heuristic_fallback(world, states, chain_plan, enemy_actions, deadline)
+            combo = opening_recovery_props or fast_heuristic_fallback(world, states, chain_plan, enemy_actions, deadline)
         world.add_debug(
             f"BOARD_PHASE_DECISION_FINAL phase={board_phase} "
             f"combo={[f'{p.kind}->p{p.target_id}' for p in combo]}"
@@ -18779,9 +19267,22 @@ def agent(obs, config=None):
     execute_pending_missions(world, moves)
 
     if not moves:
+        if hard_opening_failsafe or early_stall_recovery:
+            emergency_props = build_opening_emergency_fallback_props(
+                world,
+                states,
+                chain_plan,
+                deadline,
+                hard=hard_opening_failsafe,
+            )
+            for prop in emergency_props:
+                if _commit_proposal(world, prop, moves):
+                    break
+            execute_pending_missions(world, moves)
         # If no root combo survived commit validation, do not fall back to the
         # old hierarchy. Log diagnostics and let memory update normally.
-        log_missed_opportunities(world, states, chain_plan)
+        if not moves:
+            log_missed_opportunities(world, states, chain_plan)
 
     if DEBUG:
         for event in world.debug_events:
