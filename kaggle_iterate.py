@@ -148,8 +148,8 @@ PATCH_BOUNDS = {
     "DEFENSE_ETA_HORIZON":  (10, 40),
     "DEFENSE_SAVE_HELPERS": (2, 8),
     "EXPAND_RACE_MARGIN":   (1.0, 1.5),
-    "EARLY_RESERVE_MULT":   (0.20, 0.70),
-    "EARLY_PROD_WEIGHT":    (1.0, 6.0),
+    "EARLY_RESERVE_MULT":   (0.35, 0.70),
+    "EARLY_PROD_WEIGHT":    (1.0, 5.0),
 }
 
 
@@ -297,27 +297,45 @@ def run_iteration():
     for flag, fraction in sorted(diag.items(), key=lambda x: -x[1]):
         print(f"  {flag}: {fraction*100:.0f}% of losses")
 
-    # 4. Apply patches for the two most severe failure modes
+    # 4. Trend guard: if win rate is declining, skip parameter patches.
+    #    Applying more of the same patches when things are getting worse only
+    #    accelerates the decline (as seen with EARLY_RESERVE_MULT runaway cut).
+    prev_win_pct = None
+    if LOG_FILE.exists():
+        try:
+            lines = LOG_FILE.read_text().strip().splitlines()
+            if lines:
+                prev_record = json.loads(lines[-1])
+                prev_win_pct = prev_record.get("win_pct")
+        except Exception:
+            pass
+
+    declining = prev_win_pct is not None and win_pct < prev_win_pct - 3.0
+    if declining:
+        print(f"\n[trend-guard] Win rate fell {prev_win_pct:.1f}% → {win_pct:.1f}%. "
+              f"Skipping parameter patches to avoid runaway degradation.")
+
+    # 5. Apply patches for the two most severe failure modes (only if not declining)
     source = MAIN_PY.read_text()
     patches_applied = []
     top_flags = sorted(diag.items(), key=lambda x: -x[1])[:2]
 
-    for flag, fraction in top_flags:
-        if fraction < 0.40:   # only fix if ≥40% of losses show this pattern
-            continue
-        for const, delta, rationale in PATCH_REGISTRY.get(flag, []):
-            source, new_val = apply_patch(source, const, delta)
-            if new_val is not None:
-                patches_applied.append(f"{const}→{new_val}")
+    if not declining:
+        for flag, fraction in top_flags:
+            if fraction < 0.40:   # only fix if ≥40% of losses show this pattern
+                continue
+            for const, delta, rationale in PATCH_REGISTRY.get(flag, []):
+                source, new_val = apply_patch(source, const, delta)
+                if new_val is not None:
+                    patches_applied.append(f"{const}→{new_val}")
 
     if not patches_applied:
-        print("No patches to apply (all at bounds or below threshold).")
-        # Still submit to refresh the matchmaking pool
+        print("No patches to apply (all at bounds, below threshold, or trend-guarded).")
         patches_applied = ["no-param-change"]
 
     MAIN_PY.write_text(source)
 
-    # 5. Commit + submit
+    # 6. Commit + submit
     v   = next_version_tag()
     top_flag = top_flags[0][0] if top_flags else "unknown"
     msg = f"auto: fix {top_flag}  {','.join(patches_applied)}  wr={win_pct:.0f}pct"
@@ -326,7 +344,7 @@ def run_iteration():
     git_commit_push(v, msg)
     submit(v, msg)
 
-    # 6. Log to JSONL
+    # 7. Log to JSONL
     record = {
         "ts": ts,
         "version": v,
