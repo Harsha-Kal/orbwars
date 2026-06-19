@@ -48,12 +48,12 @@ ASTAR_MAX_TRAFFIC_MULT  = 3.5   # cap on traffic slow-down factor
 ASTAR_FRIENDLY_DISCOUNT = 0.55  # travel through friendly territory is faster
 
 # ── Expansion engine ──────────────────────────────────────────────────────────
-EXPAND_MAX_SOURCES   = 7     # planets pooled per expansion target
-EXPAND_MAX_MISSIONS  = 5     # expansion missions per turn
+EXPAND_MAX_SOURCES   = 8     # planets pooled per expansion target
+EXPAND_MAX_MISSIONS  = 6     # expansion missions per turn
 EXPAND_RACE_MARGIN   = 1.15  # my ETA must be this much better than enemy ETA
 
 # ── Pressure / encirclement engine ───────────────────────────────────────────
-PRESSURE_MAX_MISSIONS   = 3
+PRESSURE_MAX_MISSIONS   = 4
 PRESSURE_FRONTS         = 2    # attack from this many quadrant directions
 PRESSURE_MIN_PROD       = 0    # minimum enemy production worth hitting
 PRESSURE_ENCIRCLE_RANGE = 50.0 # radius to find flanking sources
