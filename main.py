@@ -52,8 +52,8 @@ EXPAND_MAX_SOURCES   = 8     # planets pooled per expansion target
 EXPAND_MAX_MISSIONS  = 6     # expansion missions per turn
 EXPAND_RACE_MARGIN   = 1.15  # my ETA must be this much better than enemy ETA
 EARLY_GAME_STEPS     = 80    # steps during which early reserve discounts apply
-EARLY_RESERVE_MULT   = 0.40  # reserve multiplier during early land-grab phase
-EARLY_PROD_WEIGHT    = 4.00   # production score multiplier in early expansion scorer
+EARLY_RESERVE_MULT   = 0.35  # reserve multiplier during early land-grab phase
+EARLY_PROD_WEIGHT    = 4.50   # production score multiplier in early expansion scorer
 
 # ── Pressure / encirclement engine ───────────────────────────────────────────
 PRESSURE_MAX_MISSIONS   = 4
