@@ -51,6 +51,9 @@ ASTAR_FRIENDLY_DISCOUNT = 0.55  # travel through friendly territory is faster
 EXPAND_MAX_SOURCES   = 8     # planets pooled per expansion target
 EXPAND_MAX_MISSIONS  = 6     # expansion missions per turn
 EXPAND_RACE_MARGIN   = 1.15  # my ETA must be this much better than enemy ETA
+EARLY_GAME_STEPS     = 80    # steps during which early reserve discounts apply
+EARLY_RESERVE_MULT   = 0.45  # reserve multiplier during early land-grab phase
+EARLY_PROD_WEIGHT    = 3.5   # production score multiplier in early expansion scorer
 
 # ── Pressure / encirclement engine ───────────────────────────────────────────
 PRESSURE_MAX_MISSIONS   = 4
@@ -359,6 +362,8 @@ class GameSnapshot:
         """
         Available ships on p that can be launched without losing the planet.
         Reserve scales with role and local enemy threat.
+        In the early land-grab phase (< EARLY_GAME_STEPS) reserves are cut by
+        EARLY_RESERVE_MULT so more ships flow into expansion captures.
         """
         inc = self.incoming.get(p.id, {})
         enemy_near = sum(
@@ -372,6 +377,9 @@ class GameSnapshot:
             base_reserve = max(12, int(p.ships) // 6)
         else:
             base_reserve = max(6, int(p.ships) // 8)
+        # Early game: discount reserves to fuel aggressive expansion
+        if self.step < EARLY_GAME_STEPS and enemy_near == 0:
+            base_reserve = max(5, int(base_reserve * EARLY_RESERVE_MULT))
         reserve = max(base_reserve, enemy_near + 5)
         return max(0, int(p.ships) - self.committed.get(p.id, 0) - reserve)
 
@@ -613,7 +621,9 @@ class ExpansionEngine:
             race = 1.0
 
         turns_yielding = max(1, snap.remaining - my_fastest_eta)
-        value = prod * turns_yielding * race
+        # Early game: heavily weight production to grab high-prod planets first
+        prod_mult = EARLY_PROD_WEIGHT if snap.step < EARLY_GAME_STEPS else 1.0
+        value = prod * prod_mult * turns_yielding * race
 
         # Quadrant pressure bonus: expand into neglected quadrants
         q = self.snap.qmap.quad_of(target)
@@ -623,8 +633,9 @@ class ExpansionEngine:
         # Cheaper / closer = higher score
         score = value / max(1.0, route_cost)
 
-        # Penalize far low-production storage planets
-        if prod <= 1 and route_cost > 30.0:
+        # Penalize far low-production storage planets (relaxed early to avoid
+        # anchoring on nearby low-value planets at the cost of good far ones)
+        if prod <= 1 and route_cost > 30.0 and snap.step >= EARLY_GAME_STEPS:
             score *= 0.25
 
         return score
