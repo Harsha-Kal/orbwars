@@ -65,6 +65,11 @@ PRESSURE_ENCIRCLE_RANGE = 50.0 # radius to find flanking sources
 DEFENSE_ETA_HORIZON  = 20    # only count threats arriving within this many turns
 DEFENSE_SAVE_HELPERS = 4     # max planets pulled for a single save
 
+# ── Late-game banking ─────────────────────────────────────────────────────────
+LATE_GAME_STEP       = 370   # after this step, conserve ships for final count
+LATE_PRESSURE_MAX    = 1     # max pressure missions in late game (only high-value targets)
+LATE_EXPAND_MAX      = 1     # max expansion missions in late game
+
 # ── Planet roles ──────────────────────────────────────────────────────────────
 ROLE_LAUNCHPAD = "LAUNCHPAD"
 ROLE_BRIDGE    = "BRIDGE"
@@ -787,7 +792,9 @@ class PressureEngine:
         prod  = int(ep.production)
         ships = int(ep.ships)
 
-        score  = prod * 45.0
+        # When losing the production race, prioritize high-prod enemy targets
+        prod_denial_mult = 2.5 if snap.my_prod < snap.enemy_prod else 1.0
+        score  = prod * 45.0 * prod_denial_mult
         score += min(60.0, nearest_supp * 1.2)    # isolated from support → easier
         score += my_coverage * 18.0               # surrounded by my planets → easier
         score += max(0.0, 60.0 - nearest_my) * 2.0  # close to me → fast strike
@@ -1017,17 +1024,22 @@ def agent(obs, config=None):
     defense = DefenseEngine(snap)
     defense.emergency_saves(moves)
 
+    # Late-game banking: after LATE_GAME_STEP conserve ships for final count
+    late_game = snap.step >= LATE_GAME_STEP
+    pressure_cap  = LATE_PRESSURE_MAX  if late_game else PRESSURE_MAX_MISSIONS
+    expansion_cap = LATE_EXPAND_MAX    if late_game else EXPAND_MAX_MISSIONS
+
     # 2. Pressure (encirclement) – only when we have a meaningful foothold
     if len(snap.my_planets) >= 2:
         pressure = PressureEngine(snap, astar)
-        for plan in pressure.missions():
+        for plan in pressure.missions(max_missions=pressure_cap):
             for src, ships, angle, _ in plan:
                 if valid_pkt(ships):
                     moves.append([src.id, angle, ships])
 
     # 3. Expansion – all-directions quadrant growth
     expansion = ExpansionEngine(snap, astar)
-    for plan in expansion.missions():
+    for plan in expansion.missions(max_missions=expansion_cap):
         for src, ships, angle, _ in plan:
             if valid_pkt(ships):
                 moves.append([src.id, angle, ships])

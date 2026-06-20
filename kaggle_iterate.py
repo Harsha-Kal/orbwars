@@ -204,6 +204,13 @@ def git_commit_push(version_tag, message):
     """Stage main.py, commit, push to master and srujan_test."""
     try:
         subprocess.run(["git", "add", "main.py"], cwd=REPO, check=True)
+        # Check if there's actually anything to commit
+        diff = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"], cwd=REPO
+        )
+        if diff.returncode == 0:
+            print(f"  [git] no changes to main.py — skipping commit")
+            return
         subprocess.run(
             ["git", "commit", "-m", f"v{version_tag}: {message}\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"],
             cwd=REPO, check=True
