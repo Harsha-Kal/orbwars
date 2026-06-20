@@ -54,7 +54,6 @@ EXPAND_RACE_MARGIN   = 1.15  # my ETA must be this much better than enemy ETA
 EARLY_GAME_STEPS     = 80    # steps during which early reserve discounts apply
 EARLY_RESERVE_MULT   = 0.45  # reserve multiplier during early land-grab phase
 EARLY_PROD_WEIGHT    = 3.50  # production score multiplier in early expansion scorer
-EARLY_PROD_RUSH_K    = 20    # top-K high-prod candidates to consider in early game
 
 # ── Pressure / encirclement engine ───────────────────────────────────────────
 PRESSURE_MAX_MISSIONS   = 4
@@ -702,18 +701,6 @@ class ExpansionEngine:
 
         candidates = snap.neutral_planets + snap.enemy_planets
         candidates = [c for c in candidates if c.id not in snap.comet_ids]
-
-        # Early-game production rush: pre-sort by prod/distance so the A* scorer
-        # always evaluates the highest-value planets first, even if they're further.
-        # This directly combats prod_deficit_mid by ensuring we don't settle for
-        # nearby low-production planets over high-production ones slightly further away.
-        if snap.step < EARLY_GAME_STEPS and snap.my_planets:
-            my_centroid_x = sum(p.x for p in snap.my_planets) / len(snap.my_planets)
-            my_centroid_y = sum(p.y for p in snap.my_planets) / len(snap.my_planets)
-            candidates.sort(
-                key=lambda c: -(c.production / max(1.0, dist(my_centroid_x, my_centroid_y, c.x, c.y)))
-            )
-            candidates = candidates[:EARLY_PROD_RUSH_K]
 
         scored = []
         for target in candidates:
